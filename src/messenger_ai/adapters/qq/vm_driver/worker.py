@@ -131,7 +131,18 @@ class QQVMWorker:
             return self._result(command, WorkerStatus.FAILED_SAFE, "abort_not_owner")
         if command.operation_id in self._committed:
             return self._result(command, WorkerStatus.UNCERTAIN, "committed_cannot_abort")
-        # Do not clear the composer: ownership cannot prove an operator did not edit it.
+        evidence = self._prepared.get(command.operation_id)
+        if evidence is None or command.binding_id not in self._bindings:
+            return self._result(command, WorkerStatus.FAILED_SAFE, "abort_evidence_missing")
+        window, conversation = self._resolve(self._bindings[command.binding_id])
+        if conversation.model_dump(mode="json") != evidence["conversation"]:
+            return self._result(command, WorkerStatus.FAILED_SAFE, "needs_manual_cleanup")
+        current = self._accessibility.read_composer(window, self._selectors.selector("composer"))
+        if current != evidence["composer_text"]:
+            return self._result(command, WorkerStatus.FAILED_SAFE, "needs_manual_cleanup")
+        self._accessibility.write_composer(window, "", self._selectors.selector("composer"))
+        if self._accessibility.read_composer(window, self._selectors.selector("composer")) != "":
+            return self._result(command, WorkerStatus.FAILED_SAFE, "needs_manual_cleanup")
         self._prepared.pop(command.operation_id, None)
         self._reservation = None
         return self._result(command, WorkerStatus.OK)

@@ -197,3 +197,20 @@ def test_late_pipe_response_cannot_match_a_new_request() -> None:
     result = process.request(second, timeout_seconds=0)
     assert result.request_id == new_id
     assert result.status in {WorkerStatus.UNCERTAIN, WorkerStatus.UNAVAILABLE}
+
+
+def test_abort_clears_only_unchanged_bot_owned_composer() -> None:
+    worker, fake, binding_id = _worker()
+    operation_id = uuid4()
+    assert _prepare(worker, binding_id, operation_id).status is WorkerStatus.OK
+    result = worker.execute(WorkerCommand(kind=WorkerKind.ABORT, binding_id=binding_id, operation_id=operation_id))
+    assert result.status is WorkerStatus.OK
+    assert fake.composer == ""
+
+    second = uuid4()
+    assert _prepare(worker, binding_id, second).status is WorkerStatus.OK
+    fake.composer = "人工改过"
+    refused = worker.execute(WorkerCommand(kind=WorkerKind.ABORT, binding_id=binding_id, operation_id=second))
+    assert refused.status is WorkerStatus.FAILED_SAFE
+    assert refused.error_code == "needs_manual_cleanup"
+    assert fake.composer == "人工改过"

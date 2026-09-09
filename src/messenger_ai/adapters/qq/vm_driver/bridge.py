@@ -2,82 +2,198 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
 from messenger_ai.adapters.qq.models import QQIdentityBinding
 from messenger_ai.domain import AuthorizedSendCommand, ErrorCode, SendOperation, SendStatus
-from messenger_ai.runtime.contracts import ObservationBatch, ObservedMessage, Direction
-from messenger_ai.domain.state_machines import SendStateMachine
+from messenger_ai.runtime.contracts import Direction, ObservationBatch, ObservedMessage
 
 from .contracts import WorkerCommand, WorkerKind, WorkerStatus
+from .message_cursor import MessageCursorStore
 from .worker import QQVMWorkerProcess
 
 
+_TERMINAL = {SendStatus.VERIFIED, SendStatus.FAILED, SendStatus.UNCERTAIN, SendStatus.CANCELLED}
+
+
 class QQVMDriverBridge:
-    """Runtime-facing V5 driver; Hub owns operation ids and durable state."""
-    def __init__(self, *, worker: QQVMWorkerProcess, bindings: tuple[QQIdentityBinding, ...], text_provider: Callable[[AuthorizedSendCommand], str], sqlite_path: str, timeout_seconds: float = 15) -> None:
+    """Durable runtime bridge. Hub owns IDs; worker performs fixed UI actions."""
+
+    def __init__(self, *, worker: QQVMWorkerProcess, bindings: tuple[QQIdentityBinding, ...],
+                 text_provider: Callable[[AuthorizedSendCommand], str], sqlite_path: str | Path,
+                 timeout_seconds: float = 15) -> None:
         self._worker, self._text_provider, self._timeout = worker, text_provider, timeout_seconds
         self._bindings = {item.hub_conversation_id: item for item in bindings}
-        self._operations: dict[UUID, SendOperation] = {}
-        self._db = sqlite3.connect(sqlite_path)
-        self._db.execute("create table if not exists qq_vm_ops (op text primary key, binding text, segment text, br integer, cr integer, status text)")
-        self._db.execute("create table if not exists qq_vm_seen (binding text, fingerprint text, primary key(binding,fingerprint))")
-        self._db.commit()
+        if len(self._bindings) != len(bindings):
+            raise ValueError("conversation bindings must be unique")
+        self._by_id = {item.binding_id: item for item in bindings}
+        self._db = sqlite3.connect(str(sqlite_path), isolation_level=None, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        self._db.executescript("""
+        PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        CREATE TABLE IF NOT EXISTS qq_vm_ops(
+          operation_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+          draft_id TEXT NOT NULL, conversation_id TEXT NOT NULL, binding_id TEXT NOT NULL,
+          segment_ref TEXT NOT NULL, binding_revision INTEGER NOT NULL,
+          conversation_revision INTEGER NOT NULL, text_hash TEXT NOT NULL,
+          status TEXT NOT NULL, commit_intent INTEGER NOT NULL DEFAULT 0,
+          error_code TEXT, UNIQUE(segment_ref)
+        );
+        """)
+        cursor_path = Path(sqlite_path).with_suffix(".cursor.sqlite3") if str(sqlite_path) != ":memory:" else ":memory:"
+        self._cursor = MessageCursorStore(cursor_path)
+        self._cursor.recover()
 
-    async def prepare_send(self, command: AuthorizedSendCommand, *, operation_id: UUID, segment_ref: str, binding_revision: int, conversation_revision: int) -> SendOperation:
-        operation = self._operations.setdefault(operation_id, SendOperation(operation_id=operation_id, idempotency_key=command.idempotency_key, draft_id=command.draft_id))
+    def _operation(self, row: sqlite3.Row) -> SendOperation:
+        return SendOperation(operation_id=UUID(row["operation_id"]), idempotency_key=row["idempotency_key"],
+                             draft_id=UUID(row["draft_id"]), status=SendStatus(row["status"]), error_code=row["error_code"])
+
+    def _persist(self, operation: SendOperation, *, commit_intent: bool | None = None) -> SendOperation:
+        fields = "status=?,error_code=?"; values: list[object] = [operation.status.value, operation.error_code]
+        if commit_intent is not None:
+            fields += ",commit_intent=?"; values.append(int(commit_intent))
+        values.append(str(operation.operation_id))
+        self._db.execute(f"UPDATE qq_vm_ops SET {fields} WHERE operation_id=?", values)
+        return operation
+
+    async def prepare_send(self, command: AuthorizedSendCommand, *, operation_id: UUID, segment_ref: str,
+                           binding_revision: int, conversation_revision: int) -> SendOperation:
+        existing = self._db.execute("SELECT * FROM qq_vm_ops WHERE operation_id=? OR idempotency_key=? OR segment_ref=?",
+                                    (str(operation_id), command.idempotency_key, segment_ref)).fetchone()
+        retry_pending = False
+        if existing:
+            if existing["operation_id"] != str(operation_id) or existing["text_hash"] != command.text_hash:
+                return SendOperation(operation_id=operation_id, idempotency_key=command.idempotency_key,
+                                     draft_id=command.draft_id, status=SendStatus.FAILED,
+                                     error_code=ErrorCode.FAILED_SAFE.value)
+            operation = self._operation(existing)
+            if operation.status is not SendStatus.PENDING:
+                return operation
+            retry_pending = True
+        else:
+            operation = SendOperation(operation_id=operation_id, idempotency_key=command.idempotency_key, draft_id=command.draft_id)
         binding = self._bindings.get(command.conversation_id)
         text = self._text_provider(command)
         if binding is None or hashlib.sha256(text.encode()).hexdigest() != command.text_hash:
-            return self._failed(operation)
-        self._db.execute("insert or replace into qq_vm_ops values(?,?,?,?,?,?)", (str(operation_id), binding.binding_id, segment_ref, binding_revision, conversation_revision, 'prepared')); self._db.commit()
-        result = await asyncio.to_thread(self._worker.request, WorkerCommand(kind=WorkerKind.PREPARE, binding_id=binding.binding_id, operation_id=operation_id, segment_ref=segment_ref, binding_revision=binding_revision, conversation_revision=conversation_revision, text=text), self._timeout)
-        if result.status is WorkerStatus.OK: SendStateMachine.transition(operation, SendStatus.PREPARED)
-        elif result.status is WorkerStatus.UNCERTAIN: SendStateMachine.transition(operation, SendStatus.UNCERTAIN, ErrorCode.SEND_UNCERTAIN.value)
-        else: self._failed(operation)
-        return operation
+            operation.status = SendStatus.FAILED; operation.error_code = ErrorCode.FAILED_SAFE.value
+            return operation
+        if not retry_pending:
+            self._db.execute("""INSERT INTO qq_vm_ops VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL)""",
+                             (str(operation_id), command.idempotency_key, str(command.draft_id), command.conversation_id,
+                              binding.binding_id, segment_ref, binding_revision, conversation_revision,
+                              command.text_hash, SendStatus.PENDING.value))
+        result = await asyncio.to_thread(self._worker.request, WorkerCommand(
+            kind=WorkerKind.PREPARE, binding_id=binding.binding_id, operation_id=operation_id,
+            segment_ref=segment_ref, binding_revision=binding_revision,
+            conversation_revision=conversation_revision, text=text), self._timeout)
+        if result.status is WorkerStatus.OK:
+            operation.status = SendStatus.PREPARED
+        elif result.status is WorkerStatus.UNCERTAIN:
+            operation.status = SendStatus.UNCERTAIN; operation.error_code = ErrorCode.SEND_UNCERTAIN.value
+        else:
+            operation.status = SendStatus.FAILED; operation.error_code = ErrorCode.FAILED_SAFE.value
+        return self._persist(operation)
 
     async def commit_send(self, operation: SendOperation) -> SendOperation:
-        if operation.status is not SendStatus.PREPARED: return operation
-        binding = self._binding_for(operation)
-        if binding is None: return self._failed(operation)
-        result = await asyncio.to_thread(self._worker.request, WorkerCommand(kind=WorkerKind.COMMIT, binding_id=binding.binding_id, operation_id=operation.operation_id), self._timeout)
-        if result.status is WorkerStatus.OK: SendStateMachine.transition(operation, SendStatus.COMMITTED)
-        elif result.status is WorkerStatus.UNCERTAIN: SendStateMachine.transition(operation, SendStatus.UNCERTAIN, ErrorCode.SEND_UNCERTAIN.value)
-        else: self._failed(operation)
-        return operation
+        row = self._db.execute("SELECT * FROM qq_vm_ops WHERE operation_id=?", (str(operation.operation_id),)).fetchone()
+        if row is None:
+            operation.status = SendStatus.FAILED; operation.error_code = ErrorCode.FAILED_SAFE.value; return operation
+        stored = self._operation(row)
+        if stored.status in _TERMINAL or row["commit_intent"]:
+            return stored
+        if stored.status is not SendStatus.PREPARED:
+            return stored
+        self._persist(stored, commit_intent=True)
+        binding = self._by_id.get(row["binding_id"])
+        if binding is None:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value; return self._persist(stored)
+        try:
+            result = await asyncio.to_thread(self._worker.request, WorkerCommand(
+                kind=WorkerKind.COMMIT, binding_id=binding.binding_id, operation_id=stored.operation_id,
+                binding_revision=row["binding_revision"], conversation_revision=row["conversation_revision"]), self._timeout)
+        except Exception:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist(stored)
+        if result.status is WorkerStatus.OK:
+            stored.status = SendStatus.COMMITTED
+        else:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+        return self._persist(stored)
 
     async def verify_send(self, operation: SendOperation) -> SendOperation:
-        if operation.status is not SendStatus.COMMITTED: return operation
-        binding = self._binding_for(operation)
-        if binding is None: return self._failed(operation)
-        result = await asyncio.to_thread(self._worker.request, WorkerCommand(kind=WorkerKind.VERIFY, binding_id=binding.binding_id, operation_id=operation.operation_id), self._timeout)
-        if result.status is WorkerStatus.OK: SendStateMachine.transition(operation, SendStatus.VERIFIED)
-        else: SendStateMachine.transition(operation, SendStatus.UNCERTAIN, ErrorCode.SEND_UNCERTAIN.value)
-        return operation
+        row = self._db.execute("SELECT * FROM qq_vm_ops WHERE operation_id=?", (str(operation.operation_id),)).fetchone()
+        if row is None:
+            operation.status = SendStatus.FAILED; operation.error_code = ErrorCode.FAILED_SAFE.value; return operation
+        stored = self._operation(row)
+        if stored.status in _TERMINAL or stored.status is not SendStatus.COMMITTED:
+            return stored
+        binding = self._by_id.get(row["binding_id"])
+        try:
+            result = await asyncio.to_thread(self._worker.request, WorkerCommand(
+                kind=WorkerKind.VERIFY, binding_id=binding.binding_id if binding else None,
+                operation_id=stored.operation_id, binding_revision=row["binding_revision"],
+                conversation_revision=row["conversation_revision"]), self._timeout)
+        except Exception:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist(stored)
+        if result.status is WorkerStatus.OK:
+            stored.status = SendStatus.VERIFIED
+        else:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+        return self._persist(stored)
 
-    def _binding_for(self, operation: SendOperation) -> QQIdentityBinding | None:
-        row = self._db.execute("select binding from qq_vm_ops where op=?", (str(operation.operation_id),)).fetchone()
-        return next((b for b in self._bindings.values() if row and b.binding_id == row[0]), None)
+    async def abort_send(self, operation: SendOperation) -> SendOperation:
+        row = self._db.execute("SELECT * FROM qq_vm_ops WHERE operation_id=?", (str(operation.operation_id),)).fetchone()
+        if row is None:
+            operation.status = SendStatus.FAILED; operation.error_code = ErrorCode.FAILED_SAFE.value
+            return operation
+        stored = self._operation(row)
+        if stored.status in _TERMINAL:
+            return stored
+        if row["commit_intent"]:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist(stored)
+        result = await asyncio.to_thread(self._worker.request, WorkerCommand(
+            kind=WorkerKind.ABORT, binding_id=row["binding_id"], operation_id=stored.operation_id), self._timeout)
+        if result.status is WorkerStatus.OK:
+            stored.status = SendStatus.CANCELLED
+        else:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+        return self._persist(stored)
 
-    async def observe_conversation(self, conversation_id: str, *, binding_revision: int, conversation_revision: int) -> ObservationBatch:
-        binding = self._bindings[conversation_id]
-        result = await asyncio.to_thread(self._worker.request, WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding.binding_id, binding_revision=binding_revision, conversation_revision=conversation_revision), self._timeout)
-        rows = result.evidence.get("bubbles", [])
-        initial = self._db.execute("select count(*) from qq_vm_seen where binding=?", (binding.binding_id,)).fetchone()[0] == 0
-        messages=[]
-        for index, row in enumerate(rows):
-            fingerprint=hashlib.sha256(repr(row).encode()).hexdigest()
-            existed=self._db.execute("select 1 from qq_vm_seen where binding=? and fingerprint=?", (binding.binding_id,fingerprint)).fetchone()
-            self._db.execute("insert or ignore into qq_vm_seen values(?,?)",(binding.binding_id,fingerprint))
-            if not initial and not existed:
-                direction=Direction(str(row.get('direction','unknown')))
-                messages.append(ObservedMessage(local_message_key=str(index), direction=direction, text=str(row.get('text','')), observed_at=row['observed_at']))
-        self._db.commit()
-        return ObservationBatch(account_id=binding.account_id,contact_id=binding.contact_id,conversation_id=conversation_id,binding_revision=binding_revision,conversation_revision=conversation_revision,complete=result.status is WorkerStatus.OK,gap_reason=result.error_code,messages=tuple(messages))
-    @staticmethod
-    def _failed(operation: SendOperation) -> SendOperation:
-        if operation.status in {SendStatus.PENDING, SendStatus.PREPARED}: SendStateMachine.transition(operation, SendStatus.FAILED, ErrorCode.FAILED_SAFE.value)
-        return operation
+    async def observe_conversation(self, conversation_id: str, *, binding_revision: int,
+                                   conversation_revision: int) -> ObservationBatch:
+        binding = self._bindings.get(conversation_id)
+        if binding is None:
+            raise KeyError(conversation_id)
+        result = await asyncio.to_thread(self._worker.request, WorkerCommand(
+            kind=WorkerKind.OBSERVE, binding_id=binding.binding_id, binding_revision=binding_revision,
+            conversation_revision=conversation_revision), self._timeout)
+        rows = result.evidence.get("bubbles", []) if result.status is WorkerStatus.OK else []
+        messages: list[ObservedMessage] = []
+        complete = result.status is WorkerStatus.OK
+        gap_reason = result.error_code
+        if complete:
+            try:
+                self._cursor.ingest_snapshot(conversation_id, list(rows))
+                for claimed in self._cursor.claim(conversation_id):
+                    raw = json.loads(claimed["payload_json"])
+                    messages.append(ObservedMessage(
+                        local_message_key=claimed["local_key"], direction=Direction(raw.get("direction", "unknown")),
+                        text=str(raw.get("text", "")), observed_at=datetime.fromisoformat(str(raw["observed_at"])),
+                        evidence_ref=f"qq-vm:{conversation_id}:{claimed['local_key']}"))
+            except ValueError as exc:
+                complete = False; gap_reason = str(exc)
+        return ObservationBatch(account_id=binding.account_id, contact_id=binding.contact_id,
+                                conversation_id=conversation_id, binding_revision=binding_revision,
+                                conversation_revision=conversation_revision, complete=complete,
+                                gap_reason=gap_reason, messages=tuple(messages))
+
+    def acknowledge_observation(self, conversation_id: str, local_keys: tuple[str, ...]) -> int:
+        """Called only after RuntimeState durably accepted the entire batch."""
+        return self._cursor.acknowledge_keys(conversation_id, local_keys)

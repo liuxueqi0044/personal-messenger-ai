@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 
 from messenger_ai.domain import AuthorizedSendCommand, SendOperation, SendStatus
 from messenger_ai.hub.service import HubService
@@ -18,9 +19,10 @@ class AuthorizedDueExecution:
     command: AuthorizedSendCommand
     token: str
     binding: AuthorizationBinding
-    live_policy_request: PolicyRequest
+    live_policy_request_factory: Callable[[], PolicyRequest]
     binding_revision: int
     conversation_revision: int
+    global_revision: int
 
 
 class SendDispatcher:
@@ -36,8 +38,13 @@ class SendDispatcher:
         self.authorization, self.driver = authorization, driver
 
     def _current(self, item: AuthorizedDueExecution) -> bool:
-        return self.state.revisions(item.due.conversation_id) == (
-            item.binding_revision, item.conversation_revision
+        binding, conversation, paused, global_revision, global_paused = self.state.execution_state(
+            item.due.conversation_id
+        )
+        return (
+            (binding, conversation, global_revision)
+            == (item.binding_revision, item.conversation_revision, item.global_revision)
+            and not paused and not global_paused
         )
 
     async def execute(self, item: AuthorizedDueExecution) -> SendOperation:
@@ -67,23 +74,30 @@ class SendDispatcher:
             return operation
         if not self._current(item):
             abort = getattr(self.driver, "abort_send", None)
+            aborted = None
             if abort is not None:
-                await abort(operation)
-            operation.status = SendStatus.CANCELLED
+                aborted = await abort(operation)
+            operation.status = SendStatus.CANCELLED if aborted is None or aborted.status is SendStatus.CANCELLED else SendStatus.UNCERTAIN
+            if operation.status is SendStatus.UNCERTAIN:
+                operation.error_code = "SEND_UNCERTAIN"
             operation = self.hub._persist_operation(operation)  # local authority bookkeeping
             self.pacing.record_revalidation_result(
                 due.pacing_plan_id, segment_sent_and_verified=False,
                 segment_index=due.segment_index, operation_id=operation.operation_id,
             )
             return operation
+        live_request = item.live_policy_request_factory()
         consumed = self.authorization.consume(
-            item.token, expected_binding=item.binding, live_request=item.live_policy_request
+            item.token, expected_binding=item.binding, live_request=live_request
         )
         if not consumed.accepted or not self._current(item):
             abort = getattr(self.driver, "abort_send", None)
+            aborted = None
             if abort is not None:
-                await abort(operation)
-            operation.status = SendStatus.CANCELLED
+                aborted = await abort(operation)
+            operation.status = SendStatus.CANCELLED if aborted is None or aborted.status is SendStatus.CANCELLED else SendStatus.UNCERTAIN
+            if operation.status is SendStatus.UNCERTAIN:
+                operation.error_code = "SEND_UNCERTAIN"
             operation = self.hub._persist_operation(operation)
             self.pacing.record_revalidation_result(
                 due.pacing_plan_id, segment_sent_and_verified=False,

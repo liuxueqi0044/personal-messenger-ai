@@ -180,6 +180,17 @@ class RuntimeState:
             raise KeyError(conversation_id)
         return int(row["binding_revision"]), int(row["conversation_revision"])
 
+    def execution_state(self, conversation_id: str) -> tuple[int, int, bool, int, bool]:
+        row = self.connection.execute(
+            "SELECT binding_revision,conversation_revision,paused FROM runtime_conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        global_revision, global_paused, _ = self.global_control()
+        return (int(row["binding_revision"]), int(row["conversation_revision"]),
+                bool(row["paused"]), global_revision, global_paused)
+
     def claim_events(self, *, limit: int = 100) -> list[sqlite3.Row]:
         with self.uow() as db:
             rows = db.execute(

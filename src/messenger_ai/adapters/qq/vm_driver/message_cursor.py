@@ -14,7 +14,7 @@ def _identity(row: dict[str, object]) -> str:
 class MessageCursorStore:
     """Transactional per-conversation snapshot, sequence and delivery outbox."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: str | Path) -> None:
         self.connection = sqlite3.connect(str(path), isolation_level=None)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript("""
@@ -39,13 +39,16 @@ class MessageCursorStore:
                 self.connection.execute("COMMIT")
                 return ()  # first observation establishes a baseline
             before = json.loads(row["snapshot_json"])
-            matches = [overlap for overlap in range(1, min(len(before), len(identities)) + 1)
-                       if before[-overlap:] == identities[:overlap]]
-            if not matches:
-                raise ValueError("message_anchor_gap")
-            longest = max(matches)
-            if len(matches) > 1 and len(set(before[-longest:])) == 1:
-                raise ValueError("message_anchor_ambiguous")
+            if not before:
+                longest = 0
+            else:
+                matches = [overlap for overlap in range(1, min(len(before), len(identities)) + 1)
+                           if before[-overlap:] == identities[:overlap]]
+                if not matches:
+                    raise ValueError("message_anchor_gap")
+                longest = max(matches)
+                if len(matches) > 1 and len(set(before[-longest:])) == 1:
+                    raise ValueError("message_anchor_ambiguous")
             next_seq = int(row["next_seq"])
             keys: list[str] = []
             for bubble in bubbles[longest:]:
@@ -74,6 +77,15 @@ class MessageCursorStore:
 
     def acknowledge(self, outbox_id: int) -> bool:
         return bool(self.connection.execute("UPDATE observation_outbox SET status='delivered' WHERE outbox_id=? AND status='dispatching'", (outbox_id,)).rowcount)
+
+    def acknowledge_keys(self, conversation_id: str, local_keys: tuple[str, ...]) -> int:
+        if not local_keys:
+            return 0
+        placeholders = ",".join("?" for _ in local_keys)
+        return self.connection.execute(
+            f"UPDATE observation_outbox SET status='delivered' WHERE conversation_id=? AND local_key IN ({placeholders}) AND status='dispatching'",
+            (conversation_id, *local_keys),
+        ).rowcount
 
     def recover(self) -> int:
         return self.connection.execute("UPDATE observation_outbox SET status='pending' WHERE status='dispatching'").rowcount

@@ -30,14 +30,26 @@ class RuntimeCoordinator:
     def observe(self, batch: ObservationBatch) -> tuple[str, ...]:
         return self.state.apply_observation(batch)
 
+    async def observe_driver(self, driver, conversation_id: str) -> tuple[str, ...]:
+        binding_revision, conversation_revision = self.state.revisions(conversation_id)
+        batch = await driver.observe_conversation(
+            conversation_id, binding_revision=binding_revision,
+            conversation_revision=conversation_revision,
+        )
+        events = self.state.apply_observation(batch)
+        driver.acknowledge_observation(
+            conversation_id, tuple(message.local_message_key for message in batch.messages)
+        )
+        return events
+
     def dispatch_events(self, *, limit: int = 100) -> int:
         delivered = 0
         for row in self.state.claim_events(limit=limit):
             ok = False
             try:
-                message = ObservedMessage.model_validate_json(row["payload_json"])
                 event_type = row["event_type"]
                 if event_type == "new_message":
+                    message = ObservedMessage.model_validate_json(row["payload_json"])
                     namespaced_key = f"qq-uia/{row['aggregate_id']}/{message.local_message_key}"
                     inbound = InboundMessage(
                         event_id=uuid5(NAMESPACE_URL, f"pmai-v5:{row['dedupe_key']}"),
@@ -79,6 +91,12 @@ class RuntimeCoordinator:
                         self.pacing.on_paused(item["conversation_id"])
                 elif event_type == "global_resume":
                     pass
+                elif event_type == "contact_resume":
+                    pass
+                elif event_type == "bot_observed":
+                    pass
+                else:
+                    raise ValueError(f"unsupported runtime event: {event_type}")
                 # bot_observed intentionally does not cancel M10 segments.
                 ok = True
                 delivered += 1

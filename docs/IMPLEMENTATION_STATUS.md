@@ -10,7 +10,7 @@
 | B3 发送账本与执行器 | 实机待验 | 需要用测试联系人验证 operation_id、提交超时、重复调用和 UNCERTAIN 隔离。 |
 | B4 记忆、规则与 DeepSeek | 仅有离线契约检查 | DeepSeek key 由用户在客体的密钥存储或运行环境中配置，不要贴到聊天、源码、截图或普通日志。 |
 | B5 编排与恢复 | 仅有离线契约检查 | 需要验证重启恢复、全局/联系人暂停、到期任务恢复和多联系人公平调度。 |
-| B6 控制 WebUI | Projection 已写入并完成真实 SQLite/Starlette 离线契约检查；实机待验 | `RuntimeWebUIProjection` 从 RuntimeState 与 Hub projection 生成常用页面；生产入口缺真实 facade 时直接报错，不回退 Fake。 |
+| B6 控制 WebUI | Projection 与 AtomicRuntimeControls 已完成，真实 SQLite/Starlette 离线契约检查通过；真实 driver/API/VM 仍待验 | `RuntimeWebUIProjection` 从 RuntimeState、Hub、M10 和可选规则/driver 投影生成常用页面；生产入口缺真实 facade 时直接报错，不回退 Fake。 |
 | B7 端到端交付 | 尚未完成 | 需要真实 A/B/C 消息、至少 5 个配置联系人调度检查，以及验收矩阵记录。 |
 
 ## 真实 runtime 与 WebUI 接口
