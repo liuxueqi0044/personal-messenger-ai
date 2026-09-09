@@ -10,6 +10,8 @@ need Windows-only dependencies.
 
 import hashlib
 import os
+import json
+import subprocess
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -29,6 +31,20 @@ class WindowsUIAQQAccessibility:
             raise UIAUnavailable("QQ VM transport can only run on Windows")
         if os.environ.get("PERSONAL_MESSENGER_VM_GUEST") != "1":
             raise UIAUnavailable("refusing UI automation outside a certified VM guest")
+        try:
+            probe = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model | ConvertTo-Json -Compress"],
+                check=True, capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            machine = json.loads(probe.stdout)
+            manufacturer = str(machine.get("Manufacturer", "")).lower()
+            model = str(machine.get("Model", "")).lower()
+        except Exception as exc:
+            raise UIAUnavailable("guest machine identity could not be certified") from exc
+        if "virtualbox" not in model or not any(name in manufacturer for name in ("innotek", "oracle")):
+            raise UIAUnavailable("refusing UI automation: machine is not a certified VirtualBox guest")
         try:
             import uiautomation as auto  # type: ignore[import-not-found]
         except ImportError as exc:

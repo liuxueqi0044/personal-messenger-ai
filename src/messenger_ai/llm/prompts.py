@@ -24,6 +24,9 @@ def build_projection(request: ReplyPlanRequest) -> PromptProjection:
     behavior = {
         "required_or_context_rules": list(rules.behavior),
         "prohibited_rules": list(rules.prohibited),
+        "escalation_rules": list(rules.escalation),
+        "positive_examples": list(rules.examples_positive),
+        "negative_examples": list(rules.examples_negative),
         "pacing": rules.pacing_note,
         "examples_are_not_templates": True,
     }
@@ -38,11 +41,16 @@ def build_projection(request: ReplyPlanRequest) -> PromptProjection:
         "summaries": [
             item.model_dump(mode="json") for item in request.contact.summaries
         ],
+        "recent_messages": [
+            item.model_dump(mode="json") for item in request.contact.recent_messages
+        ],
     }
     inbound = [item.model_dump(mode="json") for item in request.inbound]
     return PromptProjection(
         system_safety=SYSTEM_SAFETY,
-        persona_style="\n".join(rules.persona_style) or "自然、简短、柔和，像正常聊天",
+        persona_style=_json({"identity": rules.persona_identity, "language": rules.language,
+                             "preferred_length": rules.preferred_length,
+                             "tone": list(rules.persona_style)}),
         behavior=_json(behavior),
         contact_context=_json(context),
         current_inbound=_json({"messages": inbound, "untrusted_data": True}),

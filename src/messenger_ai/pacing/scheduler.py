@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from messenger_ai.domain.clock import ClockPort, SystemClock
 
@@ -200,6 +200,7 @@ class PacingScheduler:
             segment_gap_seconds(segment, request.limits) for segment in segments[:-1]
         ]
         plan = PacingPlanRecord(
+            pacing_plan_id=request.reserved_pacing_plan_id or uuid4(),
             conversation_id=request.draft.conversation_id,
             contact_id=request.draft.contact_id,
             draft_id=request.draft.draft_id,
@@ -209,6 +210,8 @@ class PacingScheduler:
             rule_version=request.draft.rule_version,
             pacing_rule_version=request.draft.rule_version,
             eligibility_id=request.draft.eligibility_id,
+            segment_eligibility_ids=request.segment_eligibility_ids or (request.draft.eligibility_id,) * len(segments),
+            segment_draft_ids=request.segment_draft_ids or (request.draft.draft_id,) * len(segments),
             created_at=self.now(),
             quiet_until=quiet_until,
             earliest_send_at=due,
@@ -391,12 +394,12 @@ class PacingScheduler:
                     pacing_plan_id=plan.pacing_plan_id,
                     conversation_id=plan.conversation_id,
                     contact_id=plan.contact_id,
-                    draft_id=plan.draft_id,
+                    draft_id=plan.segment_draft_ids[plan.segment_index],
                     text_hash=plan.text_hash,
                     expected_last_message_key=plan.expected_last_message_key,
                     rule_version=plan.rule_version,
                     pacing_rule_version=plan.pacing_rule_version,
-                    eligibility_id=plan.eligibility_id,
+                    eligibility_id=plan.segment_eligibility_ids[plan.segment_index],
                     due_at=now,
                     segment_index=plan.segment_index,
                     segment_count=plan.segment_count,

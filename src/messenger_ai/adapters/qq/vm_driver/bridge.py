@@ -32,6 +32,8 @@ class QQVMDriverBridge:
         if len(self._bindings) != len(bindings):
             raise ValueError("conversation bindings must be unique")
         self._by_id = {item.binding_id: item for item in bindings}
+        if str(sqlite_path) != ":memory:":
+            Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(sqlite_path), isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript("""
@@ -44,7 +46,32 @@ class QQVMDriverBridge:
           status TEXT NOT NULL, commit_intent INTEGER NOT NULL DEFAULT 0,
           error_code TEXT, UNIQUE(segment_ref)
         );
+        CREATE TABLE IF NOT EXISTS qq_vm_receipts(
+          operation_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+          receipt_fingerprint TEXT NOT NULL, local_key TEXT,
+          UNIQUE(conversation_id,local_key)
+        );
         """)
+        receipt_sql = self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='qq_vm_receipts'"
+        ).fetchone()[0]
+        if "local_key TEXT UNIQUE" in receipt_sql:
+            self._db.executescript("""
+            BEGIN IMMEDIATE;
+            ALTER TABLE qq_vm_receipts RENAME TO qq_vm_receipts_old;
+            CREATE TABLE qq_vm_receipts(
+              operation_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+              receipt_fingerprint TEXT NOT NULL, local_key TEXT,
+              UNIQUE(conversation_id,local_key));
+            INSERT INTO qq_vm_receipts SELECT * FROM qq_vm_receipts_old;
+            DROP TABLE qq_vm_receipts_old;
+            COMMIT;
+            """)
+        self._db.execute(
+            "UPDATE qq_vm_ops SET status=?,error_code=? WHERE (status=? AND commit_intent=1) OR status=?",
+            (SendStatus.UNCERTAIN.value, ErrorCode.SEND_UNCERTAIN.value,
+             SendStatus.PREPARED.value, SendStatus.COMMITTED.value),
+        )
         cursor_path = Path(sqlite_path).with_suffix(".cursor.sqlite3") if str(sqlite_path) != ":memory:" else ":memory:"
         self._cursor = MessageCursorStore(cursor_path)
         self._cursor.recover()
@@ -67,7 +94,18 @@ class QQVMDriverBridge:
                                     (str(operation_id), command.idempotency_key, segment_ref)).fetchone()
         retry_pending = False
         if existing:
-            if existing["operation_id"] != str(operation_id) or existing["text_hash"] != command.text_hash:
+            binding = self._bindings.get(command.conversation_id)
+            if (
+                existing["operation_id"] != str(operation_id)
+                or existing["idempotency_key"] != command.idempotency_key
+                or existing["draft_id"] != str(command.draft_id)
+                or existing["conversation_id"] != command.conversation_id
+                or binding is None or existing["binding_id"] != binding.binding_id
+                or existing["segment_ref"] != segment_ref
+                or int(existing["binding_revision"]) != binding_revision
+                or int(existing["conversation_revision"]) != conversation_revision
+                or existing["text_hash"] != command.text_hash
+            ):
                 return SendOperation(operation_id=operation_id, idempotency_key=command.idempotency_key,
                                      draft_id=command.draft_id, status=SendStatus.FAILED,
                                      error_code=ErrorCode.FAILED_SAFE.value)
@@ -104,8 +142,11 @@ class QQVMDriverBridge:
         if row is None:
             operation.status = SendStatus.FAILED; operation.error_code = ErrorCode.FAILED_SAFE.value; return operation
         stored = self._operation(row)
-        if stored.status in _TERMINAL or row["commit_intent"]:
+        if stored.status in _TERMINAL:
             return stored
+        if row["commit_intent"]:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist(stored)
         if stored.status is not SendStatus.PREPARED:
             return stored
         self._persist(stored, commit_intent=True)
@@ -142,7 +183,17 @@ class QQVMDriverBridge:
             stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
             return self._persist(stored)
         if result.status is WorkerStatus.OK:
-            stored.status = SendStatus.VERIFIED
+            receipt = result.evidence.get("receipt")
+            if isinstance(receipt, dict):
+                stored.status = SendStatus.VERIFIED
+                fingerprint = _receipt_fingerprint(receipt)
+                self._db.execute(
+                    "INSERT OR IGNORE INTO qq_vm_receipts(operation_id,conversation_id,receipt_fingerprint) VALUES(?,?,?)",
+                    (str(stored.operation_id), row["conversation_id"], fingerprint),
+                )
+            else:
+                stored.status = SendStatus.UNCERTAIN
+                stored.error_code = ErrorCode.SEND_UNCERTAIN.value
         else:
             stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
         return self._persist(stored)
@@ -183,9 +234,20 @@ class QQVMDriverBridge:
                 self._cursor.ingest_snapshot(conversation_id, list(rows))
                 for claimed in self._cursor.claim(conversation_id):
                     raw = json.loads(claimed["payload_json"])
+                    receipt = self._db.execute(
+                        """SELECT operation_id FROM qq_vm_receipts
+                           WHERE conversation_id=? AND (local_key=? OR (local_key IS NULL AND receipt_fingerprint=?))
+                           ORDER BY CASE WHEN local_key=? THEN 0 ELSE 1 END""",
+                        (conversation_id, claimed["local_key"], _receipt_fingerprint(raw), claimed["local_key"]),
+                    ).fetchall()
+                    operation_id = UUID(receipt[0]["operation_id"]) if len(receipt) == 1 else None
+                    if operation_id is not None:
+                        self._db.execute("UPDATE qq_vm_receipts SET local_key=? WHERE operation_id=? AND local_key IS NULL",
+                                         (claimed["local_key"], str(operation_id)))
                     messages.append(ObservedMessage(
                         local_message_key=claimed["local_key"], direction=Direction(raw.get("direction", "unknown")),
                         text=str(raw.get("text", "")), observed_at=datetime.fromisoformat(str(raw["observed_at"])),
+                        operation_id=operation_id,
                         evidence_ref=f"qq-vm:{conversation_id}:{claimed['local_key']}"))
             except ValueError as exc:
                 complete = False; gap_reason = str(exc)
@@ -197,3 +259,20 @@ class QQVMDriverBridge:
     def acknowledge_observation(self, conversation_id: str, local_keys: tuple[str, ...]) -> int:
         """Called only after RuntimeState durably accepted the entire batch."""
         return self._cursor.acknowledge_keys(conversation_id, local_keys)
+
+    def close(self) -> None:
+        self._worker.stop()
+        self._cursor.close()
+        self._db.close()
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self._worker.stop)
+        self._cursor.close()
+        self._db.close()
+
+
+def _receipt_fingerprint(row: dict[str, object]) -> str:
+    stable = {key: row.get(key) for key in (
+        "direction", "text", "message_key", "conversation_internal_id", "participant_signature"
+    )}
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

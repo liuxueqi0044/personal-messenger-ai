@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS memory_consumed_events (
 CREATE TABLE IF NOT EXISTS memory_messages (
   message_id TEXT PRIMARY KEY, contact_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
   event_id TEXT NOT NULL, message_key TEXT NOT NULL, observed_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL, payload_json TEXT NOT NULL,
+  expires_at TEXT NOT NULL, direction TEXT NOT NULL DEFAULT 'inbound', payload_json TEXT NOT NULL,
   UNIQUE(contact_id, conversation_id, message_key), UNIQUE(event_id)
 );
 CREATE INDEX IF NOT EXISTS ix_memory_messages_context
@@ -102,6 +102,9 @@ class SQLiteMemoryStore:
                 self.connection.execute("PRAGMA journal_mode=WAL")
                 self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.executescript(DDL)
+            columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(memory_messages)")}
+            if "direction" not in columns:
+                self.connection.execute("ALTER TABLE memory_messages ADD COLUMN direction TEXT NOT NULL DEFAULT 'inbound'")
 
     @contextmanager
     def uow(self) -> Iterator[sqlite3.Connection]:

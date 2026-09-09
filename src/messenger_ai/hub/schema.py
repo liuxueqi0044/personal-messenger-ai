@@ -165,6 +165,12 @@ CREATE TABLE IF NOT EXISTS outbox (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_available ON outbox(status, available_at);
+CREATE TABLE IF NOT EXISTS directional_history (
+    event_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, contact_id TEXT NOT NULL,
+    platform_message_key TEXT NOT NULL, direction TEXT NOT NULL,
+    operation_id TEXT, text TEXT NOT NULL, observed_at TEXT NOT NULL,
+    UNIQUE(conversation_id, platform_message_key)
+);
 CREATE TABLE IF NOT EXISTS adapter_capabilities (
     capability_id TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,

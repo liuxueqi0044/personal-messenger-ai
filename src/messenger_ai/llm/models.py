@@ -35,6 +35,12 @@ class RiskLevel(StrEnum):
     BLOCKED = "blocked"
 
 
+class MessageDirection(StrEnum):
+    INBOUND = "inbound"
+    HUMAN_OUTBOUND = "human_outbound"
+    BOT_OUTBOUND = "bot_outbound"
+
+
 class InboundItem(StrictModel):
     """A minimum, already-isolated message projection.
 
@@ -45,6 +51,7 @@ class InboundItem(StrictModel):
     message_key: str = Field(min_length=1, max_length=256)
     text: str = Field(max_length=8000)
     observed_at: datetime | None = None
+    direction: MessageDirection = MessageDirection.INBOUND
 
 
 class ContextItem(StrictModel):
@@ -75,8 +82,14 @@ class RuleProjection(StrictModel):
     source_hash: str = Field(min_length=1, max_length=128)
     system_safety: tuple[str, ...] = ()
     persona_style: tuple[str, ...] = ()
+    persona_identity: str = ""
+    language: str = "zh-CN"
+    preferred_length: str = "concise"
     behavior: tuple[str, ...] = ()
     prohibited: tuple[str, ...] = ()
+    escalation: tuple[str, ...] = ()
+    examples_positive: tuple[str, ...] = ()
+    examples_negative: tuple[str, ...] = ()
     pacing_note: str = "Planner does not choose send times"
 
 

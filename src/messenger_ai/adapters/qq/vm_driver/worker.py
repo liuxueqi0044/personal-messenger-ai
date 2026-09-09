@@ -101,7 +101,7 @@ class QQVMWorker:
         if self._accessibility.read_composer(window, self._selectors.selector("composer")) != evidence["composer_text"]:
             return self._result(command, WorkerStatus.FAILED_SAFE, "composer_drift")
         current_bubbles = [item.model_dump(mode="json") for item in self._accessibility.list_bubbles(window, self._selectors.selector("bubbles"))]
-        if current_bubbles != evidence["before_bubbles"]:
+        if _semantic_bubbles(current_bubbles) != _semantic_bubbles(evidence["before_bubbles"]):
             return self._result(command, WorkerStatus.FAILED_SAFE, "stale_context")
         self._committed.add(command.operation_id)
         self._accessibility.invoke_send(window, self._selectors.selector("send"))
@@ -167,6 +167,17 @@ class QQVMWorker:
         return WorkerResult(request_id=command.request_id, kind=command.kind, status=status, worker_epoch=self._epoch, operation_id=command.operation_id, binding_id=command.binding_id, binding_revision=command.binding_revision, conversation_revision=command.conversation_revision, error_code=error_code, evidence=evidence or {})
 
 
+def _semantic_bubbles(rows: object) -> list[tuple[object, ...]]:
+    """Compare message identity/content while ignoring volatile capture metadata."""
+    if not isinstance(rows, list):
+        return []
+    return [
+        (row.get("direction"), row.get("text"), row.get("message_key"),
+         row.get("conversation_internal_id"), row.get("participant_signature"))
+        for row in rows if isinstance(row, dict)
+    ]
+
+
 class QQVMWorkerProcess:
     """Spawn-only guest process façade; host callers never touch QQ UIA directly."""
 
@@ -195,8 +206,23 @@ class QQVMWorkerProcess:
 
     def stop(self, timeout_seconds: float = 5) -> None:
         if self._process.is_alive():
-            self._parent.send(WorkerCommand(kind=WorkerKind.STOP).model_dump(mode="json"))
+            try:
+                self._parent.send(WorkerCommand(kind=WorkerKind.STOP).model_dump(mode="json"))
+            except (BrokenPipeError, EOFError, OSError):
+                pass
             self._process.join(timeout_seconds)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout_seconds)
+            if self._process.is_alive() and hasattr(self._process, "kill"):
+                self._process.kill()
+                self._process.join(timeout_seconds)
+        try:
+            self._parent.close()
+        except (OSError, ValueError):
+            pass
+
+    close = stop
 
 
 def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentityBinding, ...]) -> None:
@@ -211,8 +237,13 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
 
 def _new_suffix(before: list[object], after: list[dict[str, object]]) -> list[dict[str, object]] | None:
     """Find only an ordered post-snapshot tail; never subtract unstable UI keys."""
-    expected = [(row.get("direction"), row.get("text")) for row in before if isinstance(row, dict)]
-    actual = [(row.get("direction"), row.get("text")) for row in after]
+    def identity(row: dict[str, object]) -> tuple[object, ...]:
+        return (row.get("direction"), row.get("text"), row.get("message_key"),
+                row.get("conversation_internal_id"), row.get("participant_signature"))
+    expected = [identity(row) for row in before if isinstance(row, dict)]
+    actual = [identity(row) for row in after]
+    if not expected:
+        return None
     for overlap in range(min(len(expected), len(actual)), 0, -1):
         if expected[len(expected) - overlap :] == actual[:overlap]:
             return after[overlap:]

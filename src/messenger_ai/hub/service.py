@@ -560,6 +560,21 @@ class HubService:
             )
             return {"draft_ids": drafts, "plan_ids": plans}
 
+    def record_directional_message(self, *, event_id: UUID, conversation_id: str,
+                                   contact_id: str, platform_message_key: str,
+                                   direction: str, text: str, observed_at: datetime,
+                                   operation_id: UUID | None = None) -> bool:
+        if direction not in {"human_outbound", "bot_outbound"}:
+            raise ValueError("directional history accepts outbound directions only")
+        with self.store.uow() as conn:
+            return bool(conn.execute(
+                """INSERT OR IGNORE INTO directional_history(
+                   event_id,conversation_id,contact_id,platform_message_key,direction,
+                   operation_id,text,observed_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (str(event_id), conversation_id, contact_id, platform_message_key, direction,
+                 str(operation_id) if operation_id else None, text, _stamp(observed_at)),
+            ).rowcount)
+
     def stable_window_is_current(
         self, conversation_id: str, last_message_key: str
     ) -> bool:

@@ -38,8 +38,19 @@ class DeepSeekResponsesProvider(OpenAIResponsesProvider):
                 api_key=api_key,
                 base_url=base_url.rstrip("/"),
                 timeout=timeout_seconds,
+                # A timeout may mean the remote request was accepted.  The
+                # daemon must decide whether a retry is safe; the SDK must
+                # never silently issue a second paid request.
+                max_retries=0,
             )
         super().__init__(model=model, transport=transport, timeout_seconds=timeout_seconds)
+
+    async def aclose(self) -> None:
+        close = getattr(self.transport, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
 
 
 DeepSeekProvider = DeepSeekResponsesProvider

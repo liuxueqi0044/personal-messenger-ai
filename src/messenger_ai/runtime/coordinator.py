@@ -5,6 +5,8 @@ from uuid import NAMESPACE_URL, uuid5
 from messenger_ai.domain import EventEnvelope, InboundMessage, Platform
 from messenger_ai.hub.service import HubService
 from messenger_ai.memory.service import MemoryService
+from messenger_ai.memory.models import MemoryMessage, MemoryMessageDirection
+from datetime import timedelta
 from messenger_ai.pacing import PacingScheduler
 
 from .contracts import Direction, ObservationBatch, ObservedMessage
@@ -44,7 +46,11 @@ class RuntimeCoordinator:
 
     def dispatch_events(self, *, limit: int = 100) -> int:
         delivered = 0
-        for row in self.state.claim_events(limit=limit):
+        for _ in range(limit):
+            claimed = self.state.claim_events(limit=1)
+            if not claimed:
+                break
+            row = claimed[0]
             ok = False
             try:
                 event_type = row["event_type"]
@@ -78,6 +84,7 @@ class RuntimeCoordinator:
                         self.memory.consume_inbound(envelope)
                     self.pacing.on_new_inbound(row["aggregate_id"])
                 elif event_type == "human_outbound":
+                    self._record_outbound(row, MemoryMessageDirection.HUMAN_OUTBOUND)
                     self.pacing.on_user_takeover(row["aggregate_id"])
                 elif event_type == "direction_unknown":
                     self.pacing.on_health_changed(row["aggregate_id"])
@@ -94,15 +101,37 @@ class RuntimeCoordinator:
                 elif event_type == "contact_resume":
                     pass
                 elif event_type == "bot_observed":
-                    pass
+                    self._record_outbound(row, MemoryMessageDirection.BOT_OUTBOUND)
                 else:
                     raise ValueError(f"unsupported runtime event: {event_type}")
                 # bot_observed intentionally does not cancel M10 segments.
                 ok = True
                 delivered += 1
+            except Exception:
+                # Current event returns to pending. No later row was preclaimed,
+                # so another contact cannot become permanently dispatching.
+                break
             finally:
                 self.state.complete_event(row["event_id"], delivered=ok)
         return delivered
+
+    def _record_outbound(self, row, direction: MemoryMessageDirection) -> None:
+        message = ObservedMessage.model_validate_json(row["payload_json"])
+        event_id = uuid5(NAMESPACE_URL, f"pmai-v5:{row['dedupe_key']}")
+        key = f"qq-uia/{row['aggregate_id']}/{message.local_message_key}"
+        self.hub.record_directional_message(
+            event_id=event_id, conversation_id=row["aggregate_id"], contact_id=row["contact_id"],
+            platform_message_key=key, direction=direction.value, text=message.text,
+            observed_at=message.observed_at, operation_id=message.operation_id)
+        if self.memory is None:
+            return
+        self.memory.record_message(MemoryMessage(
+            contact_id=row["contact_id"], conversation_id=row["aggregate_id"],
+            source_event_id=event_id,
+            platform_message_key=key,
+            text=message.text, observed_at=message.observed_at,
+            expires_at=message.observed_at + timedelta(days=30), direction=direction,
+        ))
 
     def recover(self) -> dict[str, int]:
         return {

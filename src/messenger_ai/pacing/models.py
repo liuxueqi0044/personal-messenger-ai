@@ -133,6 +133,9 @@ class ScheduleRequest(PacingModel):
     limits: SchedulerLimits = Field(default_factory=SchedulerLimits)
     capability_healthy: bool = True
     paused: bool = False
+    reserved_pacing_plan_id: UUID | None = None
+    segment_eligibility_ids: tuple[str, ...] = ()
+    segment_draft_ids: tuple[UUID, ...] = ()
 
     @field_validator("first_inbound_at", "last_inbound_at", "last_outbound_at")
     @classmethod
@@ -158,6 +161,8 @@ class PacingPlanRecord(PacingModel):
     source_message_keys: tuple[str, ...]
     rule_version: str
     eligibility_id: str
+    segment_eligibility_ids: tuple[str, ...] = ()
+    segment_draft_ids: tuple[UUID, ...] = ()
     pacing_rule_version: str
     created_at: datetime
     quiet_until: datetime

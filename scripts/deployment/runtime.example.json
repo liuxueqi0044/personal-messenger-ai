@@ -1,0 +1,41 @@
+{
+  "schema": "pmai-v5-runtime-1",
+  "data_dir": "C:/PMAI/data",
+  "secret_vault": "C:/PMAI/secrets",
+  "model": "deepseek-v4-flash",
+  "timeout_seconds": 30,
+  "model_concurrency": 2,
+  "contacts": [
+    {
+      "contact_id": "REPLACE_WITH_APPROVED_CONTACT_ID",
+      "rulepack_status": "active",
+      "binding": {
+        "hub_conversation_id": "REPLACE_WITH_HUB_CONVERSATION_ID",
+        "contact_id": "REPLACE_WITH_APPROVED_CONTACT_ID",
+        "account_id": "REPLACE_WITH_QQ_ACCOUNT_ID",
+        "platform_conversation_id": "REPLACE_WITH_QQ_INTERNAL_ID",
+        "participant_signature": "REPLACE_WITH_VERIFIED_SIGNATURE",
+        "binding_id": "REPLACE_WITH_UNIQUE_BINDING_ID"
+      }
+    }
+  ],
+  "selector_pack": {
+    "client_version": "REPLACE_WITH_QQ_VERSION",
+    "environment_fingerprint": "REPLACE_WITH_64_HEX_GUEST_ENVIRONMENT_FINGERPRINT",
+    "last_verified_at": "2026-01-01T00:00:00Z",
+    "fixture_suite_version": "REPLACE_WITH_VERIFIED_SELECTOR_SUITE",
+    "selectors": []
+  },
+  "capability": {
+    "capability_version": "REPLACE_WITH_GUEST_CAPABILITY_VERSION",
+    "environment_fingerprint": "REPLACE_WITH_64_HEX_GUEST_ENVIRONMENT_FINGERPRINT",
+    "send_background": "unsupported",
+    "verify_background": "unsupported",
+    "send_guest_foreground": "supported",
+    "verify_guest_foreground": "supported",
+    "healthy": true,
+    "client_version": "REPLACE_WITH_QQ_VERSION",
+    "execution_mode": "guest_foreground",
+    "binding_revision": 1
+  }
+}

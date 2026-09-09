@@ -7,6 +7,7 @@ from .contracts import (
     SegmentRef,
     V5MessengerDriver,
 )
+from .assembly import RuntimeApplication, assemble_runtime
 
-__all__ = ["Direction", "ObservationBatch", "ObservedMessage", "SegmentRef", "V5MessengerDriver"]
-
+__all__ = ["Direction", "ObservationBatch", "ObservedMessage", "SegmentRef", "V5MessengerDriver",
+           "RuntimeApplication", "assemble_runtime"]

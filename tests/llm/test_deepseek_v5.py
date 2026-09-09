@@ -87,6 +87,7 @@ def test_sdk_construction_uses_deepseek_base_url_and_finite_timeout(monkeypatch)
         "api_key": "test-key",
         "base_url": "https://api.deepseek.com",
         "timeout": 11,
+        "max_retries": 0,
     }
 
 

@@ -18,6 +18,7 @@ from .models import (
     FactStatus,
     IdentityBinding,
     MemoryMessage,
+    MemoryMessageDirection,
     RelationshipState,
     SourceKind,
 )
@@ -146,30 +147,34 @@ class MemoryService:
                 text=message.text,
                 observed_at=message.observed_at,
                 expires_at=expires,
+                direction=MemoryMessageDirection.INBOUND,
             )
-            try:
-                db.execute(
-                    "INSERT INTO memory_messages(message_id,contact_id,conversation_id,event_id,message_key,observed_at,expires_at,payload_json) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        str(memory_message.message_id),
-                        memory_message.contact_id,
-                        memory_message.conversation_id,
-                        str(event.event_id),
-                        memory_message.platform_message_key,
-                        stamp(memory_message.observed_at),
-                        stamp(memory_message.expires_at),
-                        encode(memory_message),
-                    ),
-                )
-            except Exception as exc:
-                if "UNIQUE" not in str(exc).upper():
-                    raise
+            self._insert_message(db, memory_message, event_id=event.event_id)
             db.execute(
                 "INSERT INTO memory_consumed_events(consumer_name,event_id,consumed_at) VALUES (?,?,?)",
                 (self.consumer_name, str(event.event_id), stamp(self.now())),
             )
         return True
+
+    def record_message(self, message: MemoryMessage) -> MemoryMessage:
+        """Persist an already-authorized direction-aware history item."""
+        with self.store.uow() as db:
+            self._assert_context(db, message.contact_id, message.conversation_id)
+            self._insert_message(db, message, event_id=message.source_event_id)
+        return message
+
+    @staticmethod
+    def _insert_message(db, message: MemoryMessage, *, event_id: UUID) -> None:
+        try:
+            db.execute(
+                "INSERT INTO memory_messages(message_id,contact_id,conversation_id,event_id,message_key,observed_at,expires_at,direction,payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(message.message_id), message.contact_id, message.conversation_id,
+                 str(event_id), message.platform_message_key, stamp(message.observed_at),
+                 stamp(message.expires_at), message.direction.value, encode(message)),
+            )
+        except Exception as exc:
+            if "UNIQUE" not in str(exc).upper():
+                raise
 
     def add_summary(self, summary: ConversationSummary) -> ConversationSummary:
         with self.store.uow() as db:

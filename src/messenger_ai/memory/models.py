@@ -25,6 +25,12 @@ class SourceKind(StrEnum):
     USER_EDIT = "user_edit"
 
 
+class MemoryMessageDirection(StrEnum):
+    INBOUND = "inbound"
+    HUMAN_OUTBOUND = "human_outbound"
+    BOT_OUTBOUND = "bot_outbound"
+
+
 class HumanApproval(DomainModel):
     approval_id: UUID = Field(default_factory=uuid4)
     verified_by: str = Field(min_length=1)
@@ -100,6 +106,7 @@ class MemoryMessage(DomainModel):
     text: str
     observed_at: datetime
     expires_at: datetime
+    direction: MemoryMessageDirection = MemoryMessageDirection.INBOUND
 
     @model_validator(mode="after")
     def validate_expiry(self) -> MemoryMessage:

@@ -89,3 +89,6 @@ class MessageCursorStore:
 
     def recover(self) -> int:
         return self.connection.execute("UPDATE observation_outbox SET status='pending' WHERE status='dispatching'").rowcount
+
+    def close(self) -> None:
+        self.connection.close()
