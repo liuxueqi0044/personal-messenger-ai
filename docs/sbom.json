@@ -1,0 +1,124 @@
+{
+  "bomFormat": "PMAI-JSON-SBOM",
+  "specVersion": "1.0",
+  "serialNumber": "urn:uuid:personal-messenger-ai-0.1.0",
+  "generatedAt": "2026-09-07T19:09:51.877954+00:00",
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "personal-messenger-ai",
+      "version": "0.1.0"
+    },
+    "networkAccessUsed": false
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "beautifulsoup4",
+      "normalized_name": "beautifulsoup4",
+      "declared_requirement": "beautifulsoup4>=4.12",
+      "installed_version": "4.12.2",
+      "license": "MIT",
+      "scope": "optional:test"
+    },
+    {
+      "type": "library",
+      "name": "httpx",
+      "normalized_name": "httpx",
+      "declared_requirement": "httpx>=0.27",
+      "installed_version": "0.28.1",
+      "license": "BSD-3-Clause",
+      "scope": "optional:test"
+    },
+    {
+      "type": "library",
+      "name": "httpx",
+      "normalized_name": "httpx",
+      "declared_requirement": "httpx>=0.27",
+      "installed_version": "0.28.1",
+      "license": "BSD-3-Clause",
+      "scope": "optional:web"
+    },
+    {
+      "type": "library",
+      "name": "hypothesis",
+      "normalized_name": "hypothesis",
+      "declared_requirement": "hypothesis>=6",
+      "installed_version": "unknown",
+      "license": "unknown",
+      "scope": "optional:test"
+    },
+    {
+      "type": "library",
+      "name": "mcp",
+      "normalized_name": "mcp",
+      "declared_requirement": "mcp>=1.0",
+      "installed_version": "1.26.0",
+      "license": "MIT",
+      "scope": "optional:mcp"
+    },
+    {
+      "type": "library",
+      "name": "openai",
+      "normalized_name": "openai",
+      "declared_requirement": "openai>=1.0",
+      "installed_version": "2.24.0",
+      "license": "Apache-2.0",
+      "scope": "optional:llm"
+    },
+    {
+      "type": "library",
+      "name": "pydantic",
+      "normalized_name": "pydantic",
+      "declared_requirement": "pydantic>=2",
+      "installed_version": "2.11.10",
+      "license": "MIT",
+      "scope": "runtime"
+    },
+    {
+      "type": "library",
+      "name": "pytest",
+      "normalized_name": "pytest",
+      "declared_requirement": "pytest>=8",
+      "installed_version": "9.1.1",
+      "license": "MIT",
+      "scope": "optional:test"
+    },
+    {
+      "type": "library",
+      "name": "pytest-asyncio",
+      "normalized_name": "pytest-asyncio",
+      "declared_requirement": "pytest-asyncio>=0.23",
+      "installed_version": "unknown",
+      "license": "unknown",
+      "scope": "optional:test"
+    },
+    {
+      "type": "library",
+      "name": "PyYAML",
+      "normalized_name": "pyyaml",
+      "declared_requirement": "PyYAML>=6.0",
+      "installed_version": "6.0.3",
+      "license": "MIT",
+      "scope": "runtime"
+    },
+    {
+      "type": "library",
+      "name": "starlette",
+      "normalized_name": "starlette",
+      "declared_requirement": "starlette>=0.37",
+      "installed_version": "1.3.1",
+      "license": "BSD-3-Clause",
+      "scope": "optional:web"
+    },
+    {
+      "type": "library",
+      "name": "uvicorn",
+      "normalized_name": "uvicorn",
+      "declared_requirement": "uvicorn>=0.29",
+      "installed_version": "0.41.0",
+      "license": "BSD-3-Clause",
+      "scope": "optional:web"
+    }
+  ]
+}

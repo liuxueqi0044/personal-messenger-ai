@@ -1,0 +1,29 @@
+{
+  "profile_id": "qq-win11-9.9.26-dpi150-light-maximized-20260908",
+  "allowed_executable_paths": [
+    "sha256:c9341972d763dc647e7e1480a4da6f8387d9313be55d8fa2df616402a3bb51d3"
+  ],
+  "allowed_executable_signatures": [
+    "3940a912c01299f79fb75618081e66aec5e97ddd501b52b61d0b9f268a945654"
+  ],
+  "allowed_process_signatures": [
+    "009018a9caf016e75d30cb86f7f6b87ef51e9720d85b2c00283c9dcf71fd29a7"
+  ],
+  "allowed_window_classes": [
+    "Chrome_WidgetWin_1"
+  ],
+  "certified_fingerprint": {
+    "platform": "qq",
+    "executable_path": "sha256:c9341972d763dc647e7e1480a4da6f8387d9313be55d8fa2df616402a3bb51d3",
+    "executable_signature": "3940a912c01299f79fb75618081e66aec5e97ddd501b52b61d0b9f268a945654",
+    "process_signature": "009018a9caf016e75d30cb86f7f6b87ef51e9720d85b2c00283c9dcf71fd29a7",
+    "client_version": "9.9.26.44343",
+    "windows_version": "Microsoft Windows NT 10.0.26200.0",
+    "dpi_scale": 1.5,
+    "monitor_id": "aa63adaa279365a28f4b99794f628ef6c49e552e4fa5af1ed14d6213ee49e370",
+    "monitor_topology_digest": "53d50b35aebb329d628b92308306c1cd87844993c568e93703de32face9c5d0b",
+    "theme": "light",
+    "window_class": "Chrome_WidgetWin_1",
+    "presentation": "maximized"
+  }
+}

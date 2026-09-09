@@ -1,0 +1,24 @@
+schema_version: 1
+rulepack_id: personal-default
+persona:
+  identity: "待用户文件补充"
+  language: zh-CN
+  tone: []
+  preferred_length: concise
+required_behaviors: []
+prohibited_behaviors: []
+escalation_rules: []
+pacing:
+  hard_min_latency_seconds: 8
+  quiet_window_seconds: 6
+  reading_chars_per_second: 8
+  composition_chars_per_second: 5
+  min_inter_reply_gap_seconds: 15
+  long_reply_threshold_chars: 60
+  long_reply_min_latency_seconds: 30
+  auto_reply_max_chars: 120
+  auto_reply_max_segments: 3
+contacts: {}
+examples:
+  positive: []
+  negative: []
