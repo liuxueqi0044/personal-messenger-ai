@@ -245,10 +245,16 @@ class PolicyEngine:
             failures.append(PolicyReason.NO_FRESH_INBOUND)
         if not state.capability.healthy:
             failures.append(PolicyReason.ADAPTER_UNHEALTHY)
-        if state.capability.send_background is not SupportLevel.SUPPORTED:
-            failures.append(PolicyReason.BACKGROUND_SEND_UNSUPPORTED)
-        if state.capability.verify_background is not SupportLevel.SUPPORTED:
-            failures.append(PolicyReason.BACKGROUND_VERIFY_UNSUPPORTED)
+        if state.capability.execution_mode.value == "guest_foreground":
+            if state.capability.send_guest_foreground is not SupportLevel.SUPPORTED:
+                failures.append(PolicyReason.BACKGROUND_SEND_UNSUPPORTED)
+            if state.capability.verify_guest_foreground is not SupportLevel.SUPPORTED:
+                failures.append(PolicyReason.BACKGROUND_VERIFY_UNSUPPORTED)
+        else:
+            if state.capability.send_background is not SupportLevel.SUPPORTED:
+                failures.append(PolicyReason.BACKGROUND_SEND_UNSUPPORTED)
+            if state.capability.verify_background is not SupportLevel.SUPPORTED:
+                failures.append(PolicyReason.BACKGROUND_VERIFY_UNSUPPORTED)
         if not state.rate_limit_available:
             failures.append(PolicyReason.RATE_LIMITED)
         if not state.within_allowed_window:

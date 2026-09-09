@@ -15,6 +15,7 @@ from messenger_ai.domain import DomainModel
 class BubbleDirection(StrEnum):
     INBOUND = "inbound"
     OUTBOUND = "outbound"
+    UNKNOWN = "unknown"
 
 
 class QQWindow(DomainModel):
@@ -27,6 +28,7 @@ class QQWindow(DomainModel):
 class QQSelector(DomainModel):
     name: str = Field(min_length=1)
     automation_id: str | None = None
+    class_name: str | None = None
     control_type: str = Field(min_length=1)
     ancestor_automation_ids: tuple[str, ...] = ()
     confidence: float = Field(ge=0, le=1, default=1)

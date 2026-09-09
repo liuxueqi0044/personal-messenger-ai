@@ -9,6 +9,7 @@ model or adapter await.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sqlite3
 import threading
@@ -22,6 +23,7 @@ from uuid import UUID, uuid4
 
 from messenger_ai.domain import (
     Authorization,
+    AuthorizationType,
     AuthorizedSendCommand,
     Draft,
     DraftStatus,
@@ -762,6 +764,27 @@ class HubService:
             error_code=row["error_code"],
         )
 
+    def _command_for_operation(self, operation_id: UUID | str) -> AuthorizedSendCommand:
+        row = self.store.connection.execute(
+            """SELECT a.* FROM send_operations s
+               JOIN authorizations a ON a.authorization_id=s.authorization_id
+               WHERE s.operation_id=?""",
+            (str(operation_id),),
+        ).fetchone()
+        if row is None:
+            raise DomainError(ErrorCode.STALE_CONTEXT, "send operation has no M9 authorization")
+        return AuthorizedSendCommand(
+            draft_id=UUID(row["draft_id"]),
+            conversation_id=row["conversation_id"],
+            expected_last_message_key=row["expected_last_message_key"],
+            text_hash=row["text_hash"],
+            idempotency_key=row["idempotency_key"],
+            authorization_type=AuthorizationType(row["authorization_type"]),
+            authorization_id=UUID(row["authorization_id"]),
+            policy_version=row["policy_version"],
+            expires_at=_parse(row["expires_at"]),
+        )
+
     def _persist_operation(
         self, op: SendOperation, *, commit_intent: bool | None = None
     ) -> SendOperation:
@@ -777,7 +800,15 @@ class HubService:
             )
         return op
 
-    async def run_send(self, operation_id: UUID | str, adapter: Any) -> SendOperation:
+    async def run_send(
+        self,
+        operation_id: UUID | str,
+        adapter: Any,
+        *,
+        segment_ref: str = "legacy:0",
+        binding_revision: int = 1,
+        conversation_revision: int | None = None,
+    ) -> SendOperation:
         """Execute a two-phase send without automatic retry from uncertainty."""
         op = self._operation(operation_id)
         if op.status in (
@@ -788,18 +819,79 @@ class HubService:
         ):
             return op
         if op.status == SendStatus.PENDING:
-            prepared = await adapter.prepare_send(op)
-            op = self._persist_operation(prepared)
+            op = await self.prepare_send(
+                operation_id, adapter, segment_ref=segment_ref,
+                binding_revision=binding_revision,
+                conversation_revision=conversation_revision,
+            )
             if op.status != SendStatus.PREPARED:
                 return op
+        return await self.commit_prepared(operation_id, adapter)
+
+    async def prepare_send(
+        self, operation_id: UUID | str, adapter: Any, *, segment_ref: str,
+        binding_revision: int, conversation_revision: int | None = None,
+    ) -> SendOperation:
+        """Prepare only; runtime must revalidate and consume M9 before commit."""
+        op = self._operation(operation_id)
+        if op.status is not SendStatus.PENDING:
+            return op
+        if op.status == SendStatus.PENDING:
+            command = self._command_for_operation(operation_id)
+            if conversation_revision is None:
+                row = self.store.connection.execute(
+                    "SELECT version FROM conversations WHERE conversation_id=?",
+                    (command.conversation_id,),
+                ).fetchone()
+                conversation_revision = int(row["version"]) if row else 0
+            # Old test adapters used ``prepare_send(operation)``. Keep that
+            # explicit compatibility seam while all production drivers receive
+            # the immutable M9 command and the Hub-owned operation id.
+            parameter = next(iter(inspect.signature(adapter.prepare_send).parameters.values()), None)
+            if parameter is not None and parameter.name == "operation":
+                prepared = await adapter.prepare_send(op)
+            else:
+                prepared = await adapter.prepare_send(
+                    command,
+                    operation_id=op.operation_id,
+                    segment_ref=segment_ref,
+                    binding_revision=binding_revision,
+                    conversation_revision=conversation_revision,
+                )
+            if (
+                prepared.operation_id != op.operation_id
+                or prepared.idempotency_key != op.idempotency_key
+                or prepared.draft_id != op.draft_id
+            ):
+                op.status = SendStatus.FAILED
+                op.error_code = ErrorCode.FAILED_SAFE.value
+                return self._persist_operation(op)
+            op = self._persist_operation(prepared)
+        return op
+
+    async def commit_prepared(self, operation_id: UUID | str, adapter: Any) -> SendOperation:
+        """Persist non-idempotent intent, then commit and verify exactly once."""
+        op = self._operation(operation_id)
+        if op.status is not SendStatus.PREPARED:
+            return op
         # Persist before the non-idempotent commit: a crash after this point is
         # quarantined by recovery rather than guessing whether a message left.
         self._persist_operation(op, commit_intent=True)
-        committed = await adapter.commit_send(op)
+        try:
+            committed = await adapter.commit_send(op)
+        except Exception:
+            op.status = SendStatus.UNCERTAIN
+            op.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist_operation(op, commit_intent=True)
         op = self._persist_operation(committed, commit_intent=True)
         if op.status != SendStatus.COMMITTED:
             return op
-        verified = await adapter.verify_send(op)
+        try:
+            verified = await adapter.verify_send(op)
+        except Exception:
+            op.status = SendStatus.UNCERTAIN
+            op.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist_operation(op, commit_intent=True)
         return self._persist_operation(verified, commit_intent=True)
 
     def recover(self) -> dict[str, int]:

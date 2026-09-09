@@ -58,6 +58,12 @@ class ExecutionGuard:
         return self.registry.get(platform, capability_version, environment_fingerprint)
 
     async def check(self, request: GuardedAction) -> GuardDecision:
+        if request.action_type.value.endswith("_guest_foreground") and not request.guest_session_id:
+            return GuardDecision(
+                allowed=False,
+                error_code=GuardErrorCode.TARGET_MISMATCH,
+                reason="guest foreground actions require a verified guest session id",
+            )
         if self.stop.active:
             return GuardDecision(
                 allowed=False,

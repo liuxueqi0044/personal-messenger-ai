@@ -87,6 +87,27 @@ class PacingScheduler:
                   pacing_plan_id TEXT NOT NULL, contact_id TEXT NOT NULL, occurred_at TEXT NOT NULL,
                   PRIMARY KEY(pacing_plan_id, occurred_at)
                 );
+                CREATE TABLE IF NOT EXISTS m10_due_outbox (
+                  outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  pacing_plan_id TEXT NOT NULL,
+                  segment_index INTEGER NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  operation_id TEXT,
+                  claimed_at TEXT,
+                  delivered_at TEXT,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(pacing_plan_id, segment_index)
+                );
+                CREATE TABLE IF NOT EXISTS m10_segment_receipts (
+                  pacing_plan_id TEXT NOT NULL,
+                  segment_index INTEGER NOT NULL,
+                  operation_id TEXT NOT NULL,
+                  verified INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY(pacing_plan_id, segment_index),
+                  UNIQUE(operation_id)
+                );
                 CREATE TABLE IF NOT EXISTS m10_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 """
             )
@@ -296,7 +317,7 @@ class PacingScheduler:
         self, conn: sqlite3.Connection, conversation_id: str, reason: CancellationReason
     ) -> int:
         rows = conn.execute(
-            "SELECT pacing_plan_id FROM m10_plans WHERE conversation_id=? AND status='waiting'",
+            "SELECT pacing_plan_id FROM m10_plans WHERE conversation_id=? AND status IN ('waiting','due_for_revalidation')",
             (conversation_id,),
         ).fetchall()
         for row in rows:
@@ -308,7 +329,7 @@ class PacingScheduler:
     ) -> None:
         now = self.now()
         changed = conn.execute(
-            "UPDATE m10_plans SET status=?,cancel_reason=?,updated_at=? WHERE pacing_plan_id=? AND status='waiting'",
+            "UPDATE m10_plans SET status=?,cancel_reason=?,updated_at=? WHERE pacing_plan_id=? AND status IN ('waiting','due_for_revalidation')",
             (PacingStatus.CANCELLED.value, reason.value, _stamp(now), plan_id),
         ).rowcount
         if changed:
@@ -392,11 +413,56 @@ class PacingScheduler:
                     due.model_dump(mode="json"),
                     now,
                 )
+                conn.execute(
+                    "INSERT OR IGNORE INTO m10_due_outbox(pacing_plan_id,segment_index,payload_json,created_at) VALUES(?,?,?,?)",
+                    (str(plan.pacing_plan_id), plan.segment_index, due.model_dump_json(), _stamp(now)),
+                )
                 due_events.append(due)
         return due_events
 
+    def claim_due_outbox(self, *, limit: int = 100) -> list[tuple[int, DueForRevalidation]]:
+        """Claim durable due events for runtime delivery.
+
+        Claims survive process failure: ``recover_due_outbox`` returns abandoned
+        claims to pending without creating a second segment event.
+        """
+        now = self.now()
+        with self._uow() as conn:
+            rows = conn.execute(
+                "SELECT outbox_id,payload_json FROM m10_due_outbox WHERE status='pending' ORDER BY outbox_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            result: list[tuple[int, DueForRevalidation]] = []
+            for row in rows:
+                changed = conn.execute(
+                    "UPDATE m10_due_outbox SET status='dispatching',claimed_at=? WHERE outbox_id=? AND status='pending'",
+                    (_stamp(now), row["outbox_id"]),
+                ).rowcount
+                if changed:
+                    result.append((row["outbox_id"], DueForRevalidation.model_validate_json(row["payload_json"])))
+            return result
+
+    def complete_due_outbox(self, outbox_id: int) -> bool:
+        with self._uow() as conn:
+            changed = conn.execute(
+                "UPDATE m10_due_outbox SET status='delivered',delivered_at=? WHERE outbox_id=? AND status='dispatching'",
+                (_stamp(self.now()), outbox_id),
+            ).rowcount
+            return bool(changed)
+
+    def recover_due_outbox(self) -> int:
+        with self._uow() as conn:
+            return conn.execute(
+                "UPDATE m10_due_outbox SET status='pending',claimed_at=NULL WHERE status='dispatching'"
+            ).rowcount
+
     def record_revalidation_result(
-        self, pacing_plan_id: UUID, *, segment_sent_and_verified: bool
+        self,
+        pacing_plan_id: UUID,
+        *,
+        segment_sent_and_verified: bool,
+        segment_index: int | None = None,
+        operation_id: UUID | str | None = None,
     ) -> PacingPlanRecord | None:
         """Advance only a verified semantic segment.
 
@@ -411,9 +477,29 @@ class PacingScheduler:
             if row is None:
                 return None
             plan = PacingPlanRecord.model_validate_json(row["payload_json"])
+            expected_index = plan.segment_index
+            if operation_id is not None:
+                receipt = conn.execute(
+                    "SELECT pacing_plan_id,segment_index,verified FROM m10_segment_receipts WHERE operation_id=?",
+                    (str(operation_id),),
+                ).fetchone()
+                if receipt is not None:
+                    # Exact replay is idempotent; a cross-segment reuse is rejected.
+                    if receipt["pacing_plan_id"] != str(pacing_plan_id) or (
+                        segment_index is not None and receipt["segment_index"] != segment_index
+                    ):
+                        return None
+                    return plan
+            if segment_index is not None and segment_index != expected_index:
+                return None
             if row["status"] != PacingStatus.DUE_FOR_REVALIDATION.value:
                 return None
             now = self.now()
+            if operation_id is not None:
+                conn.execute(
+                    "INSERT INTO m10_segment_receipts VALUES(?,?,?,?,?)",
+                    (str(pacing_plan_id), expected_index, str(operation_id), int(segment_sent_and_verified), _stamp(now)),
+                )
             if (
                 not segment_sent_and_verified
                 or plan.segment_index + 1 >= plan.segment_count

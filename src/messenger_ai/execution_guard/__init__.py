@@ -19,7 +19,12 @@ from .controls import (
     PlatformMutex,
 )
 from .guard import ExecutionGuard, GuardedCallable
-from .interceptor import DEFAULT_ALLOWED_OPERATIONS, ActionInterceptor, ActionNotAllowed
+from .interceptor import (
+    DEFAULT_ALLOWED_OPERATIONS,
+    ActionInterceptor,
+    ActionNotAllowed,
+    GuestForegroundInterceptor,
+)
 from .models import (
     ActionPhase,
     AdapterCapabilities,
@@ -40,6 +45,7 @@ __all__ = [
     "DEFAULT_ALLOWED_OPERATIONS",
     "ActionInterceptor",
     "ActionNotAllowed",
+    "GuestForegroundInterceptor",
     "ActionPhase",
     "AdapterCapabilities",
     "CancellationToken",

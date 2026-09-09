@@ -168,6 +168,34 @@ def test_restart_preserves_plan_and_due_is_exactly_once(tmp_path) -> None:
     assert scheduler.due_for_revalidation() == []
 
 
+def test_due_outbox_survives_claim_crash_and_receipt_replay_is_idempotent() -> None:
+    from uuid import uuid4
+
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    plan = scheduler.schedule(request(clock, segments=["一", "二"])).plan
+    assert plan
+    clock.advance(8)
+    due = scheduler.due_for_revalidation()[0]
+    first_claim = scheduler.claim_due_outbox()
+    assert first_claim[0][1].event_id == due.event_id
+    assert scheduler.recover_due_outbox() == 1
+    outbox_id, replayed = scheduler.claim_due_outbox()[0]
+    assert replayed.event_id == due.event_id
+    assert scheduler.complete_due_outbox(outbox_id)
+    operation_id = uuid4()
+    advanced = scheduler.record_revalidation_result(
+        plan.pacing_plan_id, segment_sent_and_verified=True,
+        segment_index=0, operation_id=operation_id,
+    )
+    assert advanced and advanced.segment_index == 1
+    replay = scheduler.record_revalidation_result(
+        plan.pacing_plan_id, segment_sent_and_verified=True,
+        segment_index=0, operation_id=operation_id,
+    )
+    assert replay and replay.segment_index == 1
+
+
 def test_clock_jump_holds_instead_of_batch_revalidating() -> None:
     clock = FakeClock(START)
     scheduler = PacingScheduler(clock=clock)

@@ -88,3 +88,15 @@ class ActionInterceptor:
         if inspect.isawaitable(result):
             return await result
         return result
+
+
+GUEST_FOREGROUND_ALLOWED_OPERATIONS = DEFAULT_ALLOWED_OPERATIONS | frozenset(
+    {"guest.window.activate", "guest.keyboard.write_text", "guest.keyboard.press_enter"}
+)
+
+
+class GuestForegroundInterceptor(ActionInterceptor):
+    """Narrow input gate for a dedicated VM guest desktop."""
+
+    def __init__(self) -> None:
+        super().__init__(GUEST_FOREGROUND_ALLOWED_OPERATIONS)

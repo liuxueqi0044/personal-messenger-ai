@@ -48,3 +48,6 @@ __all__ = [
     "build_responses_input",
     "classify_provider_error",
 ]
+from .deepseek import DeepSeekProvider, DeepSeekResponsesProvider
+
+__all__ = ["DeepSeekProvider", "DeepSeekResponsesProvider"]

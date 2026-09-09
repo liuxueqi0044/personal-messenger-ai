@@ -24,6 +24,11 @@ class GuardedActionType(StrEnum):
     COMPOSE = "compose_background"
     SEND = "send_background"
     VERIFY = "verify_background"
+    OBSERVE_GUEST = "observe_guest_foreground"
+    RESOLVE_GUEST = "resolve_guest_foreground"
+    COMPOSE_GUEST = "compose_guest_foreground"
+    SEND_GUEST = "send_guest_foreground"
+    VERIFY_GUEST = "verify_guest_foreground"
 
 
 class ActionPhase(StrEnum):
@@ -83,6 +88,11 @@ class AdapterCapabilities(DomainModel):
     compose_background: SupportLevel = SupportLevel.UNSUPPORTED
     send_background: SupportLevel = SupportLevel.UNSUPPORTED
     verify_background: SupportLevel = SupportLevel.UNSUPPORTED
+    observe_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
+    resolve_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
+    compose_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
+    send_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
+    verify_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
     requires_visible_window: bool = False
     requires_unminimized: bool = False
     confidence: float = Field(ge=0, le=1)
@@ -118,6 +128,7 @@ class GuardedAction(DomainModel):
     target_process_id: int | None = Field(default=None, gt=0)
     target_window_handle: int | None = Field(default=None, gt=0)
     timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    guest_session_id: str | None = None
 
     @field_validator("requested_operations")
     @classmethod

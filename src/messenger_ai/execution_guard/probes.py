@@ -95,9 +95,13 @@ class ProbeRunner:
             )
             for kind in GuardedActionType
         }
-        confidence = sum(
-            level is SupportLevel.SUPPORTED for level in levels.values()
-        ) / len(levels)
+        probed_kinds = {probe.action_type for probe in probes}
+        confidence = (
+            sum(levels[kind] is SupportLevel.SUPPORTED for kind in probed_kinds)
+            / len(probed_kinds)
+            if probed_kinds
+            else 0.0
+        )
         capabilities = AdapterCapabilities(
             platform=platform,
             capability_version=capability_version,

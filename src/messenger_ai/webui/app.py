@@ -143,6 +143,30 @@ def _rows(
     return "".join(out) + "</tbody></table></div>"
 
 
+def _action_form(
+    csrf: str,
+    action: str,
+    entity_id: str,
+    version: Any,
+    label: str,
+    **extra: Any,
+) -> str:
+    return (
+        _form_html(
+            csrf,
+            "/actions/" + action,
+            entity_id,
+            int(version or 1),
+            **{key: str(value) for key, value in extra.items()},
+        )
+        + f'<button type="submit">{_esc(label)}</button></form>'
+    )
+
+
+def _status(value: Any) -> str:
+    return str(value or "unknown").replace("_", " ")
+
+
 async def _get_page(
     request: Request, name: str, entity_id: str | None = None
 ) -> Response:
@@ -162,7 +186,14 @@ async def _get_page(
             ],
             True,
         )
-        body = f'<p data-state="paused">自动化状态：{status}</p>{conversations}'
+        controls = _action_form(
+            request.state.session["csrf"],
+            "resume" if data["paused"] else "pause",
+            "global",
+            data.get("revision", 1),
+            "恢复全局自动化" if data["paused"] else "暂停全局自动化",
+        )
+        body = f'<p data-state="paused">全局自动化状态：{status}</p>{controls}{conversations}'
     elif name == "conversation":
         c = data["conversation"]
         body = f'<p data-entity-id="{_esc(c["conversation_id"])}">平台 {_esc(c["platform"])} · 联系人 {_esc(c["contact_id"])} · 版本 {_esc(c["version"])}</p>'
@@ -208,18 +239,76 @@ async def _get_page(
             ],
         )
     elif name == "contacts":
-        body = _rows(
-            data["contacts"],
-            [
-                ("contact_id", "联系人"),
-                ("display_name", "名称"),
-                ("platform", "平台"),
-                ("risk", "风险"),
-            ],
-        )
+        columns = [
+            ("contact_id", "联系人"),
+            ("display_name", "名称"),
+            ("binding_status", "绑定"),
+            ("binding_expires_at", "绑定有效期"),
+            ("last_observed_at", "最后观察"),
+            ("plan_status", "计划"),
+            ("pause_status", "暂停"),
+            ("health", "健康"),
+            ("uncertain", "不确定发送"),
+        ]
+        body = _rows(data["contacts"], columns, links=False)
+        for item in data["contacts"]:
+            cid = str(item.get("contact_id", ""))
+            version = item.get("revision", item.get("version", 1))
+            paused = bool(item.get("paused", False))
+            body += (
+                f'<section data-contact-id="{_esc(cid)}"><strong>{_esc(item.get("display_name", cid))}</strong> '
+                + _action_form(
+                    request.state.session["csrf"],
+                    "resume_contact" if paused else "pause_contact",
+                    cid,
+                    version,
+                    "恢复联系人" if paused else "暂停联系人",
+                )
+            )
+            for operation in item.get("uncertain_operations", ()):
+                operation_id = operation.get("operation_id", "")
+                expected_revision = operation.get("expected_revision", version)
+                body += _action_form(
+                    request.state.session["csrf"],
+                    "ack_uncertain",
+                    cid,
+                    version,
+                    "确认已查看，保持不自动重发",
+                    operation_id=operation_id,
+                    expected_revision=expected_revision,
+                )
+            body += "</section>"
     elif name == "contact":
         c = data["contact"]
-        body = f'<section data-entity-id="{_esc(c["contact_id"])}"><p>显示名 {_esc(c["display_name"])}</p><p>平台 {_esc(c["platform"])}</p><p>风险 {_esc(c["risk"])}</p></section>'
+        body = (
+            f'<section data-entity-id="{_esc(c["contact_id"])}">'
+            f'<p>显示名 {_esc(c.get("display_name", ""))}</p>'
+            f'<p>绑定：{_esc(_status(c.get("binding_status")))}</p>'
+            f'<p>绑定有效期：{_esc(c.get("binding_expires_at", ""))}</p>'
+            f'<p>最后观察：{_esc(c.get("last_observed_at", ""))}</p>'
+            f'<p>计划：{_esc(_status(c.get("plan_status")))}</p>'
+            f'<p>健康：{_esc(_status(c.get("health")))}</p>'
+            f'<p>发送不确定：{_esc(c.get("uncertain", False))}</p>'
+            "</section>"
+        )
+        version = c.get("revision", c.get("version", 1))
+        body += _action_form(
+            request.state.session["csrf"],
+            "resume_contact" if c.get("paused") else "pause_contact",
+            c["contact_id"],
+            version,
+            "恢复联系人" if c.get("paused") else "暂停联系人",
+        )
+        for operation in c.get("uncertain_operations", ()):
+            body += _action_form(
+                request.state.session["csrf"],
+                "ack_uncertain",
+                c["contact_id"],
+                version,
+                "确认已查看，保持不自动重发",
+                operation_id=operation.get("operation_id", ""),
+                expected_revision=operation.get("expected_revision", version),
+            )
     elif name == "rules":
         body = f'<section data-rule-version="{_esc(data["rule_version"])}"><p>当前规则版本：{_esc(data["rule_version"])}，状态：{_esc(data["status"])}</p><p>第一版工作台不提供规则激活按钮</p></section>'
     elif name == "pacing":
@@ -502,8 +591,13 @@ async def _sse(request: Request) -> Response:
 
 
 def create_app(
-    hub: HubFacade | None = None, lease_service: SessionLeaseService | None = None
+    hub: HubFacade | None = None,
+    lease_service: SessionLeaseService | None = None,
+    *,
+    demo: bool = False,
 ) -> Starlette:
+    if hub is None and not demo:
+        raise RuntimeError("production WebUI requires a real HubFacade")
     facade = hub or FakeHubFacade()
 
     async def inbox(r: Request) -> Response:

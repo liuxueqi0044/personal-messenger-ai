@@ -1,5 +1,5 @@
 from .app import SESSION_TTL_SECONDS, create_app, validate_bind_host
-from .facade import FakeHubFacade, HubFacade
+from .facade import FakeHubFacade, HubFacade, LiveHubFacade, RuntimeWebUI
 from .session_lease import (
     ConfirmResult,
     PrepareResult,
@@ -14,6 +14,8 @@ __all__ = [
     "ConfirmResult",
     "FakeHubFacade",
     "HubFacade",
+    "LiveHubFacade",
+    "RuntimeWebUI",
     "PrepareResult",
     "RevokeResult",
     "SessionLeaseService",

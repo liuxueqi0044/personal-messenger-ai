@@ -345,6 +345,9 @@ class AuthorizationService:
             pacing_rule_version=request.draft.pacing_rule_version,
             capability_snapshot_hash=request.draft.capability_snapshot_hash,
             policy_state_version=request.draft.policy_state_version,
+            execution_mode=request.state.capability.execution_mode,
+            binding_revision=request.state.binding_revision,
+            conversation_revision=request.state.conversation_revision,
             approval_id=revalidation.approval_id,
         )
         authorization_id = str(uuid4())
@@ -478,6 +481,11 @@ class AuthorizationService:
                 state.active_pacing_rule_version == binding.pacing_rule_version,
                 draft.capability_snapshot_hash == binding.capability_snapshot_hash,
                 state.capability.snapshot_hash == binding.capability_snapshot_hash,
+                state.capability.execution_mode == binding.execution_mode,
+                draft.binding_revision == binding.binding_revision,
+                state.binding_revision == binding.binding_revision,
+                draft.conversation_revision == binding.conversation_revision,
+                state.conversation_revision == binding.conversation_revision,
                 draft.policy_state_version == binding.policy_state_version,
                 state.policy_state_version == binding.policy_state_version,
                 (request.approval.approval_id if request.approval else None)

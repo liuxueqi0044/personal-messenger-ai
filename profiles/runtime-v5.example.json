@@ -1,0 +1,14 @@
+{
+  "schema": "pmai-v5-runtime-1",
+  "data_dir": "state",
+  "model": "deepseek-v4-flash",
+  "contacts": [
+    {
+      "local_contact_id": "replace-after-explicit-binding",
+      "conversation_id": "replace-after-explicit-binding",
+      "binding_revision": 1,
+      "rulepack_id": "replace-with-approved-active-rulepack",
+      "rulepack_status": "active"
+    }
+  ]
+}

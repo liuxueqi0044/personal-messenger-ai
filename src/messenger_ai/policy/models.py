@@ -142,13 +142,22 @@ class SensitiveCategory(StrEnum):
     EXTERNAL_CONTENT = "external_content"
 
 
+class ExecutionMode(StrEnum):
+    BACKGROUND = "background"
+    GUEST_FOREGROUND = "guest_foreground"
+
+
 class CapabilitySnapshot(PolicyModel):
     capability_version: str = Field(min_length=1)
     environment_fingerprint: str = Field(min_length=1)
     send_background: SupportLevel
     verify_background: SupportLevel
+    send_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
+    verify_guest_foreground: SupportLevel = SupportLevel.UNSUPPORTED
     healthy: bool
     client_version: str = Field(min_length=1)
+    execution_mode: ExecutionMode = ExecutionMode.BACKGROUND
+    binding_revision: int = Field(default=1, ge=1)
 
     @property
     def snapshot_hash(self) -> str:
@@ -170,6 +179,8 @@ class DraftSnapshot(PolicyModel):
     pacing_rule_version: str = Field(min_length=1)
     capability_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     policy_state_version: str = Field(min_length=1)
+    binding_revision: int = Field(default=1, ge=1)
+    conversation_revision: int = Field(default=1, ge=1)
     created_at: datetime
     expires_at: datetime
 
@@ -241,6 +252,8 @@ class LivePolicyState(PolicyModel):
     active_pacing_rule_version: str = Field(min_length=1)
     capability: CapabilitySnapshot
     policy_state_version: str = Field(min_length=1)
+    binding_revision: int = Field(default=1, ge=1)
+    conversation_revision: int = Field(default=1, ge=1)
     conversation_type: ConversationType = ConversationType.DIRECT
     inbound_content_type: Literal["text", "image_notice", "unsupported"] = "text"
     outbound_content_type: Literal["text", "unsupported"] = "text"
@@ -342,6 +355,9 @@ class AuthorizationBinding(PolicyModel):
     pacing_rule_version: str = Field(min_length=1)
     capability_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     policy_state_version: str = Field(min_length=1)
+    execution_mode: ExecutionMode = ExecutionMode.BACKGROUND
+    binding_revision: int = Field(default=1, ge=1)
+    conversation_revision: int = Field(default=1, ge=1)
     approval_id: str | None = None
 
     @property
@@ -375,6 +391,8 @@ class InvalidationKind(StrEnum):
     RULE_CHANGED = "rule_changed"
     PACING_CHANGED = "pacing_changed"
     CAPABILITY_CHANGED = "capability_changed"
+    BINDING_CHANGED = "binding_changed"
+    HUMAN_OUTBOUND = "human_outbound"
 
 
 class InvalidationEvent(PolicyModel):

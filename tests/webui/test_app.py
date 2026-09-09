@@ -3,7 +3,7 @@ from __future__ import annotations
 from bs4 import BeautifulSoup
 from starlette.testclient import TestClient
 
-from messenger_ai.webui import FakeHubFacade, create_app, validate_bind_host
+from messenger_ai.webui import FakeHubFacade, LiveHubFacade, create_app, validate_bind_host
 
 
 def client() -> TestClient:
@@ -78,3 +78,73 @@ def test_loopback_only() -> None:
             pass
         else:
             raise AssertionError(host)
+
+
+def test_production_app_requires_explicit_facade() -> None:
+    try:
+        create_app()
+    except RuntimeError as exc:
+        assert "real HubFacade" in str(exc)
+    else:
+        raise AssertionError("production app silently created a fake facade")
+
+
+def test_ui_contract_facade_delegates_explicit_runtime_contract() -> None:
+    class Runtime:
+        def webui_page(self, name, entity_id=None):
+            return {"name": name, "entity_id": entity_id}
+
+        def webui_command(self, name, payload):
+            return {"command": name, "payload": payload}
+
+    facade = LiveHubFacade(Runtime())
+    assert facade.page("contacts")["name"] == "contacts"
+    assert facade.command("pause", {"entity_id": "global"})["command"] == "pause"
+
+    try:
+        LiveHubFacade(object())
+    except TypeError as exc:
+        assert "webui_page" in str(exc)
+    else:
+        raise AssertionError("missing runtime methods were accepted")
+
+
+def test_ui_contract_can_back_all_common_pages() -> None:
+    class Runtime:
+        def webui_page(self, name, entity_id=None):
+            if name == "inbox":
+                return {"paused": False, "revision": 1, "conversations": []}
+            if name == "contacts":
+                return {"paused": False, "revision": 1, "contacts": []}
+            if name == "contact":
+                return {"contact": {"contact_id": entity_id, "display_name": "A", "revision": 1}}
+            if name == "reviews":
+                return {"drafts": []}
+            if name == "rules":
+                return {"rule_version": "live", "status": "active"}
+            if name == "pacing":
+                return {"profile": {}, "plans": []}
+            if name == "adapters":
+                return {"adapters": []}
+            if name == "incidents":
+                return {"incidents": []}
+            if name == "audit":
+                return {"entries": []}
+            if name == "settings":
+                return {"mode": "production"}
+            raise KeyError(name)
+
+        def webui_command(self, name, payload):
+            return {"command": name, "command_id": "live-1"}
+
+    live = TestClient(create_app(LiveHubFacade(Runtime())))
+    for path in ["/inbox", "/contacts", "/contacts/a", "/reviews", "/rules", "/pacing", "/adapters", "/incidents", "/audit", "/settings"]:
+        assert live.get(path).status_code == 200
+
+
+def test_fixture_contact_page_exposes_operational_state_and_controls() -> None:
+    response = client().get("/contacts")
+    assert response.status_code == 200
+    assert "demo-only" in response.text
+    assert "绑定有效期" in response.text
+    assert "pause_contact" in response.text

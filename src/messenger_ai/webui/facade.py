@@ -17,6 +17,36 @@ class HubFacade(Protocol):
     def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
+class RuntimeWebUI(Protocol):
+    """Small runtime boundary owned by the real coordinator.
+
+    ``webui_page`` must return presentation-safe dictionaries and
+    ``webui_command`` must enforce revisions/idempotency in the runtime.  The
+    browser layer never receives a database or adapter object.
+    """
+
+    def webui_page(self, name: str, entity_id: str | None = None) -> dict[str, Any]: ...
+    def webui_command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
+@dataclass
+class LiveHubFacade:
+    """Adapter from the runtime's explicit WebUI boundary to ``HubFacade``."""
+
+    runtime: RuntimeWebUI
+
+    def __post_init__(self) -> None:
+        for method in ("webui_page", "webui_command"):
+            if not callable(getattr(self.runtime, method, None)):
+                raise TypeError(f"runtime missing required WebUI method: {method}")
+
+    def page(self, name: str, entity_id: str | None = None) -> dict[str, Any]:
+        return self.runtime.webui_page(name, entity_id)
+
+    def command(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.runtime.webui_command(name, payload)
+
+
 @dataclass
 class FakeHubFacade:
     """Deterministic in-memory Hub double for offline and browser-contract tests."""
@@ -39,6 +69,16 @@ class FakeHubFacade:
             "platform": "qq",
             "version": 1,
             "risk": "low",
+            "binding_status": "demo-only",
+            "binding_expires_at": "",
+            "last_observed_at": now.isoformat(),
+            "plan_status": "waiting",
+            "pause_status": "running",
+            "health": "fixture",
+            "uncertain": False,
+            "uncertain_operations": [],
+            "revision": 1,
+            "paused": False,
         }
         self.conversations["conversation-demo"] = {
             "conversation_id": "conversation-demo",
@@ -170,6 +210,27 @@ class FakeHubFacade:
                 raise ValueError("manual_l2_required")
             if not payload.get("target_locked", False):
                 raise ValueError("target_lock_required")
+        elif name in {"pause_contact", "resume_contact", "ack_uncertain"}:
+            contact_id = str(payload.get("entity_id", ""))
+            item = self.contacts.get(contact_id)
+            if item is None:
+                raise ValueError("contact_not_found")
+            if name == "pause_contact":
+                item["paused"] = True
+                item["pause_status"] = "paused"
+            elif name == "resume_contact":
+                item["paused"] = False
+                item["pause_status"] = "running"
+            else:
+                operation_id = str(payload.get("operation_id", ""))
+                expected_revision = int(payload.get("expected_revision", 0) or 0)
+                if not operation_id:
+                    raise ValueError("operation_id_required")
+                if expected_revision != int(item.get("revision", 0)):
+                    raise ValueError("stale_version")
+                # Acknowledging review is deliberately not a VERIFIED receipt.
+                item.setdefault("reviewed_uncertain_operations", []).append(operation_id)
+            item["revision"] = int(item.get("revision", 1)) + 1
         elif name not in {"approve_scheduled", "reject", "resubmit", "edit_draft"}:
             raise ValueError("unknown_command")
         self.entity_version += 1
