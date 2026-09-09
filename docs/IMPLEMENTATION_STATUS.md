@@ -5,7 +5,11 @@
 | 阶段 | 当前状态 | 说明 |
 |---|---|---|
 | B0 契约与边界 | 已写入，已做离线检查 | WebUI 只通过 `LiveHubFacade` 调用 runtime；生产模式必须显式注入真实 facade。 |
-| B1 虚拟机与 QQ 环境 | 实机待验 | 需要记录 Windows、QQ、UIA、VM 版本和窗口配置。 |
+| B1 虚拟机与 QQ 环境 | 部分完成，实机待验 | 已创建并核验关机空 VM（6GB、4 CPU、80GB 动态盘、TPM 2.0）；Windows ISO 未下载，系统未安装，QQ 未登录，Windows/QQ/UIA/运行内存测试待验。 |
+| B2 多联系人注册与观察 | 已实现，离线通过 | `runtime/` 与 `adapters/qq/vm_driver/` 的多联系人观察、游标和方向投影已由 3/5 联系人验收覆盖；真实 UIA 绑定待验。 |
+| B3 多目标执行与账本 | 已实现，离线通过 | VM bridge 的 prepare/commit/verify、operation 关联、重复发送防护和多目标 fixture 已覆盖；真实 QQ 发送待验。 |
+| B4 记忆、规则与规划 | 已实现，离线通过 | 复用 Memory/M7/M8，以联系人上下文和不同 reply 验收；真实 DeepSeek 调用待验。 |
+| B5 编排、恢复与分段 | 已实现，离线通过 | 真实共享 runtime 覆盖并发、暂停、三段、人工接管与 ignore；CLI 生命周期离线复验已通过。 |
 | B2 多联系人观察与绑定 | 实机待验 | 至少绑定 A/B/C；身份证据不充分、绑定过期或有缺口时必须保持暂停。 |
 | B3 发送账本与执行器 | 实机待验 | 需要用测试联系人验证 operation_id、提交超时、重复调用和 UNCERTAIN 隔离。 |
 | B4 记忆、规则与 DeepSeek | 仅有离线契约检查 | DeepSeek key 由用户在客体的密钥存储或运行环境中配置，不要贴到聊天、源码、截图或普通日志。 |
