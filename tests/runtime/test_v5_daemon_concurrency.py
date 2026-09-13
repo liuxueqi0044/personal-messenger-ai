@@ -69,6 +69,9 @@ def test_deferred_a_does_not_block_b_and_paused_old_result_is_discarded(tmp_path
         assert app.pacing.connection.execute("select count(*) from m10_plans where conversation_id='hub-0'").fetchone()[0] == 0
         assert not [r for r in harness.port.requests if r.kind.value=='commit']
         assert app.state.connection.execute("select count(*) from runtime_planning_jobs where conversation_id='hub-0' and status in ('stale','cancelled','failed')").fetchone()[0] >= 1
+        evaluation=app.state.connection.execute("select outcome from runtime_planner_evaluations where conversation_id='hub-0'").fetchone()
+        assert evaluation['outcome']=='stale'
+        assert app.state.connection.execute("select count(*) from runtime_plan_artifacts where conversation_id='hub-0'").fetchone()[0]==0
     asyncio.run(run())
 
 

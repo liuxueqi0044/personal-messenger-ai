@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from messenger_ai.llm.models import ContactProjection, ContextItem, InboundItem, ReplyPlanRequest, RuleProjection
 from messenger_ai.memory.models import ContactContext
-from messenger_ai.policy import CapabilitySnapshot, DraftSnapshot, LivePolicyState, PlannerAssessment, PolicyRequest
+from messenger_ai.policy import CapabilitySnapshot, ConversationType, DraftSnapshot, LivePolicyState, PlannerAssessment, PolicyRequest
 from messenger_ai.rules.models import RuleContext
 
 
@@ -19,7 +19,8 @@ def policy_version(*, binding_revision: int, conversation_revision: int,
 def build_llm_request(*, account_id: str, contact_id: str, conversation_id: str,
                       conversation_revision: int, memory: ContactContext,
                       rules: RuleContext, inbound: tuple[InboundItem, ...],
-                      now: datetime) -> ReplyPlanRequest:
+                      now: datetime,
+                      content_policy_checks_enabled: bool = True) -> ReplyPlanRequest:
     relation = memory.relationship_states[0].state if memory.relationship_states else "unknown"
     if relation not in {"new", "familiar", "committed", "unknown"}:
         relation = "unknown"
@@ -38,16 +39,31 @@ def build_llm_request(*, account_id: str, contact_id: str, conversation_id: str,
     rule_projection = RuleProjection(
         rulepack_id=rules.rulepack.rulepack_id, rule_version=rules.rulepack.version,
         source_hash=rules.rulepack.source_hash,
-        system_safety=tuple(item.text for item in rules.effective_prohibited),
+        content_policy_checks_enabled=content_policy_checks_enabled,
+        system_safety=(
+            tuple(item.text for item in rules.effective_prohibited)
+            if content_policy_checks_enabled else ()
+        ),
         persona_style=tone,
         persona_identity=normalized.persona.identity,
         language=normalized.persona.language,
         preferred_length=normalized.persona.preferred_length,
-        behavior=tuple(item.text for item in rules.effective_required),
-        prohibited=tuple(item.text for item in rules.effective_prohibited),
-        escalation=tuple(item.text for item in normalized.escalation_rules if item.enabled),
+        behavior=(
+            tuple(item.text for item in rules.effective_required)
+            if content_policy_checks_enabled else ()
+        ),
+        prohibited=(
+            tuple(item.text for item in rules.effective_prohibited)
+            if content_policy_checks_enabled else ()
+        ),
+        escalation=(
+            tuple(item.text for item in normalized.escalation_rules if item.enabled)
+            if content_policy_checks_enabled else ()
+        ),
         examples_positive=normalized.examples_positive,
-        examples_negative=normalized.examples_negative,
+        examples_negative=(
+            normalized.examples_negative if content_policy_checks_enabled else ()
+        ),
     )
     fingerprint = hashlib.sha256(json.dumps({
         "conversation": conversation_id, "revision": conversation_revision,
@@ -69,8 +85,13 @@ def build_policy_request(*, draft_id: UUID | str, plan_id: UUID | str, account_i
                          contact_id: str, conversation_id: str, body: str,
                          expected_last_message_key: str, source_message_keys: tuple[str, ...],
                          rule_version: str, capability: CapabilitySnapshot,
+                         conversation_type: ConversationType,
                          binding_revision: int, conversation_revision: int, global_revision: int,
                          now: datetime, due_at: datetime, expires_at: datetime,
+                         inbound_text: str,
+                         identity_unique: bool, context_complete: bool,
+                         contact_whitelisted: bool, automation_enabled: bool,
+                         counterparty_initiated: bool, source_inbound_unhandled: bool,
                          assessment: PlannerAssessment | None = None,
                          paused: bool = False, global_paused: bool = False) -> PolicyRequest:
     version = policy_version(binding_revision=binding_revision, conversation_revision=conversation_revision,
@@ -88,8 +109,14 @@ def build_policy_request(*, draft_id: UUID | str, plan_id: UUID | str, account_i
         observed_at=now, last_message_key=expected_last_message_key,
         active_rulepack_version=rule_version, active_pacing_rule_version=rule_version,
         capability=capability, policy_state_version=version,
+        conversation_type=conversation_type,
         binding_revision=binding_revision, conversation_revision=conversation_revision,
-        contact_whitelisted=True, automation_enabled=True, contact_paused=paused,
+        identity_unique=identity_unique, context_complete=context_complete,
+        contact_whitelisted=contact_whitelisted,
+        counterparty_initiated=counterparty_initiated,
+        source_inbound_unhandled=source_inbound_unhandled,
+        automation_enabled=automation_enabled, contact_paused=paused,
         global_paused=global_paused)
-    return PolicyRequest(draft=draft, state=state, assessment=assessment or PlannerAssessment(),
+    return PolicyRequest(draft=draft, state=state, inbound_text=inbound_text,
+                         assessment=assessment or PlannerAssessment(),
                          scheduled_due_at=due_at, plan_expires_at=expires_at)

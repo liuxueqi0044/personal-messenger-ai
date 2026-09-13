@@ -1,7 +1,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
   [ValidateScript({ -not $_ -or (Test-Path -LiteralPath $_ -PathType Leaf) })][string]$IsoPath,
-  [string]$BaseFolder = '%USERPROFILE%\Documents\PMAI\qq-vm',
+  [string]$BaseFolder = (Join-Path $env:USERPROFILE 'Documents\PMAI\qq-vm'),
   [string]$VmName = 'PersonalMessengerQQ',
   [int]$MemoryMB = 6144,
   [int]$CpuCount = 4,

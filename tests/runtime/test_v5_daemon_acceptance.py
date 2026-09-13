@@ -64,7 +64,13 @@ class RecordingProvider:
         )
 
 
-def _build(tmp_path, contacts: int):
+def _build(
+    tmp_path,
+    contacts: int,
+    *,
+    conversation_type: str = "direct",
+    content_policy_checks_enabled: bool = True,
+):
     harness = V5VMHarness(tmp_path / "ports", contacts=contacts)
     capability = CapabilitySnapshot(
         capability_version="fixture-v1", environment_fingerprint="fixture",
@@ -79,6 +85,7 @@ def _build(tmp_path, contacts: int):
         data_dir=tmp_path / "app", planner_provider=provider, driver=harness.bridge,
         capability=capability, authorization_signing_key=b"x" * 32,
         model_concurrency=2, clock=harness.clock,
+        content_policy_checks_enabled=content_policy_checks_enabled,
     )
     draft = app.rules.ingest(RuleSource(name="daemon.yaml", content=RULES.encode()))
     app.rules.activate(draft.draft_id, HumanApproval(approver_id="fixture", reason="acceptance"))
@@ -90,8 +97,38 @@ def _build(tmp_path, contacts: int):
             platform_evidence_hash=__import__("hashlib").sha256(binding.participant_signature.encode()).hexdigest(),
             verified_by="fixture", verified_at=harness.clock.now()))
         app.state.register(account_id=binding.account_id, contact_id=binding.contact_id,
-                           conversation_id=binding.hub_conversation_id, binding_revision=1)
+                           conversation_id=binding.hub_conversation_id, binding_revision=1,
+                           conversation_type=conversation_type)
     return app, harness, provider
+
+
+@pytest.mark.parametrize(
+    ("conversation_type", "error_code"),
+    (("group", "group_conversation_unsupported"),
+     ("unknown", "conversation_type_unknown")),
+)
+def test_uncertified_or_group_conversation_stops_before_model(
+    tmp_path, conversation_type, error_code
+):
+    app, harness, provider = _build(
+        tmp_path, 3, conversation_type=conversation_type
+    )
+
+    async def run():
+        for _ in range(3):
+            await app.tick()
+        harness.append_inbound(0, "guarded", key="guarded")
+        for _ in range(6):
+            await app.tick()
+        await app.run_until_idle(max_ticks=20)
+
+    asyncio.run(run())
+    assert provider.requests == []
+    row = app.state.connection.execute(
+        "SELECT status,error_code FROM runtime_planning_jobs "
+        "WHERE conversation_id='hub-0'"
+    ).fetchone()
+    assert (row["status"], row["error_code"]) == ("failed", error_code)
 
 
 @pytest.mark.parametrize("contacts", [3, 5])

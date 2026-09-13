@@ -31,6 +31,7 @@ from messenger_ai.pacing.models import ScheduleRequest
 from messenger_ai.policy import (
     AuthorizationService,
     CapabilitySnapshot,
+    ConversationType,
     DraftSnapshot,
     InvalidationEvent,
     InvalidationKind,
@@ -119,6 +120,7 @@ def _policy_request(
         active_pacing_rule_version=rule_version,
         capability=capability,
         policy_state_version="policy-state-1",
+        conversation_type=ConversationType.DIRECT,
         is_new_contact=is_new_contact,
         contact_whitelisted=not is_new_contact,
         automation_enabled=automation_enabled,

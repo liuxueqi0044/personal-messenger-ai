@@ -124,6 +124,34 @@ def test_event_consumer_is_idempotent_and_context_is_pair_scoped(memory) -> None
         )
 
 
+def test_identity_evidence_change_uses_atomic_expected_hash(memory) -> None:
+    service, clock = memory
+    _contact, original = contact_and_binding(service, clock)
+    replacement = original.model_copy(update={
+        "platform_evidence_hash": hashlib.sha256(b"replacement-proof").hexdigest(),
+        "approval": approval(clock, "session-identity-migration"),
+    })
+
+    with pytest.raises(DomainError) as stale:
+        service.bind_identity(
+            replacement,
+            expected_evidence_hash=hashlib.sha256(b"wrong-proof").hexdigest(),
+        )
+    assert stale.value.code.value == "STALE_CONTEXT"
+    assert service.store.connection.execute(
+        "SELECT evidence_hash FROM memory_bindings WHERE conversation_id=?",
+        (original.conversation_id,),
+    ).fetchone()[0] == original.platform_evidence_hash
+
+    assert service.bind_identity(
+        replacement,
+        expected_evidence_hash=original.platform_evidence_hash,
+    ).platform_evidence_hash == replacement.platform_evidence_hash
+    assert service.store.connection.execute(
+        "SELECT COUNT(*) FROM memory_audit WHERE action='identity.evidence_changed'"
+    ).fetchone()[0] == 1
+
+
 def test_10000_fixed_seed_same_name_and_similar_identity_never_cross_binds(
     memory,
 ) -> None:

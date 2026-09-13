@@ -1,0 +1,3291 @@
+{
+  "probe_version": "qq-uia-readonly-v1",
+  "succeeded": true,
+  "read_only": true,
+  "process_id": 7352,
+  "window_handle": 393974,
+  "client_version": "9.9.33.51802",
+  "root": {
+    "control_type": "ControlType.Window",
+    "class_name": "Chrome_WidgetWin_1",
+    "automation_id": ""
+  },
+  "host_environment": {
+    "executable_path": "sha256:c9341972d763dc647e7e1480a4da6f8387d9313be55d8fa2df616402a3bb51d3",
+    "executable_signature": "38630e446d6208da52cb7b26ef595393c91ed8403e52b9f90890a7503e59f497",
+    "process_signature": "127720124dcbb1f29d5f0c22debfe1bb9b406e21a0e5d67567fccffec6abb412",
+    "client_version": "9.9.33.51802",
+    "windows_version": "Microsoft Windows NT 10.0.26200.0",
+    "dpi_scale": 1,
+    "monitor_id": "7a0cdd28f4c0f04c2a35d748a72b95dbcb3a301db9a670b12fe855a83eff9192",
+    "monitor_topology_digest": "62ec9fdd0171ec1bd3e3d44db5e36073f85a7c4e86ef3d40875804575ece03d7",
+    "theme": "light",
+    "window_class": "Chrome_WidgetWin_1",
+    "presentation": "maximized",
+    "is_foreground": true,
+    "is_occluded": false,
+    "is_logged_in": false,
+    "modal_state": "none",
+    "other_visible_process_windows": 0
+  },
+  "window_bounds": {
+    "x": -8,
+    "y": -8,
+    "width": 1039,
+    "height": 736,
+    "minimized": false,
+    "maximized": true,
+    "foreground": true,
+    "geometry_usable": true
+  },
+  "node_count_total": 103,
+  "node_count_examined": 103,
+  "truncated": false,
+  "control_types": [
+    {
+      "value": "ControlType.Group",
+      "count": 29
+    },
+    {
+      "value": "ControlType.Button",
+      "count": 26
+    },
+    {
+      "value": "ControlType.Text",
+      "count": 19
+    },
+    {
+      "value": "ControlType.Image",
+      "count": 15
+    },
+    {
+      "value": "ControlType.Pane",
+      "count": 11
+    },
+    {
+      "value": "ControlType.Document",
+      "count": 1
+    },
+    {
+      "value": "ControlType.Edit",
+      "count": 1
+    },
+    {
+      "value": "ControlType.ToolBar",
+      "count": 1
+    }
+  ],
+  "class_names": [
+    {
+      "value": "nav-item-activator",
+      "count": 6
+    },
+    {
+      "value": "View",
+      "count": 4
+    },
+    {
+      "value": "q-badge q-badge__red",
+      "count": 4
+    },
+    {
+      "value": "item__content item-dragging-over",
+      "count": 3
+    },
+    {
+      "value": "nav-item",
+      "count": 3
+    },
+    {
+      "value": "recent-contact-item",
+      "count": 3
+    },
+    {
+      "value": "icon-item",
+      "count": 2
+    },
+    {
+      "value": "ClientView",
+      "count": 1
+    },
+    {
+      "value": "Intermediate D3D Window",
+      "count": 1
+    },
+    {
+      "value": "NonClientView",
+      "count": 1
+    },
+    {
+      "value": "RootView",
+      "count": 1
+    },
+    {
+      "value": "WinFrameView",
+      "count": 1
+    },
+    {
+      "value": "acrylic q-theme-tokens-light",
+      "count": 1
+    },
+    {
+      "value": "avatar user-avatar user-avatar--clip",
+      "count": 1
+    },
+    {
+      "value": "contact-adder-btn top-bar__adder",
+      "count": 1
+    },
+    {
+      "value": "draggable-view__container empty-panel_head",
+      "count": 1
+    },
+    {
+      "value": "draggable-view__container sidebar container-sidebar",
+      "count": 1
+    },
+    {
+      "value": "draggable-view__container topbar-draggable",
+      "count": 1
+    },
+    {
+      "value": "face-element",
+      "count": 1
+    },
+    {
+      "value": "face-element__icon",
+      "count": 1
+    }
+  ],
+  "automation_ids": [
+    {
+      "value": "RootWebArea",
+      "count": 1
+    }
+  ],
+  "pattern_counts": {
+    "invoke": 43,
+    "selection_item": 0,
+    "text": 21,
+    "value": 2,
+    "scroll": 1
+  },
+  "semantic_signals": {
+    "named_text_nodes": 19,
+    "message_region_named_text_nodes": 0,
+    "selectable_conversation_candidates": 0,
+    "left_pane_invoke_candidates": 11,
+    "composer_candidates": 0,
+    "exact_send_button_candidates": 0,
+    "send_keyword_candidates": 0,
+    "bottom_right_invoke_candidates": 0,
+    "structural_chat_shell_detected": false
+  },
+  "candidate_details": {
+    "composers": [],
+    "send_targets": []
+  },
+  "topology": {
+    "included": true,
+    "digest": "d9feb13c82e462bc895bd1e9d7a09022c25a7030c0513e9d82e1edabb6b1ee48",
+    "nodes": [
+      {
+        "structural_id": "a42e32b72afe422e3c21f1719665f1210e4db469f745c676f7900e548db1a819",
+        "runtime_id": "96bcb8450f4c06aa06d4c144385ee1488bdc13a9250c2927e48fc7c9ae2d47c1",
+        "parent_runtime_id": "__probe_root__",
+        "control_type": "ControlType.Pane",
+        "class_name": "Intermediate D3D Window",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": false,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "27b9733363cc8546a41bb1d05dab1f6ec32b5440b3e36b87a7153eadf7b4407b",
+        "runtime_id": "5d13d568c41eefab1034da0552b49652ea43cbb3885c28be697fc3da5fae14ac",
+        "parent_runtime_id": "__probe_root__",
+        "control_type": "ControlType.Pane",
+        "class_name": "RootView",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "79bba94e3939e79b2e6b12c1b23ab5c6a7c5b7b6e4c3d077c90127859759e747",
+        "runtime_id": "8ad3e57551722251d3147acbe03f29f74d1f80c1b90e53d3ae8e5283df9ef1fb",
+        "parent_runtime_id": "5d13d568c41eefab1034da0552b49652ea43cbb3885c28be697fc3da5fae14ac",
+        "control_type": "ControlType.Pane",
+        "class_name": "NonClientView",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "397dd2540651b099d427a4103e47d0470dfc22d10899816f956ae14f5f765854",
+        "runtime_id": "9e3190e38c9f322a12e04d63091dc65cb0b4e510cf3c6fd6d8dff7da321ca6da",
+        "parent_runtime_id": "8ad3e57551722251d3147acbe03f29f74d1f80c1b90e53d3ae8e5283df9ef1fb",
+        "control_type": "ControlType.Pane",
+        "class_name": "WinFrameView",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "695068f998ae77c20d8d5213eab44da348fa3bc3aee10e827ac33adeb4854f26",
+        "runtime_id": "1b043a57cf65b9667658fa5487f2f635cc15dd12fb56520aba9557bb80059ed5",
+        "parent_runtime_id": "9e3190e38c9f322a12e04d63091dc65cb0b4e510cf3c6fd6d8dff7da321ca6da",
+        "control_type": "ControlType.Pane",
+        "class_name": "ClientView",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "fae0d8a5782df49b9d0b5d832c6d3a23bb54147cf014eb7c2bf2b5ea63f60147",
+        "runtime_id": "a9ebede2d7a94b4acf9a9041ce469e830c4cd8477ab83933874158c0c29e71cd",
+        "parent_runtime_id": "1b043a57cf65b9667658fa5487f2f635cc15dd12fb56520aba9557bb80059ed5",
+        "control_type": "ControlType.Pane",
+        "class_name": "View",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "cb0b128d56da638d937597f9d1008dc77edfb175623faad90db15c8aa33ff2de",
+        "runtime_id": "0765802492fab8a4c25c8a35f3b31b414526473ed742afd60cbc70a2588f3a2c",
+        "parent_runtime_id": "a9ebede2d7a94b4acf9a9041ce469e830c4cd8477ab83933874158c0c29e71cd",
+        "control_type": "ControlType.Pane",
+        "class_name": "View",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "ea0532ca376c5fe1736dff3ce65c341db239a8bda742a396745a8772a57a7aa3",
+        "runtime_id": "a1dd03bc70bc3b83c07b7246c8a628dfd177f46fa06443100d63f791c2d0b8c0",
+        "parent_runtime_id": "0765802492fab8a4c25c8a35f3b31b414526473ed742afd60cbc70a2588f3a2c",
+        "control_type": "ControlType.Pane",
+        "class_name": "View",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "7c489f0beadc2d537199c29ce925b816461a287c2eefbe10c77cecb15a2b5ee9",
+        "runtime_id": "80347f9ef7ee6ef67fcdc5488f71f83fa157fc86a545a598314c2ae078147947",
+        "parent_runtime_id": "a1dd03bc70bc3b83c07b7246c8a628dfd177f46fa06443100d63f791c2d0b8c0",
+        "control_type": "ControlType.Document",
+        "class_name": "",
+        "automation_id": "RootWebArea",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "textpattern",
+          "valuepattern",
+          "scrollpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "0e53157c7082e48255737e5721489560bfa6c336ead7c0cd5781691543ca5815",
+        "runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "parent_runtime_id": "80347f9ef7ee6ef67fcdc5488f71f83fa157fc86a545a598314c2ae078147947",
+        "control_type": "ControlType.Group",
+        "class_name": "acrylic q-theme-tokens-light",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      },
+      {
+        "structural_id": "a372b879fb2060813f379a90859ba7ef0aa1c76517f8b312b145814c5bb5acfc",
+        "runtime_id": "d81835216a4181a7f16438d1e1b7e96e7a89f5403e1fdc80f598a61d77f4766b",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Pane",
+        "class_name": "window-control-area q-theme-tokens-light",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.834456,
+          "y": 0.01087,
+          "width": 0.157844,
+          "height": 0.054347
+        }
+      },
+      {
+        "structural_id": "3ba54bda952b5f67401af1f2e28a53e1037703b8e3125dd6539294cb717134fb",
+        "runtime_id": "21d9e2a78236f041f905e591c266e41324494652f95b43b0017f6d2b05a1977c",
+        "parent_runtime_id": "d81835216a4181a7f16438d1e1b7e96e7a89f5403e1fdc80f598a61d77f4766b",
+        "control_type": "ControlType.Button",
+        "class_name": "narrow-toggler",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.838306,
+          "y": 0.016304,
+          "width": 0.034649,
+          "height": 0.043479
+        }
+      },
+      {
+        "structural_id": "155843afd0238913f01f3f10fe748a20161799e8cb9d32400394e1a84ae1f8fc",
+        "runtime_id": "225e18793a109e8daa4502cac2a345f67f5eea95ba68ecb841bca0ae5de90db5",
+        "parent_runtime_id": "21d9e2a78236f041f905e591c266e41324494652f95b43b0017f6d2b05a1977c",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.847931,
+          "y": 0.027174,
+          "width": 0.015399,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "e0ab4ade28e8095c7e56847a559424272e9b3564bd080bef6a132e4f918fd7ea",
+        "runtime_id": "bc07f92e9e5cabc79dfb9d67828e65534b9844de9a95e33e31af6ddc5b2d69b7",
+        "parent_runtime_id": "d81835216a4181a7f16438d1e1b7e96e7a89f5403e1fdc80f598a61d77f4766b",
+        "control_type": "ControlType.Button",
+        "class_name": "window-control-area__btn miniMize",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.876805,
+          "y": 0.016304,
+          "width": 0.034648,
+          "height": 0.043479
+        }
+      },
+      {
+        "structural_id": "40d761098dd002a3f32882cd014468867e157532b4a31c56448917e48d626bf9",
+        "runtime_id": "61be28af48d433e3141bde7b87d2c92d621e1a3be5720e338f8b00411d36f861",
+        "parent_runtime_id": "bc07f92e9e5cabc79dfb9d67828e65534b9844de9a95e33e31af6ddc5b2d69b7",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.886429,
+          "y": 0.027174,
+          "width": 0.0154,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "55a14b4702852c984e9953c982a4d08bc402b6038e3707f779b217480e0d11af",
+        "runtime_id": "e810c3510de8c636538d3154f04d4281993a2360f42f3b6200605669975bffe0",
+        "parent_runtime_id": "d81835216a4181a7f16438d1e1b7e96e7a89f5403e1fdc80f598a61d77f4766b",
+        "control_type": "ControlType.Button",
+        "class_name": "window-control-area__btn",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.915303,
+          "y": 0.016304,
+          "width": 0.034649,
+          "height": 0.043479
+        }
+      },
+      {
+        "structural_id": "ba75702ec42b4f284c0bce11237908d3f13deddd5da3ad824094dfa87b7df25b",
+        "runtime_id": "e375e84a15130d7c78e82b639b8c58734af9bd586a43272bacc02f44a9e551a2",
+        "parent_runtime_id": "e810c3510de8c636538d3154f04d4281993a2360f42f3b6200605669975bffe0",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.924928,
+          "y": 0.027174,
+          "width": 0.015399,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "b833d2664389b9681e0f46cbdb2e91f5b9af3875f54681e37673ee2a5d0bb239",
+        "runtime_id": "d12f58b920b69d87fd363c0672027037504368353edb256ec7fb5af23dc7b3f1",
+        "parent_runtime_id": "d81835216a4181a7f16438d1e1b7e96e7a89f5403e1fdc80f598a61d77f4766b",
+        "control_type": "ControlType.Button",
+        "class_name": "window-control-area__btn close",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.953802,
+          "y": 0.016304,
+          "width": 0.034648,
+          "height": 0.043479
+        }
+      },
+      {
+        "structural_id": "439dce425466fb8b5b32d7e25bd60e47db044685b5308a241640c0a2755c9b67",
+        "runtime_id": "f45500b068ed301e214cf8927270ca1acde0c0787f43e9e73b918f6f56703e0c",
+        "parent_runtime_id": "d12f58b920b69d87fd363c0672027037504368353edb256ec7fb5af23dc7b3f1",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.963426,
+          "y": 0.027174,
+          "width": 0.0154,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "028e2c19adf291191adb2f5b36f6b911c498f0dabf4014428485aab5b9d510c1",
+        "runtime_id": "c5764f84fd0fa3eefd0b6ce016b3b461bf79f16b9bf78be6e2a66ac58da988af",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Group",
+        "class_name": "draggable-view__container topbar-draggable",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.054347
+        }
+      },
+      {
+        "structural_id": "0e0e04b8d9667db9b238fea13ce3253824644fa2fe436dd816afa42dd4dc1cba",
+        "runtime_id": "06b28a5838db6534a49d0e7287b61afab86008fb08c2c8e01e99613bc7965df9",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.016362,
+          "y": 0.027174,
+          "width": 0.036574,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "374beb45af8f218fe1e676c48507934a307c0dd7e8159d61df99f5de5b84db3f",
+        "runtime_id": "4ea80db3465c1cdea618ab1d229c99a97a37322ea4104e286bb4b1cc2d7cfe6a",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Group",
+        "class_name": "user-profile-card topbar-profile",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.01087,
+          "width": 0.776708,
+          "height": 0.054347
+        }
+      },
+      {
+        "structural_id": "9afede5cca6d8c57b84b3584910f331b645c4286b6593fe6cf95144d23d1c6c1",
+        "runtime_id": "8c1ffe87be1f8576e66d29bbe251f2672e127a4e5d3ae9bddfb95674056053e2",
+        "parent_runtime_id": "4ea80db3465c1cdea618ab1d229c99a97a37322ea4104e286bb4b1cc2d7cfe6a",
+        "control_type": "ControlType.Button",
+        "class_name": "avatar user-avatar user-avatar--clip",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.073147,
+          "y": 0.021739,
+          "width": 0.023099,
+          "height": 0.032609
+        }
+      },
+      {
+        "structural_id": "8be0b0f3dbd65de4a91e682fb44e282822f5f17333dad6a07b4a44f598474c00",
+        "runtime_id": "bfffe7cba931ea86958931cee0f94424be2246fc075f72f39fa0f916de6c9ffe",
+        "parent_runtime_id": "4ea80db3465c1cdea618ab1d229c99a97a37322ea4104e286bb4b1cc2d7cfe6a",
+        "control_type": "ControlType.Button",
+        "class_name": "icon icon-online avatar__status",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.087584,
+          "y": 0.04212,
+          "width": 0.009625,
+          "height": 0.013587
+        }
+      },
+      {
+        "structural_id": "86e3fae29d5beb8c43274cf6b44f65649063f76cc4af6c29362759d096b87d9d",
+        "runtime_id": "7c527c8fda7550a87ba5d16c9c45a757f4b344b5c54a4b2311f71c981c9d2eaf",
+        "parent_runtime_id": "4ea80db3465c1cdea618ab1d229c99a97a37322ea4104e286bb4b1cc2d7cfe6a",
+        "control_type": "ControlType.Group",
+        "class_name": "no-drag-region",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.102021,
+          "y": 0.025815,
+          "width": 0.040424,
+          "height": 0.024457
+        }
+      },
+      {
+        "structural_id": "69c58ea415d04210ef2edea9f730ca10c0f09a0eafe1432d08917f78d452ddb9",
+        "runtime_id": "4e1480b9c5b45409bddb750a26a30039721a76d1c4b221ed7e2b4fdbf0708998",
+        "parent_runtime_id": "7c527c8fda7550a87ba5d16c9c45a757f4b344b5c54a4b2311f71c981c9d2eaf",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.102021,
+          "y": 0.025815,
+          "width": 0.040424,
+          "height": 0.024457
+        }
+      },
+      {
+        "structural_id": "dfe9f24e39280988b7732fc295240640b8e1fb6c5a9866ab809305df21c7bbdf",
+        "runtime_id": "afda72662890368d14b9843848ad266e4c6989db8fb58c91404b60a9ec701c27",
+        "parent_runtime_id": "4ea80db3465c1cdea618ab1d229c99a97a37322ea4104e286bb4b1cc2d7cfe6a",
+        "control_type": "ControlType.Button",
+        "class_name": "profile_signature text-ellipsis editable empty-long-nick",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.14437,
+          "y": 0.023098,
+          "width": 0.076997,
+          "height": 0.029891
+        }
+      },
+      {
+        "structural_id": "7787d8f0fec1c82febaaffdd2187be729051050692aab33c4866e90f3afea2c6",
+        "runtime_id": "5fdee18540af3ea39a93044f39aa0790f6e77160eb4830b28bb874df9f241c03",
+        "parent_runtime_id": "4ea80db3465c1cdea618ab1d229c99a97a37322ea4104e286bb4b1cc2d7cfe6a",
+        "control_type": "ControlType.Button",
+        "class_name": "weather-widget user-profile-card__weather q-theme-tokens-light",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.771896,
+          "y": 0.016304,
+          "width": 0.050048,
+          "height": 0.043479
+        }
+      },
+      {
+        "structural_id": "a3a1f8f0bc2c8a12cd8ff0dceac6280dc5eca313277ede88be888d9613a49629",
+        "runtime_id": "4b35e2ff02c79eb6534fe2efa07c9ebc0f05ec32071be3c092dcdc7dd36050dc",
+        "parent_runtime_id": "5fdee18540af3ea39a93044f39aa0790f6e77160eb4830b28bb874df9f241c03",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.779596,
+          "y": 0.024457,
+          "width": 0.019249,
+          "height": 0.027173
+        }
+      },
+      {
+        "structural_id": "06bde111f4361542b0d9549cd07846bb04fcaff349529c113f880ee674dd58c1",
+        "runtime_id": "46c4bdc11fd834abab43130991e856a0f5503d85eeac7d642433e1ef156f0c11",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Group",
+        "class_name": "draggable-view__container sidebar container-sidebar",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.01155,
+          "y": 0.065217,
+          "width": 0.050048,
+          "height": 0.918479
+        }
+      },
+      {
+        "structural_id": "9949ee0db1ff902c5e17b2469a362743e4aed96358604bd6d51ca8217668f5db",
+        "runtime_id": "8ce0ddf03c6626af3afb31ed6301b2f202c6e3301a9af4f6a26c5bb72190e3ed",
+        "parent_runtime_id": "46c4bdc11fd834abab43130991e856a0f5503d85eeac7d642433e1ef156f0c11",
+        "control_type": "ControlType.Group",
+        "class_name": "sidebar-nav",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.01155,
+          "y": 0.065217,
+          "width": 0.050048,
+          "height": 0.918479
+        }
+      },
+      {
+        "structural_id": "c6bab3ca7f4822ce863836c0f27be17955efc112e74a94b1018d5a99f3077336",
+        "runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "parent_runtime_id": "8ce0ddf03c6626af3afb31ed6301b2f202c6e3301a9af4f6a26c5bb72190e3ed",
+        "control_type": "ControlType.ToolBar",
+        "class_name": "sidebar-wrapper",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.01155,
+          "y": 0.065217,
+          "width": 0.050048,
+          "height": 0.918479
+        }
+      },
+      {
+        "structural_id": "230a17821d5d9dc3656c265c5d9601b85c60b295b825c93d5ac5d9902bbf714b",
+        "runtime_id": "bd89e9b25ffa90f699796c1a765ec2d89812ac724f96a1718d0e3c89b585d32e",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.076087,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "f4c99fa7c0ab16c43b87d3daae4e533dd17fb42752c8fcdbc7de30fe3440e2b9",
+        "runtime_id": "f900e72f0112ae19d9d0cda7f524fb49a800c9de85b357721e9ad3983e8a8403",
+        "parent_runtime_id": "bd89e9b25ffa90f699796c1a765ec2d89812ac724f96a1718d0e3c89b585d32e",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.040423,
+          "y": 0.077446,
+          "width": 0.013475,
+          "height": 0.017663
+        }
+      },
+      {
+        "structural_id": "7ffc105824ac57f40f1fec8e9af7e46b02515d5d374e3e7ca8e80b019cb58a3b",
+        "runtime_id": "027a50d6529f1a4576f36b1bd6032eb2f669352f34b1157771463d3afae6fd07",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.130435,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "bd95231dfbe938cf4819dc91af2a1c1be4062ff070e461a672b6ee57ced8b62f",
+        "runtime_id": "aabfe124387eba32683e8ef600d32e3732e81f105e0900bcc8a5a97f8ce5a5a5",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item-activator",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.184783,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "1d191aed85f9eb337380b7967968f4fad2d6a99c38d56cff92692f11c3024e42",
+        "runtime_id": "c6dbaf2e4e3236d668d207fa21ecc2b8136130832066604ae178bbb0271db862",
+        "parent_runtime_id": "aabfe124387eba32683e8ef600d32e3732e81f105e0900bcc8a5a97f8ce5a5a5",
+        "control_type": "ControlType.Group",
+        "class_name": "q-badge q-badge__red",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.184783,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "e2c8e9399fef59b1543862f1e34013a96f76ca6983a5ffefe7f6b08d30a42694",
+        "runtime_id": "0ecc5d39a4e31738b21f91a6cc0d01bc1937cea4937bf7209cc476a5ab7e6ae6",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.23913,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "27a45491be3c1f63b8f738c7f44ae441ca09fadf9119ebb9de6e0231eb3061e9",
+        "runtime_id": "ef6467f8349f0235ef667011f359ec5d343121ea46bb2ee5d8b4898ec64f20b4",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item-activator",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.293478,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "943aef131d47a570a6094a30d8458e0a91f49bf98584a76e58db9f19c85dbe92",
+        "runtime_id": "c9df12a158364c44f3ecb6d2f0a238cb74cc7b1bcce9af678005836392292db1",
+        "parent_runtime_id": "ef6467f8349f0235ef667011f359ec5d343121ea46bb2ee5d8b4898ec64f20b4",
+        "control_type": "ControlType.Group",
+        "class_name": "q-badge q-badge__red",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.293478,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "a015cb6e6735382dc05759cac699e6bb74d68c0e8c9d923ab86402d881837402",
+        "runtime_id": "a69b0e6f60c943534121800bb8b93482e852fb8ca0138e35496dba2a1993249d",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item-activator",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.347826,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "ef1ea36128db462f6b2265e71d5fae0af372a6f0f3f3a6fe79f8d39ab4d3a49a",
+        "runtime_id": "3b22093a420915c343fc8a2a03a9c23d8a62633e1749de900170c54fd9397cc2",
+        "parent_runtime_id": "a69b0e6f60c943534121800bb8b93482e852fb8ca0138e35496dba2a1993249d",
+        "control_type": "ControlType.Group",
+        "class_name": "q-badge q-badge__red",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.347826,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "0e2f236b5640649d98aa53d87a931d2b18beba5a54774bfff67221256064792c",
+        "runtime_id": "74d0fa81bdc3889932392078f8a5d1ad168e2d74cad407da48d55601ddeb2d0f",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item-activator",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.402174,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "b22c712c30e1fa5067dbb44d983e4469f7928e55e850976bcb98f12f80bdc53a",
+        "runtime_id": "8f76991c1e275d45882574406141d9f6e55bb67d993f5330548fa926ab7b1e96",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item-activator",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.456522,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "36e6fa48864fcf6abf9e9a7459fbdf35dd9b62d1a48b31929c1831c243ea3fc5",
+        "runtime_id": "e16bf1c12a7a2ffda3833cc720366cfc9f45d67367aa4d33337fa9b796b4ca97",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item-activator",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.51087,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "a1595be9eadf675cbe3056a03d04bdc6ba667eb305795d6fe9da8a675e88e403",
+        "runtime_id": "108009befa5b903f89531b4a7472f902ad849bb56a0c226577edd486fa20de61",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "nav-item nav-item-more",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.565217,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "770b1b61a1175ad1fd0f2955c63ff2deda726e3d28e1b578d7b64aeabe752ab6",
+        "runtime_id": "074c1839c8975b068732c2553b8216eba5b496535bf4ff54502164ca0299cf71",
+        "parent_runtime_id": "108009befa5b903f89531b4a7472f902ad849bb56a0c226577edd486fa20de61",
+        "control_type": "ControlType.Group",
+        "class_name": "more-item",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.565217,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "e8714d239f5019e4ce99efe6088de12890fc1e5201e3ff021a2a5838af202709",
+        "runtime_id": "fd3d55dab74b78a979173f2be9ce9b141424763ee18625a89a6b5d4ef0ba53d5",
+        "parent_runtime_id": "074c1839c8975b068732c2553b8216eba5b496535bf4ff54502164ca0299cf71",
+        "control_type": "ControlType.Group",
+        "class_name": "q-badge q-badge__red",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.565217,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "320b24f3c7f78901fa4f675b88fccbb6f4c7a09a163ca4bad236189fdc51e65c",
+        "runtime_id": "65e316967245d3590d12d2b4c2a5447adca2140ad6498bc45885ba1784c067a4",
+        "parent_runtime_id": "fd3d55dab74b78a979173f2be9ce9b141424763ee18625a89a6b5d4ef0ba53d5",
+        "control_type": "ControlType.Group",
+        "class_name": "icon-item",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.019249,
+          "y": 0.565217,
+          "width": 0.034649,
+          "height": 0.048913
+        }
+      },
+      {
+        "structural_id": "83203bf5babf182aa156be28e5a6d5eab326f554d01a2e7a106ac19474fe078c",
+        "runtime_id": "2ce132abefcdc9c2bf4539ef73e3ad6a9b8f6d4bb8bed02f38064539ee3503fc",
+        "parent_runtime_id": "65e316967245d3590d12d2b4c2a5447adca2140ad6498bc45885ba1784c067a4",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.025987,
+          "y": 0.574728,
+          "width": 0.021174,
+          "height": 0.029892
+        }
+      },
+      {
+        "structural_id": "5b3deee725419b7071cb558069ddc6e32f23edb5288b8abf7754ec4bd5e9dcf6",
+        "runtime_id": "1be26553704272eca4c3bd4e3658d66865040b022f4aa0da0be86690c110c765",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "item-mail func-menu__item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.015399,
+          "y": 0.826087,
+          "width": 0.042349,
+          "height": 0.046196
+        }
+      },
+      {
+        "structural_id": "55e172e073d057b0c5f92cab034ee491965e437649dff1b27a86df6c7a02275f",
+        "runtime_id": "ffd801d9ad7a2da4f75f00a466a6c085964a76180c327e3b4c2133fbdff7ed08",
+        "parent_runtime_id": "1be26553704272eca4c3bd4e3658d66865040b022f4aa0da0be86690c110c765",
+        "control_type": "ControlType.Group",
+        "class_name": "item-mail__activator-wrapper",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.015399,
+          "y": 0.826087,
+          "width": 0.042349,
+          "height": 0.046196
+        }
+      },
+      {
+        "structural_id": "356ff351b076f4587a4d78a59b825b3cddd4adf3fcc4b3d51982105ddbf91513",
+        "runtime_id": "8916859a6aaa436546322277da518f167be9ba3c1811ab38e2ec888357284e61",
+        "parent_runtime_id": "ffd801d9ad7a2da4f75f00a466a6c085964a76180c327e3b4c2133fbdff7ed08",
+        "control_type": "ControlType.Button",
+        "class_name": "icon-item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.020212,
+          "y": 0.826087,
+          "width": 0.032724,
+          "height": 0.046196
+        }
+      },
+      {
+        "structural_id": "20bf8a376e475b8ef18a53a33e06a3f8e388ec76e196c608b699c4ae4239968e",
+        "runtime_id": "9b7a1b9d61d91f7c6b77c256cce1e92f97a44923879154e81706083d1943b601",
+        "parent_runtime_id": "8916859a6aaa436546322277da518f167be9ba3c1811ab38e2ec888357284e61",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.027911,
+          "y": 0.836957,
+          "width": 0.017325,
+          "height": 0.024456
+        }
+      },
+      {
+        "structural_id": "9b3250ab90beac94d97e353f38f5e4b6d6de6074507202c47ac97e5ce55f6d9d",
+        "runtime_id": "a862a880e2e966debf5f06470309904ebd67363c22765e68d480d4269bc47a80",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "handoff-item func-menu__item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.021174,
+          "y": 0.877717,
+          "width": 0.030799,
+          "height": 0.043479
+        }
+      },
+      {
+        "structural_id": "1020164fe29dc52b2f913a877c9f5ac1c2d44fba6ea76c235f774822145f6f95",
+        "runtime_id": "f5d2470f1805de636c3f5b4b82a66c42550cd8f94acdbcc9e3fb454e0c23a954",
+        "parent_runtime_id": "a862a880e2e966debf5f06470309904ebd67363c22765e68d480d4269bc47a80",
+        "control_type": "ControlType.Button",
+        "class_name": "icon-item handoff-icon",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [
+          "conversation_item"
+        ],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.020212,
+          "y": 0.876359,
+          "width": 0.032724,
+          "height": 0.046195
+        }
+      },
+      {
+        "structural_id": "07a0a616e0d37d6a083d39418265de75993e4ff5de9427cecb9463c868d66bd7",
+        "runtime_id": "2b8a4bc3979f53c66e473abd8e1012552c70aa38a2b15c9ca9e3a18abff2af6b",
+        "parent_runtime_id": "f5d2470f1805de636c3f5b4b82a66c42550cd8f94acdbcc9e3fb454e0c23a954",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.027911,
+          "y": 0.887228,
+          "width": 0.017325,
+          "height": 0.024457
+        }
+      },
+      {
+        "structural_id": "56ed5ba3c040e896415f9886442d36915930174b50febcd26805bb5ef3406f4e",
+        "runtime_id": "47fda3399a8b1c5961bf23af5d43371398a1d328593cc5e8231a61fb29e96e4e",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "func-menu-more-component func-menu__item",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.020212,
+          "y": 0.92663,
+          "width": 0.032724,
+          "height": 0.046196
+        }
+      },
+      {
+        "structural_id": "47fab697b40be8be8633b1f9846ef6eb81a783ecb2f7016fd304e963176e6f2b",
+        "runtime_id": "150ab47dbd4beddec1cf8dce0f4f71ef4aec18aeca975bc2e6ebf11a7bcb91a7",
+        "parent_runtime_id": "47fda3399a8b1c5961bf23af5d43371398a1d328593cc5e8231a61fb29e96e4e",
+        "control_type": "ControlType.Group",
+        "class_name": "q-badge q-badge__red update-badge",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.020212,
+          "y": 0.92663,
+          "width": 0.032724,
+          "height": 0.046196
+        }
+      },
+      {
+        "structural_id": "4373572c7a1e2362ccc3d939a550a20f8c36ef380086dde711ea8740341c67fd",
+        "runtime_id": "b414f2d440a96b7c1245a41dda00785066c10988e9786b4e094e15a4d5d527b4",
+        "parent_runtime_id": "150ab47dbd4beddec1cf8dce0f4f71ef4aec18aeca975bc2e6ebf11a7bcb91a7",
+        "control_type": "ControlType.Button",
+        "class_name": "icon-item sidebar-icon",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.020212,
+          "y": 0.92663,
+          "width": 0.032724,
+          "height": 0.046196
+        }
+      },
+      {
+        "structural_id": "e5513787b0c452b027802755328cd48af18de826ea0cce23ff37bd3546842989",
+        "runtime_id": "e5ae24fe87a790408940c51d6f49e4937f1f32e2e2368048ee3f943aa389c8c8",
+        "parent_runtime_id": "b414f2d440a96b7c1245a41dda00785066c10988e9786b4e094e15a4d5d527b4",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar",
+          "ControlType.Button",
+          "ControlType.Group",
+          "ControlType.Button"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.027911,
+          "y": 0.9375,
+          "width": 0.017325,
+          "height": 0.024457
+        }
+      },
+      {
+        "structural_id": "cd3e24878fdb1b585b434bfb3ae9f22c8ae70fdf74daafe08ab0d11616d58fd7",
+        "runtime_id": "fa1a3a14409d9b1bcefb164760b26b593e99fa2949f37e5d7f77e700c03e9af6",
+        "parent_runtime_id": "9c8c6c40eda30b11e2f543d87a3e25b8023ee207ca91e504b363ffecc4e6c026",
+        "control_type": "ControlType.Button",
+        "class_name": "version-tip-button",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.ToolBar"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.025987,
+          "y": 0.953804,
+          "width": 0.021174,
+          "height": 0.029892
+        }
+      },
+      {
+        "structural_id": "ef388ed84041b82630c309e2535946a5a34e8ef9f66bb44923f030e2ac47742c",
+        "runtime_id": "a1db657f84fdca5901de0f32b87f142ccb0d355e102290acb8faeb9f03259178",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Group",
+        "class_name": "q-search main-search__search-input",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.073147,
+          "y": 0.081522,
+          "width": 0.184793,
+          "height": 0.038043
+        }
+      },
+      {
+        "structural_id": "19edddc3130529247e3f49ea4d4fa70922af4ea1ef459b65ce7d3853573b6312",
+        "runtime_id": "8283901aa636d60fbae0313362c6a4da7cc68905df9163599db1c08f11802527",
+        "parent_runtime_id": "a1db657f84fdca5901de0f32b87f142ccb0d355e102290acb8faeb9f03259178",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.080847,
+          "y": 0.089674,
+          "width": 0.015399,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "58555ba65a39e271b34d2f55115e925522df7c41b7efe0979beb773876ca0041",
+        "runtime_id": "dc0dbb8a14a01466ee3da7bd246760926a7a581797b644f10cdd2ffd678db935",
+        "parent_runtime_id": "a1db657f84fdca5901de0f32b87f142ccb0d355e102290acb8faeb9f03259178",
+        "control_type": "ControlType.Edit",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "search",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern",
+          "valuepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.098171,
+          "y": 0.086957,
+          "width": 0.155919,
+          "height": 0.027173
+        }
+      },
+      {
+        "structural_id": "cfb008a6ad1a44ce1c6b8d042d89d6c38bc24d57774324f0be77e7f681245ca8",
+        "runtime_id": "4a8afeea86c1d870153845b7eb853e82ae48537eb2987107f8a3e7994dc60d94",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Button",
+        "class_name": "contact-adder-btn top-bar__adder",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.26564,
+          "y": 0.08288,
+          "width": 0.025024,
+          "height": 0.035327
+        }
+      },
+      {
+        "structural_id": "20b43b8cb938bf084ed52c66e0b0c8a4c56db4a3f11827768f3d1197eea04a18",
+        "runtime_id": "218e198ff9e01c73ab0f491c4fcb50f51f3c493b10631e1a2cd7877d9a07efdb",
+        "parent_runtime_id": "4a8afeea86c1d870153845b7eb853e82ae48537eb2987107f8a3e7994dc60d94",
+        "control_type": "ControlType.Group",
+        "class_name": "q-badge q-badge__red plus-panel-badge",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Button"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.26564,
+          "y": 0.08288,
+          "width": 0.025024,
+          "height": 0.035327
+        }
+      },
+      {
+        "structural_id": "064f81f13a57623bcc7335144fed418b3bdc46eee17c2a943d7f273512799771",
+        "runtime_id": "5fd85aa79a0cdd10f40b9ea3ee7dbc1b67da52703ec1f717dcc8bc994f882064",
+        "parent_runtime_id": "218e198ff9e01c73ab0f491c4fcb50f51f3c493b10631e1a2cd7877d9a07efdb",
+        "control_type": "ControlType.Group",
+        "class_name": "top-bar__adder",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Button",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.26564,
+          "y": 0.08288,
+          "width": 0.025024,
+          "height": 0.035327
+        }
+      },
+      {
+        "structural_id": "2b692bee57bab15ff4ce7fceea4608766a9188cadb973583a7acdb0132b3b058",
+        "runtime_id": "c81315ff7ec1b3861890f4a8773bc2abadc70db2e7eb757990b292a5230086d7",
+        "parent_runtime_id": "5fd85aa79a0cdd10f40b9ea3ee7dbc1b67da52703ec1f717dcc8bc994f882064",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Button",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.270452,
+          "y": 0.089674,
+          "width": 0.0154,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "2e864e29069b6cf0b44484603014a9dc0ccc985811af7ec006dfec32a9679b34",
+        "runtime_id": "ce609de364e9c3ac0dcfeb1296d063f9d2a33a6355c7a61d5d44627a33de928f",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Pane",
+        "class_name": "q-scroll-view scroll-view--memory scroll-view--show-scrollbar recent-contact-list recent-contact-default-theme-list",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.13587,
+          "width": 0.240616,
+          "height": 0.847826
+        }
+      },
+      {
+        "structural_id": "389ca397297909817a490ad08b3cec80591cb14cb9aa3c208e1ba7d9a3fc53e7",
+        "runtime_id": "1ce421f0f7a642a886a76918826114014b830a6ba08198862dd27e011499e202",
+        "parent_runtime_id": "ce609de364e9c3ac0dcfeb1296d063f9d2a33a6355c7a61d5d44627a33de928f",
+        "control_type": "ControlType.Group",
+        "class_name": "recent-contact-item",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.13587,
+          "width": 0.240616,
+          "height": 0.086956
+        }
+      },
+      {
+        "structural_id": "d34801d8c37948c971999072e81a96cc454925ac90acfa1b600a00ce05f38795",
+        "runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "parent_runtime_id": "1ce421f0f7a642a886a76918826114014b830a6ba08198862dd27e011499e202",
+        "control_type": "ControlType.Group",
+        "class_name": "item__content item-dragging-over",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.13587,
+          "width": 0.240616,
+          "height": 0.086956
+        }
+      },
+      {
+        "structural_id": "c4b281e812046b888b97c4b25ab95d2ce5eb1aeb2ad58f4f728eb6d4ef4cafa4",
+        "runtime_id": "736ed64326d7d37d61e97f16a90a65bbd505370b91c7eb06c7f1104c20c9bd29",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.123195,
+          "y": 0.153533,
+          "width": 0.026949,
+          "height": 0.024456
+        }
+      },
+      {
+        "structural_id": "88f124fb4f592c1bbd197d4f8e6ea6edcc31a6c0cd89e3af65d1a2567f673c11",
+        "runtime_id": "554d04ee45dcf72115c2efa5f2197a280aa6a33381c8333c7a14b93c005261e8",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.150144,
+          "y": 0.153533,
+          "width": 0.01925,
+          "height": 0.024456
+        }
+      },
+      {
+        "structural_id": "e22872ea0f793ca3a7035c43ef4a9998864ce1b7bc7aec6e635d87e3932fcbbf",
+        "runtime_id": "5b487f5e5c677e97e2067265eaec8c2a1b2fc8588128c278216a4d1e2dd18058",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.168431,
+          "y": 0.153533,
+          "width": 0.06641,
+          "height": 0.024456
+        }
+      },
+      {
+        "structural_id": "c478e7fb02595821973ebf596ae395d53129125b8c2c64d654024fef839f3f3b",
+        "runtime_id": "532610a85d3ad7132e2e2e4458faabc7370f38c902dc635d9d27c4c86c81b6fa",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.26564,
+          "y": 0.15625,
+          "width": 0.025024,
+          "height": 0.017663
+        }
+      },
+      {
+        "structural_id": "9171f9f89457b1d6ffa9849b7714c6810243b5725141767e062eab780d5cda1f",
+        "runtime_id": "f9e0806bfb626554f735cbfb2d73bfdff17bfb51b6d6b7f5a6e05f3603a9e3fe",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.123195,
+          "y": 0.184783,
+          "width": 0.095284,
+          "height": 0.02038
+        }
+      },
+      {
+        "structural_id": "4ea1dc789b5b6c5a4d9d4574fe8bdfd4dd8684e6dee5c000b3d40c6a5a9bb63a",
+        "runtime_id": "15e21318cc67f5b5685e29b8594197823240b3c4c7a0f31307b1d7afe1af49e2",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Group",
+        "class_name": "face-element",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.217517,
+          "y": 0.184783,
+          "width": 0.015399,
+          "height": 0.02038
+        }
+      },
+      {
+        "structural_id": "3d20fc606633e41bb6dd3c67ed7ebe53c1a74160dc3cc80d468466acc4906535",
+        "runtime_id": "1beae751143569de75427fbf6876977002e0d996c27d4f0b75d7d35a3e0a203a",
+        "parent_runtime_id": "15e21318cc67f5b5685e29b8594197823240b3c4c7a0f31307b1d7afe1af49e2",
+        "control_type": "ControlType.Image",
+        "class_name": "face-element__icon",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.217517,
+          "y": 0.184783,
+          "width": 0.015399,
+          "height": 0.02038
+        }
+      },
+      {
+        "structural_id": "327f1cfbab2326b11dbd3bc003596c5c6bf0768eff8b0ad12028cbfcf660f151",
+        "runtime_id": "283446d581b9ad83aa1ecd30119e64d7fcf5cda9ead06855dbde853bf1ccfa1d",
+        "parent_runtime_id": "3bf112b55774633f956c0d48f2b33448d88f47de368f892c9590e9cca1398b21",
+        "control_type": "ControlType.Group",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.270452,
+          "y": 0.184783,
+          "width": 0.020212,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "be369a5059a32f7f890021e7ce01bd4d0cbec3212abb3bc7852a86885f243303",
+        "runtime_id": "4990f14cb36f854a8f37470b4b6c23a2feeb5ea88e69c1e97d809e714a0ac8e9",
+        "parent_runtime_id": "283446d581b9ad83aa1ecd30119e64d7fcf5cda9ead06855dbde853bf1ccfa1d",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.274302,
+          "y": 0.186141,
+          "width": 0.012512,
+          "height": 0.017663
+        }
+      },
+      {
+        "structural_id": "5ecac969fa78ade6972843ce7ab3ac43b8c0eb70bb370493ab6820b0c895b882",
+        "runtime_id": "c643b0abbcbede7bbb3c6d419d7e080b7d38710e1fff8173e951ef32fd95620f",
+        "parent_runtime_id": "ce609de364e9c3ac0dcfeb1296d063f9d2a33a6355c7a61d5d44627a33de928f",
+        "control_type": "ControlType.Group",
+        "class_name": "recent-contact-item",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.222826,
+          "width": 0.240616,
+          "height": 0.086957
+        }
+      },
+      {
+        "structural_id": "a42d83bff6f728f65d3a9621a70d86bdd70d3fbf76fb57d3e5bd9015a83d63b5",
+        "runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "parent_runtime_id": "c643b0abbcbede7bbb3c6d419d7e080b7d38710e1fff8173e951ef32fd95620f",
+        "control_type": "ControlType.Group",
+        "class_name": "item__content item-dragging-over",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.222826,
+          "width": 0.240616,
+          "height": 0.086957
+        }
+      },
+      {
+        "structural_id": "5deceb414f7b6f8475dcab512147984baaeb5f01031d5c113a2ae6639d799b32",
+        "runtime_id": "23b03fb12b682e519592123362789a74c122038cce09a07f93841522e0d8ce08",
+        "parent_runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.123195,
+          "y": 0.240489,
+          "width": 0.094322,
+          "height": 0.024457
+        }
+      },
+      {
+        "structural_id": "9e9864e9b20d87080f828bade34a110fa6b0fd9ccb855de0a33f20a2f06ac50e",
+        "runtime_id": "32a0c554c1ba93e47f8a4909c745696cfa9676b7ffa6f0351f789c7ea37ccdef",
+        "parent_runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.26564,
+          "y": 0.243207,
+          "width": 0.025024,
+          "height": 0.017663
+        }
+      },
+      {
+        "structural_id": "d356b9786aec816837af634f6c07af1b66e12e0c8fef3548a28bf67579800338",
+        "runtime_id": "5572a2a61e7f83c62bfd1abf9e7abeee73168f48b8a49f0848bf020a83c09b9b",
+        "parent_runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.123195,
+          "y": 0.271739,
+          "width": 0.0231,
+          "height": 0.020381
+        }
+      },
+      {
+        "structural_id": "6a9f4702a6124d7ba7344a893178f0b77d26a271093d90f5e6962889c8cd1d43",
+        "runtime_id": "5e40ba806519f96699a1e34015a524b673f7e6647ddddeac28c603e1601a0449",
+        "parent_runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.146295,
+          "y": 0.271739,
+          "width": 0.034648,
+          "height": 0.020381
+        }
+      },
+      {
+        "structural_id": "29d4fa35b0fbb97e8643adae7ae1a0d0adaae99230caad44b5c4bbedabb6747b",
+        "runtime_id": "d0415b255dde5d1da6d14b466af84b328b49d7547d61c5c446cbdd10f94403cc",
+        "parent_runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.180943,
+          "y": 0.271739,
+          "width": 0.034649,
+          "height": 0.020381
+        }
+      },
+      {
+        "structural_id": "45cda0bb7804ba89686398d2c1b7c6fed72f08bea1cd82e18df11cb2a9c5ea07",
+        "runtime_id": "78dd38376ded5e41fd6167cd1b759e79c6889bdc8edee4df44f85e3f2b18bfb9",
+        "parent_runtime_id": "552e435880cc9c48085f5a876147fbdd6ebbc6a067a8476b16feb32cd4f8e177",
+        "control_type": "ControlType.Group",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.275265,
+          "y": 0.271739,
+          "width": 0.015399,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "00f0fa3227b955598ca81d94c30295e05e7b682d338d780c800ff4eb927a7860",
+        "runtime_id": "9ad0dcb5602c84847749d1037fb0651a4b1287d72b24d54eb3834886d34a1fb3",
+        "parent_runtime_id": "78dd38376ded5e41fd6167cd1b759e79c6889bdc8edee4df44f85e3f2b18bfb9",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.279115,
+          "y": 0.273098,
+          "width": 0.007699,
+          "height": 0.017663
+        }
+      },
+      {
+        "structural_id": "585df1b126cd634070f11510086b73b8e3c69c77d8f507d33c1f7c87d071b939",
+        "runtime_id": "cdf57d57cae5e5958fa66bf060f8f53f80ff397b3b2caa439e279be2bfe4395c",
+        "parent_runtime_id": "ce609de364e9c3ac0dcfeb1296d063f9d2a33a6355c7a61d5d44627a33de928f",
+        "control_type": "ControlType.Group",
+        "class_name": "recent-contact-item",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.309783,
+          "width": 0.240616,
+          "height": 0.086956
+        }
+      },
+      {
+        "structural_id": "9a787dcfa27f8a3126f3a2741d91dbc4556f7f976d21f79a903e82765d0fb804",
+        "runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "parent_runtime_id": "cdf57d57cae5e5958fa66bf060f8f53f80ff397b3b2caa439e279be2bfe4395c",
+        "control_type": "ControlType.Group",
+        "class_name": "item__content item-dragging-over",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.061598,
+          "y": 0.309783,
+          "width": 0.240616,
+          "height": 0.086956
+        }
+      },
+      {
+        "structural_id": "c9d474010611eab3c85ef3d34d8646271ff582288eba2ab4de8afb051bf6b97e",
+        "runtime_id": "f923487ee7a1ede665c9098a64a20dca86d363a054cb036fdbb2c28d6c872c6d",
+        "parent_runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.123195,
+          "y": 0.327446,
+          "width": 0.100097,
+          "height": 0.024456
+        }
+      },
+      {
+        "structural_id": "95d61ad2a98fcd83e7308e8eb631722b1536da9b196398838d7517af65ad0051",
+        "runtime_id": "a3e8e57d255ad4091e5ef8edee501a910a8785c2666301db51cd715f7949476c",
+        "parent_runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.263715,
+          "y": 0.330163,
+          "width": 0.026949,
+          "height": 0.017663
+        }
+      },
+      {
+        "structural_id": "2c1fd6b76a91161581b12f91a862395397ffe99b7130dda828a937da6e39f150",
+        "runtime_id": "b070b148647720432652feb15c1b30e0d406ac8e5dcc5b2ef1c18fa0ffb39aae",
+        "parent_runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.123195,
+          "y": 0.358696,
+          "width": 0.055823,
+          "height": 0.02038
+        }
+      },
+      {
+        "structural_id": "cdbc45b8b1e9cc5996be1070897e052f18dc9eb902d69bbf9de8c73652b60649",
+        "runtime_id": "b5bf946f6fcaea55a4c1574754a1254d1965b7dc65faed09411a5c04d4bd1f29",
+        "parent_runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.178056,
+          "y": 0.358696,
+          "width": 0.082772,
+          "height": 0.02038
+        }
+      },
+      {
+        "structural_id": "abcb1196a9b003bd7160e2b144cd337fabde6e11d2c429d6647cef887913e7e4",
+        "runtime_id": "14a3b384d533f61d9def2ffd94f6ab7066849c80a6b7497095a9b87e77f40d3c",
+        "parent_runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "control_type": "ControlType.Text",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "named_text",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "textpattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.262753,
+          "y": 0.358696,
+          "width": 0.151106,
+          "height": 0.02038
+        }
+      },
+      {
+        "structural_id": "4461d07c009827d67e1079f0617adcb44059da23482a1b77bc1e8e4a05bc6137",
+        "runtime_id": "617fd854488e86d970aaf0b020fc5616db115eaaaf3cb4e171d904e4d23461c3",
+        "parent_runtime_id": "39b42b4af9b1ab89f75d1d5c046c816c3206c5c005594429c1f2ee26b166349c",
+        "control_type": "ControlType.Group",
+        "class_name": "q-svg-icon q-icon no-disturb-icon",
+        "automation_id": "",
+        "name_kind": "nonempty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.275265,
+          "y": 0.358696,
+          "width": 0.015399,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "35c47fb58f0a29e2c2b654b71391a7a65c88797ac5d8b77ccd34a937da809194",
+        "runtime_id": "202f7fb6428683db16bd71a97bdc291dc958011148b119829cdeb10ddfa8bf44",
+        "parent_runtime_id": "617fd854488e86d970aaf0b020fc5616db115eaaaf3cb4e171d904e4d23461c3",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group",
+          "ControlType.Pane",
+          "ControlType.Group",
+          "ControlType.Group",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.275265,
+          "y": 0.358696,
+          "width": 0.015399,
+          "height": 0.021739
+        }
+      },
+      {
+        "structural_id": "166746f2ac37075e776b5b6eed44d401894fe7afa01dca19a11a07dd90e83b34",
+        "runtime_id": "b60e4083b357bdc68b2ffb70a40606eb91bb402fb4b271d5db103eb4fa759213",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Group",
+        "class_name": "resize-handler ew",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.300289,
+          "y": 0.065217,
+          "width": 0.004812,
+          "height": 0.918479
+        }
+      },
+      {
+        "structural_id": "284b520470713dc39384498ea01255b808cc521ea3628de24a7325c1e618d8b7",
+        "runtime_id": "e5c4e7518aeae38988630d2a27bf4769356d3b19a06dc63529a080a70c67935f",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Group",
+        "class_name": "draggable-view__container empty-panel_head",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [
+          "invokepattern"
+        ],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.302214,
+          "y": 0.065217,
+          "width": 0.686236,
+          "height": 0.078805
+        }
+      },
+      {
+        "structural_id": "96ec2ded88505053eb1dd781cb0abc6168d4cf1fa584d6a3425f561fa159bc5a",
+        "runtime_id": "e88f4aa93450ad5ed85feb036a429d6c382f840a903b66f8aa0c65f226c1c0c0",
+        "parent_runtime_id": "953f1ff9aca453bd8bcbb2cb1747ec064f00017c0781b211b4aae2ea0fe962a4",
+        "control_type": "ControlType.Image",
+        "class_name": "",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Document",
+          "ControlType.Group"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.596728,
+          "y": 0.456522,
+          "width": 0.097208,
+          "height": 0.135869
+        }
+      },
+      {
+        "structural_id": "ea0532ca376c5fe1736dff3ce65c341db239a8bda742a396745a8772a57a7aa3",
+        "runtime_id": "03e05086de15e7b0af2d8583af649a4f75a0745f6fe5d5965556a6585846aed0",
+        "parent_runtime_id": "0765802492fab8a4c25c8a35f3b31b414526473ed742afd60cbc70a2588f3a2c",
+        "control_type": "ControlType.Pane",
+        "class_name": "View",
+        "automation_id": "",
+        "name_kind": "empty",
+        "ancestor_control_types": [
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane",
+          "ControlType.Pane"
+        ],
+        "patterns": [],
+        "semantic_anchors": [],
+        "is_enabled": true,
+        "is_offscreen": false,
+        "normalized_bounds": {
+          "x": 0.0077,
+          "y": 0.01087,
+          "width": 0.9846,
+          "height": 0.97826
+        }
+      }
+    ]
+  },
+  "privacy": {
+    "emitted_control_names": false,
+    "emitted_message_text": false,
+    "changed_window_state": false
+  }
+}

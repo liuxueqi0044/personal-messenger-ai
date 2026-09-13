@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, time
 from hashlib import sha256
+from uuid import UUID, uuid4
 
 from messenger_ai.domain.models import PacingProfile, ReplyPlan
 from messenger_ai.pacing import PacingScheduler
@@ -31,6 +33,7 @@ def request(
     last_outbound_at: datetime | None = None,
     profile: PacingProfile | None = None,
     limits: SchedulerLimits | None = None,
+    one_shot_attempt_id: UUID | None = None,
 ) -> ScheduleRequest:
     text = "".join(segments) if segments else reply
     draft = DraftSnapshot(
@@ -54,6 +57,7 @@ def request(
         last_outbound_at=last_outbound_at,
         profile=profile or PacingProfile(),
         limits=limits or SchedulerLimits(),
+        one_shot_attempt_id=one_shot_attempt_id,
     )
 
 
@@ -169,8 +173,6 @@ def test_restart_preserves_plan_and_due_is_exactly_once(tmp_path) -> None:
 
 
 def test_due_outbox_survives_claim_crash_and_receipt_replay_is_idempotent() -> None:
-    from uuid import uuid4
-
     clock = FakeClock(START)
     scheduler = PacingScheduler(clock=clock)
     plan = scheduler.schedule(request(clock, segments=["一", "二"])).plan
@@ -185,15 +187,494 @@ def test_due_outbox_survives_claim_crash_and_receipt_replay_is_idempotent() -> N
     assert scheduler.complete_due_outbox(outbox_id)
     operation_id = uuid4()
     advanced = scheduler.record_revalidation_result(
-        plan.pacing_plan_id, segment_sent_and_verified=True,
-        segment_index=0, operation_id=operation_id,
+        plan.pacing_plan_id,
+        segment_sent_and_verified=True,
+        segment_index=0,
+        operation_id=operation_id,
     )
     assert advanced and advanced.segment_index == 1
     replay = scheduler.record_revalidation_result(
-        plan.pacing_plan_id, segment_sent_and_verified=True,
-        segment_index=0, operation_id=operation_id,
+        plan.pacing_plan_id,
+        segment_sent_and_verified=True,
+        segment_index=0,
+        operation_id=operation_id,
     )
     assert replay and replay.segment_index == 1
+
+
+def test_legacy_schema_adds_nullable_one_shot_provenance_columns(tmp_path) -> None:
+    path = tmp_path / "legacy-pacing.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE m10_plans (
+          pacing_plan_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+          contact_id TEXT NOT NULL, status TEXT NOT NULL,
+          earliest_send_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          payload_json TEXT NOT NULL, due_emitted_at TEXT, cancel_reason TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE m10_due_outbox (
+          outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          pacing_plan_id TEXT NOT NULL, segment_index INTEGER NOT NULL,
+          payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          operation_id TEXT, claimed_at TEXT, delivered_at TEXT,
+          created_at TEXT NOT NULL, UNIQUE(pacing_plan_id, segment_index)
+        );
+        """
+    )
+    connection.close()
+
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(path, clock=clock)
+    attempt_id = uuid4()
+    plan = scheduler.schedule(request(clock, one_shot_attempt_id=attempt_id)).plan
+    assert plan is not None
+    clock.advance(8)
+    due = scheduler.due_for_revalidation(
+        pacing_plan_id=plan.pacing_plan_id,
+        one_shot_attempt_id=attempt_id,
+    )
+
+    for table in ("m10_plans", "m10_due_outbox"):
+        columns = {
+            row["name"]
+            for row in scheduler.connection.execute(f"PRAGMA table_info({table})")
+        }
+        assert "one_shot_attempt_id" in columns
+    assert due[0].one_shot_attempt_id == attempt_id
+    assert scheduler.connection.execute(
+        "SELECT one_shot_attempt_id FROM m10_due_outbox"
+    ).fetchone()["one_shot_attempt_id"] == str(attempt_id)
+
+
+def test_one_shot_due_requires_the_exact_attempt_and_skips_normal_scan() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    attempt_id = uuid4()
+    plan = scheduler.schedule(request(clock, one_shot_attempt_id=attempt_id)).plan
+    assert plan is not None and plan.one_shot_attempt_id == attempt_id
+    clock.advance(8)
+
+    assert scheduler.due_for_revalidation() == []
+    assert scheduler.due_for_revalidation(pacing_plan_id=plan.pacing_plan_id) == []
+    assert (
+        scheduler.due_for_revalidation(
+            pacing_plan_id=plan.pacing_plan_id,
+            one_shot_attempt_id=uuid4(),
+        )
+        == []
+    )
+    assert (
+        scheduler.connection.execute(
+            "SELECT status FROM m10_plans WHERE pacing_plan_id=?",
+            (str(plan.pacing_plan_id),),
+        ).fetchone()["status"]
+        == "waiting"
+    )
+
+    due = scheduler.due_for_revalidation(
+        pacing_plan_id=plan.pacing_plan_id,
+        one_shot_attempt_id=attempt_id,
+    )
+
+    assert len(due) == 1
+    assert due[0].one_shot_attempt_id == attempt_id
+
+
+def test_recovered_one_shot_claim_remains_quarantined_from_normal_claims() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    attempt_id = uuid4()
+    plan = scheduler.schedule(request(clock, one_shot_attempt_id=attempt_id)).plan
+    assert plan is not None
+    clock.advance(8)
+    assert scheduler.due_for_revalidation(
+        pacing_plan_id=plan.pacing_plan_id,
+        one_shot_attempt_id=attempt_id,
+    )
+    claimed = scheduler.claim_due_outbox(
+        pacing_plan_id=plan.pacing_plan_id,
+        segment_index=0,
+        one_shot_attempt_id=attempt_id,
+    )
+    assert len(claimed) == 1
+
+    assert scheduler.recover_due_outbox() == 1
+    assert scheduler.claim_due_outbox() == []
+    assert (
+        scheduler.claim_due_outbox(
+            pacing_plan_id=plan.pacing_plan_id,
+            segment_index=0,
+        )
+        == []
+    )
+    assert (
+        scheduler.claim_due_outbox(
+            pacing_plan_id=plan.pacing_plan_id,
+            segment_index=0,
+            one_shot_attempt_id=uuid4(),
+        )
+        == []
+    )
+    assert (
+        len(
+            scheduler.claim_due_outbox(
+                pacing_plan_id=plan.pacing_plan_id,
+                segment_index=0,
+                one_shot_attempt_id=attempt_id,
+            )
+        )
+        == 1
+    )
+
+
+def test_clock_jump_scans_are_isolated_by_one_shot_provenance() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    attempt_id = uuid4()
+    regular = scheduler.schedule(
+        request(
+            clock,
+            conversation="regular",
+            contact="regular-contact",
+            profile=PacingProfile(plan_ttl_seconds=1_000),
+        )
+    ).plan
+    one_shot = scheduler.schedule(
+        request(
+            clock,
+            conversation="one-shot",
+            contact="one-shot-contact",
+            profile=PacingProfile(plan_ttl_seconds=1_000),
+            one_shot_attempt_id=attempt_id,
+        )
+    ).plan
+    assert regular is not None and one_shot is not None
+    assert scheduler.due_for_revalidation() == []
+    clock.advance(301)
+
+    assert (
+        scheduler.due_for_revalidation(
+            pacing_plan_id=one_shot.pacing_plan_id,
+            one_shot_attempt_id=uuid4(),
+        )
+        == []
+    )
+    assert (
+        scheduler.connection.execute(
+            "SELECT status FROM m10_plans WHERE pacing_plan_id=?",
+            (str(one_shot.pacing_plan_id),),
+        ).fetchone()["status"]
+        == "waiting"
+    )
+    assert (
+        scheduler.due_for_revalidation(
+            pacing_plan_id=one_shot.pacing_plan_id,
+            one_shot_attempt_id=attempt_id,
+        )
+        == []
+    )
+    assert scheduler.due_for_revalidation() == []
+
+    statuses = {
+        row["pacing_plan_id"]: row["status"]
+        for row in scheduler.connection.execute(
+            "SELECT pacing_plan_id,status FROM m10_plans"
+        )
+    }
+    assert statuses[str(one_shot.pacing_plan_id)] == "hold_replan"
+    assert statuses[str(regular.pacing_plan_id)] == "hold_replan"
+
+
+def test_atomic_result_and_outbox_completion_roll_back_and_recover_safely() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    attempt_id = uuid4()
+    operation_id = uuid4()
+    plan = scheduler.schedule(request(clock, one_shot_attempt_id=attempt_id)).plan
+    assert plan is not None
+    clock.advance(8)
+    assert scheduler.due_for_revalidation(
+        pacing_plan_id=plan.pacing_plan_id,
+        one_shot_attempt_id=attempt_id,
+    )
+    outbox_id, _due = scheduler.claim_due_outbox(
+        pacing_plan_id=plan.pacing_plan_id,
+        segment_index=0,
+        one_shot_attempt_id=attempt_id,
+    )[0]
+    assert (
+        scheduler.record_revalidation_result_and_complete_due_outbox(
+            outbox_id,
+            uuid4(),
+            segment_sent_and_verified=True,
+            segment_index=0,
+            operation_id=operation_id,
+            one_shot_attempt_id=attempt_id,
+        )
+        is None
+    )
+    assert (
+        scheduler.record_revalidation_result_and_complete_due_outbox(
+            outbox_id,
+            plan.pacing_plan_id,
+            segment_sent_and_verified=True,
+            segment_index=1,
+            operation_id=operation_id,
+            one_shot_attempt_id=attempt_id,
+        )
+        is None
+    )
+    assert (
+        scheduler.record_revalidation_result_and_complete_due_outbox(
+            outbox_id,
+            plan.pacing_plan_id,
+            segment_sent_and_verified=True,
+            segment_index=0,
+            operation_id=operation_id,
+            one_shot_attempt_id=uuid4(),
+        )
+        is None
+    )
+    scheduler.connection.execute(
+        """CREATE TRIGGER fail_due_delivery
+           BEFORE UPDATE OF status ON m10_due_outbox
+           WHEN NEW.status='delivered'
+           BEGIN SELECT RAISE(ABORT, 'simulated crash'); END"""
+    )
+
+    try:
+        scheduler.record_revalidation_result_and_complete_due_outbox(
+            outbox_id,
+            plan.pacing_plan_id,
+            segment_sent_and_verified=True,
+            segment_index=0,
+            operation_id=operation_id,
+            one_shot_attempt_id=attempt_id,
+        )
+    except sqlite3.IntegrityError as error:
+        assert "simulated crash" in str(error)
+    else:
+        raise AssertionError("delivery trigger should abort the pacing transaction")
+
+    plan_row = scheduler.connection.execute(
+        "SELECT status FROM m10_plans WHERE pacing_plan_id=?",
+        (str(plan.pacing_plan_id),),
+    ).fetchone()
+    outbox_row = scheduler.connection.execute(
+        "SELECT status,operation_id FROM m10_due_outbox WHERE outbox_id=?",
+        (outbox_id,),
+    ).fetchone()
+    assert plan_row["status"] == "due_for_revalidation"
+    assert tuple(outbox_row) == ("dispatching", None)
+    assert (
+        scheduler.connection.execute(
+            "SELECT COUNT(*) FROM m10_segment_receipts"
+        ).fetchone()[0]
+        == 0
+    )
+
+    scheduler.connection.execute("DROP TRIGGER fail_due_delivery")
+    assert scheduler.record_revalidation_result_and_complete_due_outbox(
+        outbox_id,
+        plan.pacing_plan_id,
+        segment_sent_and_verified=True,
+        segment_index=0,
+        operation_id=operation_id,
+        one_shot_attempt_id=attempt_id,
+    )
+    assert scheduler.recover_due_outbox() == 0
+    delivered_row = scheduler.connection.execute(
+        "SELECT status,operation_id FROM m10_due_outbox WHERE outbox_id=?",
+        (outbox_id,),
+    ).fetchone()
+    assert tuple(delivered_row) == ("delivered", str(operation_id))
+    assert (
+        scheduler.record_revalidation_result_and_complete_due_outbox(
+            outbox_id,
+            plan.pacing_plan_id,
+            segment_sent_and_verified=False,
+            segment_index=0,
+            operation_id=operation_id,
+            one_shot_attempt_id=attempt_id,
+        )
+        is None
+    )
+    assert (
+        scheduler.record_revalidation_result_and_complete_due_outbox(
+            outbox_id,
+            plan.pacing_plan_id,
+            segment_sent_and_verified=True,
+            segment_index=0,
+            operation_id=uuid4(),
+            one_shot_attempt_id=attempt_id,
+        )
+        is None
+    )
+
+
+def test_atomic_revalidation_rejection_needs_no_send_operation() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    attempt_id = uuid4()
+    plan = scheduler.schedule(request(clock, one_shot_attempt_id=attempt_id)).plan
+    assert plan is not None
+    clock.advance(8)
+    assert scheduler.due_for_revalidation(
+        pacing_plan_id=plan.pacing_plan_id,
+        one_shot_attempt_id=attempt_id,
+    )
+    outbox_id, _due = scheduler.claim_due_outbox(
+        pacing_plan_id=plan.pacing_plan_id,
+        segment_index=0,
+        one_shot_attempt_id=attempt_id,
+    )[0]
+
+    assert scheduler.record_revalidation_result_and_complete_due_outbox(
+        outbox_id,
+        plan.pacing_plan_id,
+        segment_sent_and_verified=False,
+        segment_index=0,
+        one_shot_attempt_id=attempt_id,
+    )
+    plan_status = scheduler.connection.execute(
+        "SELECT status FROM m10_plans WHERE pacing_plan_id=?",
+        (str(plan.pacing_plan_id),),
+    ).fetchone()["status"]
+    outbox_status = scheduler.connection.execute(
+        "SELECT status,operation_id FROM m10_due_outbox WHERE outbox_id=?",
+        (outbox_id,),
+    ).fetchone()
+    assert plan_status == "rejected"
+    assert tuple(outbox_status) == ("delivered", None)
+    assert scheduler.recover_due_outbox() == 0
+
+
+def test_exact_due_only_advances_the_named_waiting_plan() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    selected = scheduler.schedule(
+        request(clock, conversation="conv-selected", contact="contact-selected")
+    ).plan
+    other = scheduler.schedule(
+        request(clock, conversation="conv-other", contact="contact-other")
+    ).plan
+    assert selected and other
+
+    clock.advance(8)
+    due = scheduler.due_for_revalidation(pacing_plan_id=selected.pacing_plan_id)
+
+    assert [event.pacing_plan_id for event in due] == [selected.pacing_plan_id]
+    rows = scheduler.connection.execute(
+        "SELECT pacing_plan_id,status FROM m10_plans ORDER BY pacing_plan_id"
+    ).fetchall()
+    statuses = {row["pacing_plan_id"]: row["status"] for row in rows}
+    assert statuses[str(selected.pacing_plan_id)] == "due_for_revalidation"
+    assert statuses[str(other.pacing_plan_id)] == "waiting"
+    outbox_plan_ids = [
+        row["pacing_plan_id"]
+        for row in scheduler.connection.execute(
+            "SELECT pacing_plan_id FROM m10_due_outbox ORDER BY outbox_id"
+        ).fetchall()
+    ]
+    assert outbox_plan_ids == [str(selected.pacing_plan_id)]
+
+
+def test_exact_claim_only_dispatches_the_named_plan_segment() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    selected = scheduler.schedule(
+        request(clock, conversation="conv-selected", contact="contact-selected")
+    ).plan
+    other = scheduler.schedule(
+        request(clock, conversation="conv-other", contact="contact-other")
+    ).plan
+    assert selected and other
+    clock.advance(8)
+    assert scheduler.due_for_revalidation(pacing_plan_id=selected.pacing_plan_id)
+    assert scheduler.due_for_revalidation(pacing_plan_id=other.pacing_plan_id)
+
+    assert (
+        scheduler.claim_due_outbox(
+            pacing_plan_id=selected.pacing_plan_id, segment_index=1
+        )
+        == []
+    )
+    claimed = scheduler.claim_due_outbox(
+        pacing_plan_id=selected.pacing_plan_id, segment_index=0
+    )
+
+    assert len(claimed) == 1
+    assert claimed[0][1].pacing_plan_id == selected.pacing_plan_id
+    rows = scheduler.connection.execute(
+        "SELECT pacing_plan_id,status FROM m10_due_outbox ORDER BY outbox_id"
+    ).fetchall()
+    statuses = {row["pacing_plan_id"]: row["status"] for row in rows}
+    assert statuses[str(selected.pacing_plan_id)] == "dispatching"
+    assert statuses[str(other.pacing_plan_id)] == "pending"
+
+
+def test_cancel_plan_only_cancels_the_named_plan() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    selected = scheduler.schedule(
+        request(clock, conversation="conv-selected", contact="contact-selected")
+    ).plan
+    other = scheduler.schedule(
+        request(clock, conversation="conv-other", contact="contact-other")
+    ).plan
+    assert selected and other
+
+    assert (
+        scheduler.cancel_plan(selected.pacing_plan_id, CancellationReason.USER_TAKEOVER)
+        == 1
+    )
+    assert (
+        scheduler.cancel_plan(selected.pacing_plan_id, CancellationReason.USER_TAKEOVER)
+        == 0
+    )
+    rows = scheduler.connection.execute(
+        "SELECT pacing_plan_id,status,cancel_reason FROM m10_plans ORDER BY pacing_plan_id"
+    ).fetchall()
+    states = {
+        row["pacing_plan_id"]: (row["status"], row["cancel_reason"]) for row in rows
+    }
+    assert states[str(selected.pacing_plan_id)] == (
+        "cancelled",
+        "user_takeover",
+    )
+    assert states[str(other.pacing_plan_id)] == ("waiting", None)
+
+
+def test_nonrecoverable_exact_claim_is_never_requeued_after_crash() -> None:
+    clock = FakeClock(START)
+    scheduler = PacingScheduler(clock=clock)
+    selected = scheduler.schedule(request(clock)).plan
+    assert selected
+    clock.advance(8)
+    assert scheduler.due_for_revalidation(pacing_plan_id=selected.pacing_plan_id)
+
+    claimed = scheduler.claim_due_outbox(
+        pacing_plan_id=selected.pacing_plan_id,
+        segment_index=0,
+        recoverable=False,
+    )
+
+    assert len(claimed) == 1
+    assert scheduler.recover_due_outbox() == 0
+    row = scheduler.connection.execute(
+        "SELECT status FROM m10_due_outbox WHERE outbox_id=?", (claimed[0][0],)
+    ).fetchone()
+    assert row["status"] == "dispatching_nonrecoverable"
+    assert (
+        scheduler.claim_due_outbox(
+            pacing_plan_id=selected.pacing_plan_id,
+            segment_index=0,
+            recoverable=False,
+        )
+        == []
+    )
 
 
 def test_clock_jump_holds_instead_of_batch_revalidating() -> None:

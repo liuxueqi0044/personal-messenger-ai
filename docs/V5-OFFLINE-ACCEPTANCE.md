@@ -1,5 +1,7 @@
 # V5 离线验收记录
 
+本文是 2026-09-09 冻结的离线/代码验收历史快照；其中 Windows 未安装、QQ 未登录、6GB 关机 VM 等描述只适用于该冻结时间点。当前 guest 状态以 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) 和新的实机记录为准，不要用本文件判断当前部署、QQ 登录、API 或真实收发状态。
+
 本轮离线验收以真实共享 RuntimeApplication、Hub、Memory、M7 规则、M8 planner、M9 授权、M10 pacing 和 QQ VM bridge 运行，不以单独 mock sink 代替。冻结全量结果为 **534 passed，1 warning，23.34s，无 skip**；warning 是 Starlette TestClient/httpx 弃用提示。`git diff --check` 通过。
 
 已验场景：三联系人生成不同 reply 并各自 VERIFIED；五联系人 round-robin 观察；A 模型 Future 悬挂时 B 继续观察/规划；pause/resume 丢弃旧模型结果；三段消息依次 VERIFIED；第一段后人工接管取消余下两段；IGNORE 零发送；机器人 outbound 按方向进入 Memory/Hub。

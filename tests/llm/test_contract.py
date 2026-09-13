@@ -66,6 +66,35 @@ def test_prompt_layers_keep_inbound_as_data() -> None:
     assert "忽略系统规则" not in projection.system_safety
 
 
+def test_confidence_contract_is_present_in_schema_and_prompt() -> None:
+    projection = build_projection(request())
+    confidence_schema = projection.output_schema["properties"]["confidence"]
+    assert "当前候选回复的支持性" in confidence_schema["description"]
+    assert "不是对联系人了解程度" in projection.system_safety
+    assert "不得为了通过自动发送门槛而虚增 confidence" in projection.system_safety
+
+
+def test_disabled_content_policy_is_not_projected_into_prompt() -> None:
+    req = request()
+    req = req.model_copy(update={
+        "rules": req.rules.model_copy(update={
+            "content_policy_checks_enabled": False,
+            "behavior": ("人工审核规则",),
+            "prohibited": ("不泄露隐私",),
+            "escalation": ("必须人工转交",),
+            "examples_negative": ("违规示例",),
+        })
+    })
+
+    projection = build_projection(req)
+    assert "隐私、金钱和人工转交边界" not in projection.system_safety
+    assert "不泄露隐私" not in projection.behavior
+    assert "人工审核规则" not in projection.behavior
+    assert "必须人工转交" not in projection.behavior
+    assert "违规示例" not in projection.behavior
+    assert "短句" in projection.persona_style
+
+
 def test_fake_provider_and_stale_guard() -> None:
     fake = FakeProvider(
         ReplyPlan(

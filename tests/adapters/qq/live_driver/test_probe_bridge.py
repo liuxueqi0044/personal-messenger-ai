@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +22,13 @@ from messenger_ai.adapters.qq.live_driver.topology import (
 )
 
 HASH = "a" * 64
+REAL_QQ_9933_EMPTY = (
+    Path(__file__).with_name("fixtures") / "qq_9_9_33_foreground_empty.json"
+)
+REAL_QQ_9933_SELECTED_GROUP = (
+    Path(__file__).with_name("fixtures")
+    / "qq_9_9_33_foreground_selected_group.json"
+)
 
 
 def report() -> dict:
@@ -284,3 +293,82 @@ def test_qq_nt_chromium_split_panes_are_mapped_without_visible_text() -> None:
         SelectorRole.CONVERSATION_ITEM,
         SelectorRole.MESSAGE_REGION,
     }
+
+
+def test_qq_9933_real_empty_shell_maps_list_and_rows_but_not_messages() -> None:
+    value = json.loads(REAL_QQ_9933_EMPTY.read_text(encoding="utf-8-sig"))
+    _runtime, topology = ingest_probe_report(value, "qq-uia-readonly-v2")
+
+    result = compile_selector_pack(
+        topology,
+        client_version="9.9.33.51802",
+        roles=(SelectorRole.CONVERSATION_LIST, SelectorRole.CONVERSATION_ITEM),
+    )
+    assert result.status is MappingStatus.UNIQUE
+    assert result.pack is not None
+    selectors = {item.role: item for item in result.pack.selectors}
+    assert selectors[SelectorRole.CONVERSATION_LIST].control_type == "pane"
+    assert "recent-contact-list" in selectors[SelectorRole.CONVERSATION_LIST].class_name
+    assert selectors[SelectorRole.CONVERSATION_LIST].patterns == ()
+    assert selectors[SelectorRole.CONVERSATION_LIST].automation_id_digest is None
+    assert selectors[SelectorRole.CONVERSATION_ITEM].control_type == "group"
+    assert selectors[SelectorRole.CONVERSATION_ITEM].class_name == "recent-contact-item"
+    assert selectors[SelectorRole.CONVERSATION_ITEM].patterns == ("invokepattern",)
+    assert selectors[SelectorRole.CONVERSATION_ITEM].automation_id_digest is None
+
+    message = compile_selector_pack(
+        topology, roles=(SelectorRole.MESSAGE_REGION,)
+    )
+    assert message.status is MappingStatus.NOT_FOUND
+    assert message.pack is None
+
+    wrong_version = compile_selector_pack(
+        topology,
+        client_version="9.9.26.44343",
+        roles=(SelectorRole.CONVERSATION_LIST,),
+    )
+    assert wrong_version.status is MappingStatus.REJECTED
+
+
+def test_qq_9933_duplicate_recent_lists_fail_closed() -> None:
+    value = json.loads(REAL_QQ_9933_EMPTY.read_text(encoding="utf-8-sig"))
+    original = next(
+        node
+        for node in value["topology"]["nodes"]
+        if "recent-contact-list" in node["class_name"].split()
+    )
+    duplicate = copy.deepcopy(original)
+    duplicate["runtime_id"] = "duplicate-recent-contact-list"
+    duplicate["structural_id"] = "b" * 64
+    value["topology"]["nodes"].append(duplicate)
+
+    _runtime, topology = ingest_probe_report(value, "qq-uia-readonly-v2")
+    result = compile_selector_pack(
+        topology,
+        roles=(SelectorRole.CONVERSATION_LIST, SelectorRole.CONVERSATION_ITEM),
+    )
+
+    assert result.status is MappingStatus.NOT_FOUND
+    assert result.pack is None
+
+
+def test_qq_9933_real_selected_group_maps_inner_message_scroller() -> None:
+    value = json.loads(REAL_QQ_9933_SELECTED_GROUP.read_text(encoding="utf-8-sig"))
+    _runtime, topology = ingest_probe_report(value, "qq-uia-readonly-v2")
+
+    result = compile_selector_pack(
+        topology,
+        roles=(SelectorRole.MESSAGE_REGION,),
+    )
+
+    assert result.status is MappingStatus.UNIQUE
+    assert result.pack is not None
+    selector = result.pack.selector(SelectorRole.MESSAGE_REGION)
+    assert selector.control_type == "group"
+    assert {"q-scroll-view", "ml-container", "ml-root", "container"} <= set(
+        selector.class_name.split()
+    )
+    assert selector.patterns == ("invokepattern", "scrollpattern")
+    assert sum(
+        "message_region" in node.semantic_anchors for node in topology.nodes
+    ) == 1

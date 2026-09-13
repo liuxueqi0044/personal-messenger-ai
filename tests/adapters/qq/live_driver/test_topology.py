@@ -111,6 +111,32 @@ def test_stable_mapping_and_redacted_snapshot() -> None:
     assert all("发送" not in repr(item) for item in snapshot.nodes)
 
 
+def test_qq_9933_selected_shell_keeps_explicit_message_region() -> None:
+    selected = UiTopologySnapshot.from_inputs(
+        [
+            node("root", "Window", anchors=("main_window",)),
+            node("list", "Pane", parent="root", anchors=("conversation_list",)),
+            node("item", "Group", parent="list", anchors=("conversation_item",)),
+            node(
+                "messages",
+                "Document",
+                parent="root",
+                patterns=("TextPattern",),
+                anchors=("message_region",),
+                rect=(0.3, 0.1, 0.95, 0.8),
+            ),
+        ],
+        client_version="9.9.33.51802",
+        environment_fingerprint=ENV,
+        fixture_suite_version="q1-fixture-v1",
+    )
+
+    mapping = map_role_candidates(
+        selected, roles=(SelectorRole.MESSAGE_REGION,)
+    )[0]
+    assert mapping.status is MappingStatus.UNIQUE
+
+
 def test_tree_digest_is_stable_under_input_reordering() -> None:
     first = fixture()
     second = fixture(("send", "composer", "messages", "item", "list", "root"))

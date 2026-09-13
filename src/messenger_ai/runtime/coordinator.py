@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from uuid import NAMESPACE_URL, uuid5
+from datetime import timedelta
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from messenger_ai.domain import EventEnvelope, InboundMessage, Platform
 from messenger_ai.hub.service import HubService
-from messenger_ai.memory.service import MemoryService
 from messenger_ai.memory.models import MemoryMessage, MemoryMessageDirection
-from datetime import timedelta
+from messenger_ai.memory.service import MemoryService
 from messenger_ai.pacing import PacingScheduler
 
-from .contracts import Direction, ObservationBatch, ObservedMessage
+from .contracts import ObservationBatch, ObservedMessage
 from .state import RuntimeState
 
 
@@ -44,10 +44,28 @@ class RuntimeCoordinator:
         )
         return events
 
-    def dispatch_events(self, *, limit: int = 100) -> int:
+    def dispatch_events(
+        self,
+        *,
+        limit: int = 100,
+        conversation_id: str | None = None,
+        one_shot_attempt_id: UUID | None = None,
+    ) -> int:
+        if (conversation_id is None) != (one_shot_attempt_id is None):
+            raise ValueError(
+                "exact event dispatch requires conversation and one-shot attempt"
+            )
         delivered = 0
         for _ in range(limit):
-            claimed = self.state.claim_events(limit=1)
+            claimed = (
+                self.state.claim_events(limit=1)
+                if conversation_id is None
+                else self.state.claim_events_for(
+                    conversation_id,
+                    one_shot_attempt_id=one_shot_attempt_id,
+                    limit=1,
+                )
+            )
             if not claimed:
                 break
             row = claimed[0]
@@ -96,9 +114,7 @@ class RuntimeCoordinator:
                     ).fetchall()
                     for item in conversations:
                         self.pacing.on_paused(item["conversation_id"])
-                elif event_type == "global_resume":
-                    pass
-                elif event_type == "contact_resume":
+                elif event_type in {"global_resume", "contact_resume"}:
                     pass
                 elif event_type == "bot_observed":
                     self._record_outbound(row, MemoryMessageDirection.BOT_OUTBOUND)
@@ -107,7 +123,7 @@ class RuntimeCoordinator:
                 # bot_observed intentionally does not cancel M10 segments.
                 ok = True
                 delivered += 1
-            except Exception:
+            except Exception:  # noqa: BLE001 - durable event returns to pending
                 # Current event returns to pending. No later row was preclaimed,
                 # so another contact cannot become permanently dispatching.
                 break
@@ -134,8 +150,10 @@ class RuntimeCoordinator:
         ))
 
     def recover(self) -> dict[str, int]:
-        return {
+        recovered = {
             "runtime_events": self.state.recover_events(),
             "pacing_due": self.pacing.recover_due_outbox(),
             **self.hub.recover(),
         }
+        recovered["runtime_verified"] = self.state.recover_verified_segments()
+        return recovered

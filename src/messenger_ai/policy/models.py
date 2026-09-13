@@ -254,7 +254,7 @@ class LivePolicyState(PolicyModel):
     policy_state_version: str = Field(min_length=1)
     binding_revision: int = Field(default=1, ge=1)
     conversation_revision: int = Field(default=1, ge=1)
-    conversation_type: ConversationType = ConversationType.DIRECT
+    conversation_type: ConversationType = ConversationType.UNKNOWN
     inbound_content_type: Literal["text", "image_notice", "unsupported"] = "text"
     outbound_content_type: Literal["text", "unsupported"] = "text"
     identity_unique: bool = True

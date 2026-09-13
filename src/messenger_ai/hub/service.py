@@ -47,6 +47,32 @@ ACTIVE_PLAN_STATUSES = (
     PlanStatus.AUTHORIZED.value,
 )
 
+# A driver may only move an operation along the transition its phase owns.
+# Anything else at the Hub boundary is treated as a fail-closed outcome so a
+# buggy or adversarial adapter cannot fabricate a committed/verified send.
+_PHASE_RESULT_STATUSES: dict[str, frozenset[SendStatus]] = {
+    "prepare": frozenset(
+        {
+            SendStatus.PREPARED,
+            SendStatus.FAILED,
+            SendStatus.CANCELLED,
+            SendStatus.UNCERTAIN,
+        }
+    ),
+    "commit": frozenset(
+        {
+            SendStatus.COMMITTED,
+            SendStatus.UNCERTAIN,
+        }
+    ),
+    "verify": frozenset(
+        {
+            SendStatus.VERIFIED,
+            SendStatus.UNCERTAIN,
+        }
+    ),
+}
+
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -815,6 +841,56 @@ class HubService:
             )
         return op
 
+    def _fail_closed_phase_result(
+        self,
+        op: SendOperation,
+        reported: SendStatus,
+        *,
+        phase: str,
+        commit_intent: bool,
+    ) -> SendOperation | None:
+        """Reject a result status the phase cannot legitimately produce.
+
+        Returns ``None`` when ``reported`` is phase-valid.  Otherwise the
+        operation is forced to a conservative terminal state and persisted:
+        a driver claiming the non-idempotent send already crossed the boundary
+        (``COMMITTED``/``VERIFIED`` in the wrong phase) becomes
+        ``send_uncertain``; every other off-phase status is an explicit
+        ``FAILED_SAFE``.
+        """
+        if reported in _PHASE_RESULT_STATUSES[phase]:
+            return None
+        if commit_intent or reported in {SendStatus.COMMITTED, SendStatus.VERIFIED}:
+            op.status = SendStatus.UNCERTAIN
+            op.error_code = ErrorCode.SEND_UNCERTAIN.value
+        else:
+            op.status = SendStatus.FAILED
+            op.error_code = ErrorCode.FAILED_SAFE.value
+        return self._persist_operation(op, commit_intent=commit_intent)
+
+    @staticmethod
+    def _operation_identity(op: SendOperation) -> tuple[str, str, str]:
+        """Return the immutable identity an adapter phase must preserve."""
+
+        return (str(op.operation_id), op.idempotency_key, str(op.draft_id))
+
+    def _fail_closed_identity_result(
+        self,
+        operation_id: UUID | str,
+        *,
+        expected: tuple[str, str, str],
+        reported: SendOperation,
+        commit_intent: bool,
+    ) -> SendOperation | None:
+        """Quarantine the original operation if a phase swaps its identity."""
+
+        if self._operation_identity(reported) == expected:
+            return None
+        original = self._operation(operation_id)
+        original.status = SendStatus.UNCERTAIN
+        original.error_code = ErrorCode.SEND_UNCERTAIN.value
+        return self._persist_operation(original, commit_intent=commit_intent)
+
     async def run_send(
         self,
         operation_id: UUID | str,
@@ -853,6 +929,7 @@ class HubService:
             return op
         if op.status == SendStatus.PENDING:
             command = self._command_for_operation(operation_id)
+            expected_identity = self._operation_identity(op)
             if conversation_revision is None:
                 row = self.store.connection.execute(
                     "SELECT version FROM conversations WHERE conversation_id=?",
@@ -873,14 +950,16 @@ class HubService:
                     binding_revision=binding_revision,
                     conversation_revision=conversation_revision,
                 )
-            if (
-                prepared.operation_id != op.operation_id
-                or prepared.idempotency_key != op.idempotency_key
-                or prepared.draft_id != op.draft_id
-            ):
-                op.status = SendStatus.FAILED
-                op.error_code = ErrorCode.FAILED_SAFE.value
-                return self._persist_operation(op)
+            if self._operation_identity(prepared) != expected_identity:
+                original = self._operation(operation_id)
+                original.status = SendStatus.FAILED
+                original.error_code = ErrorCode.FAILED_SAFE.value
+                return self._persist_operation(original)
+            closed = self._fail_closed_phase_result(
+                op, prepared.status, phase="prepare", commit_intent=False
+            )
+            if closed is not None:
+                return closed
             op = self._persist_operation(prepared)
         return op
 
@@ -892,21 +971,49 @@ class HubService:
         # Persist before the non-idempotent commit: a crash after this point is
         # quarantined by recovery rather than guessing whether a message left.
         self._persist_operation(op, commit_intent=True)
+        expected_identity = self._operation_identity(op)
         try:
             committed = await adapter.commit_send(op)
-        except Exception:
+        except Exception:  # noqa: BLE001 - unknown adapter failure is send uncertainty
             op.status = SendStatus.UNCERTAIN
             op.error_code = ErrorCode.SEND_UNCERTAIN.value
             return self._persist_operation(op, commit_intent=True)
+        closed = self._fail_closed_identity_result(
+            operation_id,
+            expected=expected_identity,
+            reported=committed,
+            commit_intent=True,
+        )
+        if closed is not None:
+            return closed
+        closed = self._fail_closed_phase_result(
+            op, committed.status, phase="commit", commit_intent=True
+        )
+        if closed is not None:
+            return closed
         op = self._persist_operation(committed, commit_intent=True)
         if op.status != SendStatus.COMMITTED:
             return op
+        expected_identity = self._operation_identity(op)
         try:
             verified = await adapter.verify_send(op)
-        except Exception:
+        except Exception:  # noqa: BLE001 - unknown adapter failure is send uncertainty
             op.status = SendStatus.UNCERTAIN
             op.error_code = ErrorCode.SEND_UNCERTAIN.value
             return self._persist_operation(op, commit_intent=True)
+        closed = self._fail_closed_identity_result(
+            operation_id,
+            expected=expected_identity,
+            reported=verified,
+            commit_intent=True,
+        )
+        if closed is not None:
+            return closed
+        closed = self._fail_closed_phase_result(
+            op, verified.status, phase="verify", commit_intent=True
+        )
+        if closed is not None:
+            return closed
         return self._persist_operation(verified, commit_intent=True)
 
     def recover(self) -> dict[str, int]:

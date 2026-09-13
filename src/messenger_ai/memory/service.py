@@ -59,7 +59,12 @@ class MemoryService:
             )
         return contact
 
-    def bind_identity(self, binding: IdentityBinding) -> IdentityBinding:
+    def bind_identity(
+        self,
+        binding: IdentityBinding,
+        *,
+        expected_evidence_hash: str | None = None,
+    ) -> IdentityBinding:
         """Only an already-validated HumanApproval can create/change a binding."""
         with self.store.uow() as db:
             contact = self._active_contact(db, binding.contact_id)
@@ -72,6 +77,14 @@ class MemoryService:
             if existing is not None and existing["contact_id"] != binding.contact_id:
                 raise DomainError(
                     ErrorCode.IDENTITY_AMBIGUOUS, "conversation already bound"
+                )
+            if expected_evidence_hash is not None and (
+                existing is None
+                or existing["evidence_hash"] != expected_evidence_hash
+            ):
+                raise DomainError(
+                    ErrorCode.STALE_CONTEXT,
+                    "identity evidence changed before compare-and-swap",
                 )
             if (
                 existing is not None
@@ -95,9 +108,14 @@ class MemoryService:
                 )
                 action = "identity.bound"
             else:
-                db.execute(
+                changed = db.execute(
                     "UPDATE memory_bindings SET binding_id=?,evidence_hash=?,payload_json=?,updated_at=? "
-                    "WHERE platform=? AND account_id=? AND conversation_id=?",
+                    "WHERE platform=? AND account_id=? AND conversation_id=?"
+                    + (
+                        " AND evidence_hash=?"
+                        if expected_evidence_hash is not None
+                        else ""
+                    ),
                     (
                         str(binding.binding_id),
                         binding.platform_evidence_hash,
@@ -106,8 +124,14 @@ class MemoryService:
                         binding.platform.value,
                         binding.account_id,
                         binding.conversation_id,
+                        *((expected_evidence_hash,) if expected_evidence_hash is not None else ()),
                     ),
                 )
+                if expected_evidence_hash is not None and changed.rowcount != 1:
+                    raise DomainError(
+                        ErrorCode.STALE_CONTEXT,
+                        "identity evidence compare-and-swap failed",
+                    )
                 action = "identity.evidence_changed"
             self._audit(
                 db,

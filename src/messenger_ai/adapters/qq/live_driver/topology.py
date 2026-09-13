@@ -98,7 +98,8 @@ class UiNodeSnapshot:
                 {
                     _clean(anchor)
                     for anchor in item.semantic_anchors
-                    if _clean(anchor) in {role.value for role in SelectorRole}
+                    if _clean(anchor)
+                    in ({role.value for role in SelectorRole} | {"empty_chat_shell"})
                 }
             )
         )
@@ -395,6 +396,19 @@ def map_role_candidates(
     """Map roles using multiple signals; ties and weak candidates fail closed."""
     by_id = {node.node_id: node for node in snapshot.nodes}
     mappings: list[RoleMapping] = []
+    anchored_roles = {
+        anchor
+        for node in snapshot.nodes
+        for anchor in node.semantic_anchors
+    }
+    # QQ 9.9.33's observed empty-panel shell can otherwise let a broad Document
+    # or Pane win through generic scoring and pretend that chat is readable.
+    # Keep this guard version-bound and evidence-bound so selected chats and
+    # older generic fixtures retain their independently classified region.
+    message_region_requires_anchor = (
+        snapshot.client_version.startswith("9.9.33.")
+        and "empty_chat_shell" in anchored_roles
+    )
     for role in roles:
         candidates = tuple(
             sorted(
@@ -407,6 +421,8 @@ def map_role_candidates(
             for item in candidates
             if item.structural_score >= _MIN_STRUCTURAL_SCORE[role]
         )
+        if role is SelectorRole.MESSAGE_REGION and message_region_requires_anchor:
+            viable = ()
         if not viable:
             mappings.append(RoleMapping(role, MappingStatus.NOT_FOUND, candidates))
             continue

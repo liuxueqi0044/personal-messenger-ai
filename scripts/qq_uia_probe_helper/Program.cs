@@ -22,6 +22,45 @@ static int ReadMaxNodes(string[] arguments)
 static bool HasFlag(string[] arguments, string flag) =>
     arguments.Any(argument => string.Equals(argument, flag, StringComparison.Ordinal));
 
+static int ReadWarmupMilliseconds(string[] arguments)
+{
+    for (var index = 0; index < arguments.Length - 1; index += 1)
+    {
+        if (arguments[index] == "--warmup-ms" && int.TryParse(arguments[index + 1], out var parsed))
+        {
+            return Math.Clamp(parsed, 250, 10_000);
+        }
+    }
+    return 2_000;
+}
+
+static int ReadForegroundWaitMilliseconds(string[] arguments)
+{
+    for (var index = 0; index < arguments.Length - 1; index += 1)
+    {
+        if (arguments[index] == "--wait-for-foreground-ms" &&
+            int.TryParse(arguments[index + 1], out var parsed))
+        {
+            return Math.Clamp(parsed, 0, 120_000);
+        }
+    }
+    return 0;
+}
+
+static (bool Supplied, long Value) ReadLongOption(string[] arguments, string name)
+{
+    for (var index = 0; index < arguments.Length - 1; index += 1)
+    {
+        if (arguments[index] == name)
+        {
+            return long.TryParse(arguments[index + 1], out var parsed)
+                ? (true, parsed)
+                : (true, -1);
+        }
+    }
+    return (false, 0);
+}
+
 static bool Supports(AutomationElement element, AutomationPattern pattern)
 {
     try
@@ -252,12 +291,14 @@ static void EmitCurrentIdentityResult(
     bool? isForegroundBefore = null,
     bool? isForegroundAfter = null,
     bool transientNavigationPerformed = false,
-    string? rightRegionStructureDigest = null)
+    string? rightRegionStructureDigest = null,
+    bool guestForeground = false,
+    bool guestEnvironmentCertified = false)
 {
     Emit(new
     {
-        probe_version = "qq-uia-current-identity-v1",
-        mode = "current_chat_identity",
+        probe_version = guestForeground ? "qq-uia-guest-foreground-identity-v1" : "qq-uia-current-identity-v1",
+        mode = guestForeground ? "guest_foreground_current_chat_identity" : "current_chat_identity",
         succeeded,
         status,
         header_candidate_count = headerCandidateCount,
@@ -272,6 +313,13 @@ static void EmitCurrentIdentityResult(
         is_foreground_before = isForegroundBefore,
         is_foreground_after = isForegroundAfter,
         right_region_structure_digest = rightRegionStructureDigest,
+        guest_environment = guestForeground ? new
+        {
+            certified = guestEnvironmentCertified,
+            machine = "PMAI-QQVM",
+            user = "qqbot",
+            hypervisor = "virtualbox",
+        } : null,
         recovery = new
         {
             attempted = recoveryAttempted,
@@ -290,7 +338,7 @@ static void EmitCurrentIdentityResult(
             mouse_input_used = false,
             keyboard_input_used = false,
             clipboard_used = false,
-            foreground_requested = false,
+            foreground_requested = guestForeground,
             composer_send_attempted = false,
             composer_or_send_accessed = false,
             write_actions_supported = false,
@@ -1290,14 +1338,105 @@ static bool IsUsablePrintWindowFrame(PrintWindowFrame frame)
     return maxLuminance - minLuminance >= 12 && colors.Count >= 8;
 }
 
+static bool IsCertifiedGuestIdentityEnvironment()
+{
+    if (!string.Equals(Environment.MachineName, "PMAI-QQVM", StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(Environment.UserName, "qqbot", StringComparison.OrdinalIgnoreCase)) return false;
+    try
+    {
+        var path = @"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\BIOS";
+        var manufacturer = Convert.ToString(Registry.GetValue(path, "SystemManufacturer", "")) ?? "";
+        var product = Convert.ToString(Registry.GetValue(path, "SystemProductName", "")) ?? "";
+        return (manufacturer + " " + product).Contains("VirtualBox", StringComparison.OrdinalIgnoreCase);
+    }
+    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return false; }
+}
+
+static ActiveHeaderEvidence FindGuestActiveHeader(AutomationElement root, double windowLeft,
+    double windowTop, double windowWidth, double windowHeight)
+{
+    var candidates = new List<(AutomationElement Element, string Line, string StructureLine)>();
+    try
+    {
+        var elements = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+        for (var index = 0; index < elements.Count && index < 5_000; index += 1)
+        {
+            var element = elements[index];
+            AutomationElement.AutomationElementInformation current;
+            try { current = element.Current; }
+            catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException) { continue; }
+            var bounds = current.BoundingRectangle;
+            var classTokens = (current.ClassName ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var nx = Normalize(bounds.X - windowLeft, windowWidth);
+            var ny = Normalize(bounds.Y - windowTop, windowHeight);
+            var nw = Normalize(bounds.Width, windowWidth);
+            var nh = Normalize(bounds.Height, windowHeight);
+            var valid = current.ControlType == ControlType.Button && current.IsEnabled && !current.IsOffscreen &&
+                !bounds.IsEmpty && classTokens.Contains("chat-header__contact-name", StringComparer.Ordinal) &&
+                Supports(element, InvokePattern.Pattern) && nx >= 0.28 && ny >= 0.05 && ny <= 0.14 &&
+                nw > 0 && nh > 0 && !string.IsNullOrWhiteSpace(current.Name);
+            if (!valid) continue;
+            var structure = $"ControlType.Button|chat-header__contact-name|{nx}|{ny}|{nw}|{nh}";
+            candidates.Add((element, $"{structure}|{NormalizeLocalText(current.Name)}", structure));
+        }
+    }
+    catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
+    { return new ActiveHeaderEvidence(0, null, null, null); }
+    return candidates.Count == 1
+        ? new ActiveHeaderEvidence(1, Sha256(candidates[0].Line), candidates[0].Element,
+            Sha256($"qq-guest-header-v1|{candidates[0].StructureLine}"))
+        : new ActiveHeaderEvidence(candidates.Count, null, null, null);
+}
+
+static void EmitGuestHeaderResult(bool succeeded, string status, int count = 0,
+    string? headerDigest = null, string? rightDigest = null, int? processId = null,
+    long? windowHandle = null, bool guestCertified = false)
+{
+    Emit(new { probe_version = "qq-uia-guest-header-v1", mode = "guest_foreground_header_inspect",
+        succeeded, status, header_candidate_count = count, active_header_digest = headerDigest,
+        right_region_structure_digest = rightDigest, process_id = processId, window_handle = windowHandle,
+        guest_environment = new { certified = guestCertified, machine = "PMAI-QQVM", user = "qqbot", hypervisor = "virtualbox" },
+        privacy = new { exact_hwnd = true, emitted_control_names = false, emitted_chat_text = false,
+            mouse_input_used = false, keyboard_input_used = false, clipboard_used = false,
+            transient_navigation_performed = false, composer_or_send_accessed = false } });
+}
+
+static bool TryCloseTransientWindow(IntPtr windowHandle, int processId)
+{
+    NativeMethods.GetWindowThreadProcessId(windowHandle, out var ownerPid);
+    if (ownerPid != processId || !NativeMethods.IsWindowVisible(windowHandle)) return false;
+    try
+    {
+        var element = AutomationElement.FromHandle(windowHandle);
+        if (element.TryGetCurrentPattern(WindowPattern.Pattern, out var raw) && raw is WindowPattern window)
+        {
+            window.Close();
+            return WaitForWindowToClose(processId, windowHandle);
+        }
+    }
+    catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException) { }
+    return false;
+}
+
 var maxNodes = ReadMaxNodes(args);
 var includeTopology = HasFlag(args, "--include-topology");
+var warmupUiaEvents = HasFlag(args, "--warmup-uia-events");
+var warmupMilliseconds = warmupUiaEvents ? ReadWarmupMilliseconds(args) : 0;
+var foregroundWaitMilliseconds = ReadForegroundWaitMilliseconds(args);
+var targetPidOption = ReadLongOption(args, "--target-qq-pid");
+var targetHwndOption = ReadLongOption(args, "--target-qq-hwnd");
 var selectionMode = HasFlag(args, "--match-from-stdin");
 var selectionAuthorized = HasFlag(args, "--select-authorized");
 var captureMode = HasFlag(args, "--capture-current-chat");
 var captureAuthorized = HasFlag(args, "--capture-authorized");
 var identityMode = HasFlag(args, "--capture-current-identity");
 var identityAuthorized = HasFlag(args, "--identity-authorized");
+var guestIdentityMode = HasFlag(args, "--capture-current-identity-guest-foreground");
+var guestIdentityAuthorized = HasFlag(args, "--guest-identity-authorized");
+var guestHeaderMode = HasFlag(args, "--inspect-guest-current-header");
+var guestHeaderAuthorized = HasFlag(args, "--guest-header-authorized");
+identityMode = identityMode || guestIdentityMode;
+identityAuthorized = identityAuthorized || guestIdentityAuthorized;
 var avatarMode = HasFlag(args, "--capture-current-avatar");
 var avatarAuthorized = HasFlag(args, "--avatar-authorized");
 var avatarDiscoveryMode = HasFlag(args, "--discover-current-avatar");
@@ -1317,6 +1456,7 @@ var activeModeCount = new[]
     avatarMode || avatarAuthorized,
     avatarDiscoveryMode || avatarDiscoveryAuthorized,
     sessionInspectionMode || sessionInspectionAuthorized,
+    guestHeaderMode || guestHeaderAuthorized,
 }.Count(enabled => enabled);
 if (activeModeCount > 1)
 {
@@ -1346,6 +1486,31 @@ if (activeModeCount > 1)
     }
     return 2;
 }
+if ((foregroundWaitMilliseconds > 0 || targetPidOption.Supplied || targetHwndOption.Supplied) &&
+    activeModeCount != 0 && !guestIdentityMode && !guestHeaderMode)
+{
+    Emit(new
+    {
+        probe_version = "qq-uia-readonly-v1",
+        succeeded = false,
+        error_code = "STRUCTURAL_WAIT_MODE_CONFLICT",
+        read_only = true,
+    });
+    return 2;
+}
+if (targetPidOption.Supplied != targetHwndOption.Supplied ||
+    (targetPidOption.Supplied &&
+     (targetPidOption.Value <= 0 || targetPidOption.Value > int.MaxValue || targetHwndOption.Value <= 0)))
+{
+    Emit(new
+    {
+        probe_version = "qq-uia-readonly-v1",
+        succeeded = false,
+        error_code = "TARGET_QQ_WINDOW_INVALID",
+        read_only = true,
+    });
+    return 2;
+}
 if (sessionInspectionAuthorized && !sessionInspectionMode)
 {
     EmitCurrentSessionResult(false, "SESSION_INSPECTION_MODE_REQUIRED");
@@ -1363,7 +1528,7 @@ if (identityAuthorized && !identityMode)
 }
 if (identityMode && !identityAuthorized)
 {
-    EmitCurrentIdentityResult(false, "IDENTITY_AUTHORIZATION_REQUIRED");
+    EmitCurrentIdentityResult(false, "IDENTITY_AUTHORIZATION_REQUIRED", guestForeground: guestIdentityMode);
     return 2;
 }
 if (avatarAuthorized && !avatarMode)
@@ -1414,7 +1579,51 @@ var windows = Process.GetProcessesByName("QQ")
     .Where(process => process.MainWindowHandle != IntPtr.Zero)
     .ToArray();
 
-if (windows.Length != 1)
+Process process;
+IntPtr probeWindowHandle;
+if (targetPidOption.Supplied)
+{
+    Process candidate;
+    try
+    {
+        candidate = Process.GetProcessById(checked((int)targetPidOption.Value));
+    }
+    catch (Exception exception) when (exception is ArgumentException or OverflowException)
+    {
+        Emit(new { probe_version = "qq-uia-readonly-v1", succeeded = false,
+            error_code = "TARGET_QQ_WINDOW_UNAVAILABLE", read_only = true });
+        return 2;
+    }
+    probeWindowHandle = new IntPtr(targetHwndOption.Value);
+    NativeMethods.GetWindowThreadProcessId(probeWindowHandle, out var ownerPid);
+    if (!string.Equals(candidate.ProcessName, "QQ", StringComparison.OrdinalIgnoreCase) ||
+        ownerPid != candidate.Id || !NativeMethods.IsWindowVisible(probeWindowHandle))
+    {
+        Emit(new { probe_version = "qq-uia-readonly-v1", succeeded = false,
+            error_code = "TARGET_QQ_WINDOW_MISMATCH", read_only = true });
+        return 2;
+    }
+    process = candidate;
+}
+if (guestIdentityMode != guestIdentityAuthorized ||
+    (guestIdentityMode && HasFlag(args, "--capture-current-identity")))
+{
+    EmitCurrentIdentityResult(false, "GUEST_IDENTITY_MODE_CONFLICT", guestForeground: true);
+    return 2;
+}
+if (guestIdentityMode && (!targetPidOption.Supplied || !targetHwndOption.Supplied))
+{
+    EmitCurrentIdentityResult(false, "GUEST_EXACT_TARGET_REQUIRED", guestForeground: true);
+    return 2;
+}
+if (guestHeaderMode != guestHeaderAuthorized ||
+    (guestHeaderMode && (!targetPidOption.Supplied || !targetHwndOption.Supplied)))
+{
+    EmitGuestHeaderResult(false, "GUEST_HEADER_AUTHORIZATION_OR_TARGET_REQUIRED");
+    return 2;
+}
+
+else if (windows.Length != 1)
 {
     if (sessionInspectionMode)
     {
@@ -1456,9 +1665,56 @@ if (windows.Length != 1)
     });
     return 2;
 }
-
-var process = windows[0];
-if (!NativeMethods.GetWindowRect(process.MainWindowHandle, out var nativeRectangle))
+else
+{
+    process = windows[0];
+    probeWindowHandle = process.MainWindowHandle;
+}
+var foregroundWait = Stopwatch.StartNew();
+long? foregroundStableSince = null;
+while (foregroundWaitMilliseconds > 0 &&
+       foregroundWait.ElapsedMilliseconds < foregroundWaitMilliseconds)
+{
+    process.Refresh();
+    var ready = probeWindowHandle != IntPtr.Zero &&
+        NativeMethods.GetForegroundWindow() == probeWindowHandle &&
+        NativeMethods.IsZoomed(probeWindowHandle) &&
+        !NativeMethods.IsIconic(probeWindowHandle);
+    if (ready)
+    {
+        foregroundStableSince ??= foregroundWait.ElapsedMilliseconds;
+        if (foregroundWait.ElapsedMilliseconds - foregroundStableSince >= 1_000)
+        {
+            break;
+        }
+    }
+    else
+    {
+        foregroundStableSince = null;
+    }
+    Thread.Sleep(100);
+}
+process.Refresh();
+var foregroundWaitSatisfied = probeWindowHandle != IntPtr.Zero &&
+    NativeMethods.GetForegroundWindow() == probeWindowHandle &&
+    NativeMethods.IsZoomed(probeWindowHandle) &&
+    !NativeMethods.IsIconic(probeWindowHandle) &&
+    foregroundStableSince is not null &&
+    foregroundWait.ElapsedMilliseconds - foregroundStableSince >= 1_000;
+if (foregroundWaitMilliseconds > 0 && !foregroundWaitSatisfied)
+{
+    Emit(new
+    {
+        probe_version = "qq-uia-readonly-v1",
+        succeeded = false,
+        error_code = "QQ_FOREGROUND_MAXIMIZED_TIMEOUT",
+        read_only = true,
+        foreground_wait_used = true,
+        foreground_wait_ms = foregroundWaitMilliseconds,
+    });
+    return 2;
+}
+if (!NativeMethods.GetWindowRect(probeWindowHandle, out var nativeRectangle))
 {
     if (sessionInspectionMode)
     {
@@ -1503,9 +1759,9 @@ var windowLeft = (double)nativeRectangle.Left;
 var windowTop = (double)nativeRectangle.Top;
 var windowWidth = (double)(nativeRectangle.Right - nativeRectangle.Left);
 var windowHeight = (double)(nativeRectangle.Bottom - nativeRectangle.Top);
-var windowMinimized = NativeMethods.IsIconic(process.MainWindowHandle);
-var windowMaximized = NativeMethods.IsZoomed(process.MainWindowHandle);
-var windowForeground = NativeMethods.GetForegroundWindow() == process.MainWindowHandle;
+var windowMinimized = NativeMethods.IsIconic(probeWindowHandle);
+var windowMaximized = NativeMethods.IsZoomed(probeWindowHandle);
+var windowForeground = NativeMethods.GetForegroundWindow() == probeWindowHandle;
 var geometryUsable = !windowMinimized && windowWidth >= 300 && windowHeight >= 200;
 var presentation = windowMinimized ? "minimized" : windowMaximized ? "maximized" : "normal";
 var executablePath = string.Empty;
@@ -1521,7 +1777,7 @@ var executableSignature = string.IsNullOrWhiteSpace(executablePath)
     ? new string('0', 64)
     : FileSha256(executablePath);
 var processSignature = Sha256($"{process.ProcessName}|{executableSignature}");
-var dpiScale = Math.Round(Math.Max(96u, NativeMethods.GetDpiForWindow(process.MainWindowHandle)) / 96d, 4);
+var dpiScale = Math.Round(Math.Max(96u, NativeMethods.GetDpiForWindow(probeWindowHandle)) / 96d, 4);
 var monitorId = Sha256($"{windowLeft},{windowTop},{windowWidth},{windowHeight}");
 var monitorTopologyDigest = Sha256(string.Join(",", new[]
 {
@@ -1530,11 +1786,11 @@ var monitorTopologyDigest = Sha256(string.Join(",", new[]
     NativeMethods.GetSystemMetrics(78).ToString(),
     NativeMethods.GetSystemMetrics(79).ToString(),
 }));
-var otherVisibleProcessWindows = CountOtherVisibleProcessWindows(process.Id, process.MainWindowHandle);
+var otherVisibleProcessWindows = CountOtherVisibleProcessWindows(process.Id, probeWindowHandle);
 AutomationElement root;
 try
 {
-    root = AutomationElement.FromHandle(process.MainWindowHandle);
+    root = AutomationElement.FromHandle(probeWindowHandle);
 }
 catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
 {
@@ -1579,8 +1835,18 @@ catch (Exception exception) when (exception is ElementNotAvailableException or I
 }
 
 AutomationElementCollection elements;
+StructureChangedEventHandler? warmupHandler = null;
 try
 {
+    if (warmupUiaEvents)
+    {
+        // The handler is scoped to this already identified QQ HWND.  Its empty
+        // callback neither reads nor records event data; registration only
+        // advertises an active UIA client before the structural enumeration.
+        warmupHandler = (_, _) => { };
+        Automation.AddStructureChangedEventHandler(root, TreeScope.Subtree, warmupHandler);
+        Thread.Sleep(warmupMilliseconds);
+    }
     elements = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
 }
 catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
@@ -1623,6 +1889,21 @@ catch (Exception exception) when (exception is ElementNotAvailableException or I
         read_only = true,
     });
     return 2;
+}
+finally
+{
+    if (warmupHandler is not null)
+    {
+        try
+        {
+            Automation.RemoveStructureChangedEventHandler(root, warmupHandler);
+        }
+        catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
+        {
+            // The target may disappear during a read-only probe; there is no
+            // broader desktop registration to remove.
+        }
+    }
 }
 
 var controlTypes = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -1953,10 +2234,10 @@ if (sessionInspectionMode)
             activeHeaderDigest,
             structureDigest,
             process.Id,
-            process.MainWindowHandle.ToInt64(),
+            probeWindowHandle.ToInt64(),
             startedAt,
             windowMaximized,
-            NativeMethods.GetForegroundWindow() == process.MainWindowHandle);
+            NativeMethods.GetForegroundWindow() == probeWindowHandle);
     }
     if (windowMinimized || !windowMaximized || !geometryUsable)
     {
@@ -2008,6 +2289,23 @@ if (sessionInspectionMode)
         headerEvidence.StructureDigest);
     return 0;
 }
+if (guestHeaderMode)
+{
+    var guestCertified = IsCertifiedGuestIdentityEnvironment();
+    if (!guestCertified || !windowForeground || windowMinimized || !windowMaximized || !geometryUsable)
+    {
+        EmitGuestHeaderResult(false, "GUEST_HEADER_ENVIRONMENT_NOT_CERTIFIED",
+            processId: process.Id, windowHandle: probeWindowHandle.ToInt64(), guestCertified: guestCertified);
+        return 2;
+    }
+    var header = FindGuestActiveHeader(root, windowLeft, windowTop, windowWidth, windowHeight);
+    var chat = CaptureCurrentChatEvidence(root, elements, windowLeft, windowTop, windowWidth, windowHeight);
+    var ready = header.CandidateCount == 1 && header.Element is not null && !string.IsNullOrWhiteSpace(header.Digest);
+    EmitGuestHeaderResult(ready, ready ? "HEADER_CAPTURED" : "ACTIVE_HEADER_AMBIGUOUS",
+        header.CandidateCount, header.Digest, chat.RightRegionStructureDigest,
+        process.Id, probeWindowHandle.ToInt64(), guestCertified);
+    return ready ? 0 : 2;
+}
 if (avatarDiscoveryMode)
 {
     void EmitAvatarDiscovery(
@@ -2026,9 +2324,9 @@ if (avatarDiscoveryMode)
             structureDigest,
             candidates,
             process.Id,
-            process.MainWindowHandle.ToInt64(),
+            probeWindowHandle.ToInt64(),
             windowMaximized,
-            NativeMethods.GetForegroundWindow() == process.MainWindowHandle);
+            NativeMethods.GetForegroundWindow() == probeWindowHandle);
     }
     if (windowMinimized || !windowMaximized || !geometryUsable)
     {
@@ -2135,10 +2433,10 @@ if (avatarMode)
                 structureDigest,
                 headerCandidateCount,
                 process.Id,
-                process.MainWindowHandle.ToInt64(),
+                probeWindowHandle.ToInt64(),
                 windowMaximized,
                 windowForeground,
-                foregroundAfter == process.MainWindowHandle,
+                foregroundAfter == probeWindowHandle,
                 foregroundBefore.HasValue && foregroundAfter != foregroundBefore.Value,
                 captureApi);
         }
@@ -2251,7 +2549,7 @@ if (avatarMode)
             PrintWindowFrame? frame;
             if (frameIndex == 0)
             {
-                frame = CapturePrintWindowFrame(process.MainWindowHandle, (int)windowWidth, (int)windowHeight);
+                frame = CapturePrintWindowFrame(probeWindowHandle, (int)windowWidth, (int)windowHeight);
                 if (frame is not null && !IsUsablePrintWindowFrame(frame))
                 {
                     Array.Clear(frame.Pixels, 0, frame.Pixels.Length);
@@ -2259,7 +2557,7 @@ if (avatarMode)
                 }
                 if (frame is null)
                 {
-                    frame = CaptureExactHwndBitBltFrame(process.MainWindowHandle, (int)windowWidth, (int)windowHeight);
+                    frame = CaptureExactHwndBitBltFrame(probeWindowHandle, (int)windowWidth, (int)windowHeight);
                     captureApi = "ExactHwndBitBlt";
                 }
                 else
@@ -2270,8 +2568,8 @@ if (avatarMode)
             else
             {
                 frame = captureApi == "PrintWindow"
-                    ? CapturePrintWindowFrame(process.MainWindowHandle, (int)windowWidth, (int)windowHeight)
-                    : CaptureExactHwndBitBltFrame(process.MainWindowHandle, (int)windowWidth, (int)windowHeight);
+                    ? CapturePrintWindowFrame(probeWindowHandle, (int)windowWidth, (int)windowHeight)
+                    : CaptureExactHwndBitBltFrame(probeWindowHandle, (int)windowWidth, (int)windowHeight);
             }
             if (frame is null || !IsUsablePrintWindowFrame(frame))
             {
@@ -2405,24 +2703,32 @@ if (identityMode)
                 originalViewRestored,
                 foregroundChanged,
                 process.Id,
-                process.MainWindowHandle.ToInt64(),
+                probeWindowHandle.ToInt64(),
                 windowMaximized,
                 windowForeground,
-                NativeMethods.GetForegroundWindow() == process.MainWindowHandle,
+                NativeMethods.GetForegroundWindow() == probeWindowHandle,
                 transientNavigationPerformed,
-                identityRightRegionStructureDigest);
+                identityRightRegionStructureDigest,
+                guestIdentityMode,
+                guestIdentityMode && IsCertifiedGuestIdentityEnvironment());
         }
         if (windowMinimized || !windowMaximized || !geometryUsable)
         {
             EmitIdentity(false, "WINDOW_STATE_NOT_CERTIFIED");
             return 2;
         }
-        if (windowForeground)
+        if (guestIdentityMode && (!windowForeground || !IsCertifiedGuestIdentityEnvironment()))
+        {
+            EmitIdentity(false, "GUEST_FOREGROUND_ENVIRONMENT_NOT_CERTIFIED");
+            return 2;
+        }
+        if (!guestIdentityMode && windowForeground)
         {
             EmitIdentity(false, "QQ_FOREGROUND");
             return 2;
         }
-        if (!isLoggedIn || !structuralChatShell || modalState != "none" || otherVisibleProcessWindows != 0)
+        if ((!guestIdentityMode && (!isLoggedIn || !structuralChatShell || modalState != "none")) ||
+            otherVisibleProcessWindows != 0)
         {
             EmitIdentity(false, "CHAT_SHELL_NOT_CERTIFIED");
             return 2;
@@ -2438,7 +2744,9 @@ if (identityMode)
             EmitIdentity(false, "IDENTITY_STDIN_INVALID");
             return 2;
         }
-        var headerEvidence = FindActiveHeader(root, windowLeft, windowTop, windowWidth, windowHeight);
+        var headerEvidence = guestIdentityMode
+            ? FindGuestActiveHeader(root, windowLeft, windowTop, windowWidth, windowHeight)
+            : FindActiveHeader(root, windowLeft, windowTop, windowWidth, windowHeight);
         if (headerEvidence.CandidateCount != 1 || headerEvidence.Element is null)
         {
             EmitIdentity(
@@ -2469,7 +2777,7 @@ if (identityMode)
         }
         var foregroundBefore = NativeMethods.GetForegroundWindow();
         var windowsBefore = VisibleProcessWindowHandles(process.Id);
-        if (windowsBefore.Length != 1 || windowsBefore[0] != process.MainWindowHandle)
+        if (windowsBefore.Length != 1 || windowsBefore[0] != probeWindowHandle)
         {
             EmitIdentity(
                 false,
@@ -2514,12 +2822,14 @@ if (identityMode)
         }
         catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
         {
+            var cleanupSucceeded = TryCloseTransientWindow(profileHandles[0], process.Id);
             EmitIdentity(
                 false,
-                "PROFILE_UIA_ROOT_UNAVAILABLE",
+                cleanupSucceeded ? "PROFILE_UIA_ROOT_UNAVAILABLE" : "RESTORATION_FAILED",
                 headerEvidence.CandidateCount,
                 headerEvidence.Digest,
                 recoveryAttempted: true,
+                originalViewRestored: cleanupSucceeded,
                 foregroundChanged: foregroundChangedAfterOpen,
                 transientNavigationPerformed: true);
             return 2;
@@ -2539,6 +2849,11 @@ if (identityMode)
         catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
         {
             restored = false;
+        }
+        if (guestIdentityMode && NativeMethods.GetForegroundWindow() != probeWindowHandle)
+        {
+            NativeMethods.SetForegroundWindow(probeWindowHandle);
+            Thread.Sleep(150);
         }
         var foregroundPreserved = NativeMethods.GetForegroundWindow() == foregroundBefore;
         if (!restored)
@@ -2574,6 +2889,33 @@ if (identityMode)
                 foregroundChanged: true,
                 transientNavigationPerformed: true);
             return 2;
+        }
+        if (guestIdentityMode)
+        {
+            NativeMethods.GetWindowThreadProcessId(probeWindowHandle, out var restoredOwnerPid);
+            if (restoredOwnerPid != process.Id || !NativeMethods.IsWindowVisible(probeWindowHandle) ||
+                !NativeMethods.IsZoomed(probeWindowHandle) || NativeMethods.IsIconic(probeWindowHandle) ||
+                !NativeMethods.GetWindowRect(probeWindowHandle, out var restoredRectangle) ||
+                restoredRectangle.Left != nativeRectangle.Left || restoredRectangle.Top != nativeRectangle.Top ||
+                restoredRectangle.Right != nativeRectangle.Right || restoredRectangle.Bottom != nativeRectangle.Bottom)
+            {
+                EmitIdentity(false, "QQ_WINDOW_NOT_RESTORED", recoveryAttempted: true,
+                    originalViewRestored: false, foregroundChanged: false,
+                    transientNavigationPerformed: true);
+                return 2;
+            }
+            var restoredRoot = AutomationElement.FromHandle(probeWindowHandle);
+            var restoredElements = restoredRoot.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+            var restoredHeader = FindGuestActiveHeader(restoredRoot, windowLeft, windowTop, windowWidth, windowHeight);
+            var restoredChat = CaptureCurrentChatEvidence(restoredRoot, restoredElements, windowLeft, windowTop, windowWidth, windowHeight);
+            if (restoredHeader.CandidateCount != 1 || restoredHeader.Digest != headerEvidence.Digest ||
+                restoredChat.RightRegionStructureDigest != identityRightRegionStructureDigest)
+            {
+                EmitIdentity(false, "ORIGINAL_CONVERSATION_NOT_RESTORED", headerEvidence.CandidateCount,
+                    headerEvidence.Digest, profileEvidence.CandidateCount, null, null,
+                    profileEvidence.StructureDigest, true, false, false, true);
+                return 2;
+            }
         }
         if (profileEvidence.CandidateCount != 1)
         {
@@ -2679,7 +3021,7 @@ if (captureMode)
         chatEvidence.RightRegionStructureDigest,
         messages,
         process.Id,
-        process.MainWindowHandle.ToInt64(),
+        probeWindowHandle.ToInt64(),
         windowMinimized,
         DateTimeOffset.UtcNow.ToString("O"));
     return 0;
@@ -2869,8 +3211,14 @@ Emit(new
     succeeded = true,
     read_only = true,
     process_id = process.Id,
-    window_handle = process.MainWindowHandle.ToInt64(),
+    window_handle = probeWindowHandle.ToInt64(),
     client_version = clientVersion,
+    warmup_used = warmupUiaEvents,
+    warmup_ms = warmupMilliseconds,
+    foreground_wait_used = foregroundWaitMilliseconds > 0,
+    foreground_wait_ms = foregroundWaitMilliseconds,
+    foreground_wait_elapsed_ms = Math.Min(
+        foregroundWait.ElapsedMilliseconds, foregroundWaitMilliseconds),
     root = new
     {
         control_type = rootCurrent.ControlType?.ProgrammaticName ?? string.Empty,
@@ -3069,6 +3417,10 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     internal static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetForegroundWindow(IntPtr windowHandle);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

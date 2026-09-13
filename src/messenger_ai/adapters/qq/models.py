@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import Field, field_validator
@@ -31,6 +31,12 @@ class QQSelector(DomainModel):
     class_name: str | None = None
     control_type: str = Field(min_length=1)
     ancestor_automation_ids: tuple[str, ...] = ()
+    # Q1 structural selectors.  These fields are optional so deployed v1 packs
+    # continue to validate while newer packs avoid relying on AutomationId.
+    required_patterns: tuple[str, ...] = ()
+    class_name_tokens: tuple[str, ...] = ()
+    ancestor_control_types: tuple[str, ...] = ()
+    selected_class_name_token: str | None = None
     confidence: float = Field(ge=0, le=1, default=1)
 
 
@@ -65,6 +71,81 @@ class QQConversation(DomainModel):
     tree_digest: str = Field(min_length=1)
 
 
+class QQCertifiedDirectIdentity(DomainModel):
+    """Fresh proof for the currently selected one-to-one conversation."""
+
+    profile_id_hmac: str = Field(pattern=r"^[0-9a-f]{64}$")
+    conversation_type: Literal["direct"]
+    client_version: str = Field(min_length=1)
+    selector_pack_version: str = Field(min_length=1)
+    group_marker_probe_complete: Literal[True]
+    group_marker_count: Literal[0]
+    process_id: int = Field(gt=0)
+    window_handle: int = Field(gt=0)
+    header_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    right_region_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @property
+    def participant_signature(self) -> str:
+        return f"qq-profile-hmac:{self.profile_id_hmac}"
+
+
+class QQSessionObservedDirectIdentity(DomainModel):
+    """Operator-observed direct identity with separate stable and locator proofs."""
+
+    binding_id: str = Field(min_length=1)
+    conversation_type: Literal["direct"]
+    type_evidence_source: Literal["operator_observed_direct"]
+    client_version: str = Field(min_length=1)
+    selector_pack_version: str = Field(min_length=1)
+    group_marker_probe_complete: Literal[True]
+    group_marker_count: Literal[0]
+    process_id: int = Field(gt=0)
+    window_handle: int = Field(gt=0)
+    process_started_at_100ns: int = Field(gt=0)
+    vm_environment_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selected_row_runtime_id_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    header_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @property
+    def participant_signature(self) -> str:
+        """Stable contact proof, deliberately independent of QQ window lifetime.
+
+        The PID/HWND/start time and selected runtime-id remain available as
+        same-session locators, but cannot be part of a participant identity:
+        QQ replaces all of them after a restart or window recreation.
+        """
+        stable = {
+            "binding_id": self.binding_id,
+            "conversation_type": self.conversation_type,
+            "header_digest": self.header_digest,
+            "type_evidence_source": self.type_evidence_source,
+        }
+        digest = hashlib.sha256(json.dumps(stable, sort_keys=True,
+                                            separators=(",", ":")).encode()).hexdigest()
+        return f"qq-session-observed:{digest}"
+
+    @property
+    def legacy_participant_signature(self) -> str:
+        """The pre-restart-stability digest, retained solely for migration."""
+        legacy = {
+            "binding_id": self.binding_id,
+            "client_version": self.client_version,
+            "conversation_type": self.conversation_type,
+            "header_digest": self.header_digest,
+            "process_id": self.process_id,
+            "process_started_at_100ns": self.process_started_at_100ns,
+            "selected_row_runtime_id_hash": self.selected_row_runtime_id_hash,
+            "selector_pack_version": self.selector_pack_version,
+            "type_evidence_source": self.type_evidence_source,
+            "vm_environment_fingerprint": self.vm_environment_fingerprint,
+            "window_handle": self.window_handle,
+        }
+        digest = hashlib.sha256(json.dumps(legacy, sort_keys=True,
+                                            separators=(",", ":")).encode()).hexdigest()
+        return f"qq-session-observed:{digest}"
+
+
 class QQIdentityBinding(DomainModel):
     """Human-approved binding; display_name is presentation-only evidence."""
 
@@ -74,10 +155,16 @@ class QQIdentityBinding(DomainModel):
     platform_conversation_id: str = Field(min_length=1)
     participant_signature: str = Field(min_length=1)
     binding_id: str = Field(min_length=1)
+    # Legacy construction stays fail-closed. Production requires the explicit
+    # all-direct scope; temporary one-to-one sessions are included by consent.
+    conversation_type: Literal["unknown", "direct", "group"] = "unknown"
+    friendship_verified: bool = False
+    authorization_scope: Literal["legacy_explicit_contacts", "all_direct_including_temporary"] = "legacy_explicit_contacts"
 
     def matches(self, conversation: QQConversation) -> bool:
         return (
-            self.platform_conversation_id == conversation.internal_id
+            not conversation.participant_signature.startswith("uncertified:")
+            and self.platform_conversation_id == conversation.internal_id
             and self.participant_signature == conversation.participant_signature
         )
 

@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from io import BytesIO
+from pathlib import Path
+
+
+SOURCE = Path(__file__).parents[2] / "scripts" / "deployment" / "qq_session_runtime_supervisor_guest.py"
+SPEC = importlib.util.spec_from_file_location("runtime_supervisor", SOURCE)
+assert SPEC and SPEC.loader
+SUPERVISOR = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(SUPERVISOR)
+
+
+def test_driver_status_never_infers_health_from_missing_pauses() -> None:
+    assert SUPERVISOR._driver_status(None) == ("unknown", ["METRICS_UNAVAILABLE"])
+    assert SUPERVISOR._driver_status({"global_paused": False, "conversation_pause_reason_counts": {}}) == (
+        "unknown", ["NO_WORKER_HEALTH_EVIDENCE"]
+    )
+    assert SUPERVISOR._driver_status({
+        "global_paused": False,
+        "conversation_pause_reason_counts": {"driver_temporary:worker_not_alive": 1},
+    }) == ("degraded", ["WORKER_NOT_ALIVE"])
+    assert SUPERVISOR._driver_status({
+        "global_paused": True,
+        "conversation_pause_reason_counts": {"driver_temporary:worker_not_alive": 1},
+    }) == ("paused", ["WORKER_NOT_ALIVE", "GLOBAL_PAUSED"])
+
+
+def test_driver_status_requires_fresh_witness_successful_observe_for_available() -> None:
+    metrics = {
+        "global_paused": False,
+        "conversation_count": 1,
+        "this_run_unpaused_observed_count": 1,
+        "conversation_pause_reason_counts": {"none": 1},
+    }
+    witness = {
+        "state": "available", "available": True, "worker_alive": True,
+        "worker_process_id": 123, "worker_exit_code": None, "first_terminal_failure": None,
+        "observe_freshness_seconds": 30.0,
+        "last_successful_observe": {
+            "kind": "observe", "status": "ok", "completed_at": datetime.now(UTC).isoformat(),
+        },
+    }
+    assert SUPERVISOR._driver_status(metrics, witness, []) == ("available", [])
+
+    witness["last_successful_observe"] = None
+    assert SUPERVISOR._driver_status(metrics, witness, []) == ("unknown", ["SUCCESSFUL_OBSERVE_MISSING"])
+    assert SUPERVISOR._driver_status(metrics, None, ["WORKER_WITNESS_STALE"]) == (
+        "unknown", ["WORKER_WITNESS_STALE"]
+    )
+    witness["last_successful_observe"] = {
+        "kind": "observe", "status": "ok", "completed_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
+    }
+    assert SUPERVISOR._driver_status(metrics, witness, []) == ("unknown", ["SUCCESSFUL_OBSERVE_STALE"])
+
+
+def test_driver_status_rejects_healthy_worker_when_contacts_are_not_ready() -> None:
+    metrics = {
+        "global_paused": False,
+        "conversation_count": 3,
+        "this_run_unpaused_observed_count": 0,
+        "conversation_pause_reason_counts": {
+            "driver_temporary:worker_action_failed": 3,
+        },
+    }
+    witness = {
+        "state": "available", "available": True, "worker_alive": True,
+        "worker_process_id": 123, "worker_exit_code": None,
+        "first_terminal_failure": None, "observe_freshness_seconds": 30.0,
+        "last_successful_observe": {
+            "kind": "observe", "status": "ok",
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    }
+
+    assert SUPERVISOR._driver_status(metrics, witness, []) == (
+        "degraded",
+        ["WORKER_ACTION_FAILED", "CONTACT_OBSERVATION_INCOMPLETE", "CONVERSATION_PAUSED"],
+    )
+
+
+def test_metrics_exports_evaluation_metadata_without_payload_columns(tmp_path: Path) -> None:
+    runtime = sqlite3.connect(tmp_path / "runtime.sqlite3")
+    runtime.executescript("""
+        CREATE TABLE runtime_conversations(paused INTEGER,last_observed_at TEXT,pause_reason TEXT);
+        INSERT INTO runtime_conversations VALUES(0,'2026-01-01T00:00:00+00:00',NULL);
+        CREATE TABLE runtime_global_control(singleton INTEGER,paused INTEGER,reason TEXT);
+        INSERT INTO runtime_global_control VALUES(1,0,NULL);
+        CREATE TABLE runtime_planning_jobs(status TEXT,error_code TEXT);
+        INSERT INTO runtime_planning_jobs VALUES('ignored',NULL);
+        CREATE TABLE runtime_planner_decisions(request_id TEXT,conversation_id TEXT,action TEXT,selection_reason TEXT,model TEXT,latency_ms INTEGER,created_at TEXT);
+        CREATE TABLE runtime_planner_evaluations(
+          request_id TEXT,conversation_id TEXT,action TEXT,outcome TEXT,decision_code TEXT,
+          policy_reason_codes_json TEXT,policy_rule_ids_json TEXT,policy_sensitive_categories_json TEXT,
+          model TEXT,latency_ms INTEGER,created_at TEXT,provider_request_json TEXT,plan_json TEXT,usage_json TEXT
+        );
+        INSERT INTO runtime_planner_evaluations VALUES(
+          'req-1','conversation-1','observe','review_required','review',
+          '["manual_rule_hit"]','["rule-1"]','["sensitive"]','model-x',42,
+          '2026-01-01T00:00:00+00:00','secret-request','secret-plan','secret-usage'
+        );
+    """)
+    runtime.commit()
+    runtime.close()
+    bridge = sqlite3.connect(tmp_path / "qq-vm-bridge.sqlite3")
+    bridge.executescript("CREATE TABLE qq_vm_ops(status TEXT,error_code TEXT); CREATE TABLE qq_vm_receipts(x INTEGER);")
+    bridge.commit()
+    bridge.close()
+
+    metrics = SUPERVISOR._metrics(tmp_path, "2025-01-01T00:00:00+00:00")
+
+    assert metrics is not None
+    assert metrics["recent_planner_evaluations"] == [{
+        "request_id": "req-1", "conversation_id": "conversation-1", "action": "observe",
+        "outcome": "review_required", "decision_code": "review",
+        "policy_reason_codes": ["manual_rule_hit"], "policy_rule_ids": ["rule-1"],
+        "policy_sensitive_categories": ["sensitive"], "model": "model-x", "latency_ms": 42,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }]
+    assert "secret-request" not in str(metrics)
+    assert "secret-plan" not in str(metrics)
+    assert "secret-usage" not in str(metrics)
+
+
+def test_metrics_returns_empty_evaluations_when_legacy_db_lacks_table(tmp_path: Path) -> None:
+    runtime = sqlite3.connect(tmp_path / "runtime.sqlite3")
+    runtime.executescript("""
+        CREATE TABLE runtime_conversations(paused INTEGER,last_observed_at TEXT,pause_reason TEXT);
+        CREATE TABLE runtime_global_control(singleton INTEGER,paused INTEGER,reason TEXT);
+        INSERT INTO runtime_global_control VALUES(1,0,NULL);
+        CREATE TABLE runtime_planning_jobs(status TEXT,error_code TEXT);
+        CREATE TABLE runtime_planner_decisions(request_id TEXT,conversation_id TEXT,action TEXT,selection_reason TEXT,model TEXT,latency_ms INTEGER,created_at TEXT);
+    """)
+    runtime.commit(); runtime.close()
+    bridge = sqlite3.connect(tmp_path / "qq-vm-bridge.sqlite3")
+    bridge.executescript("CREATE TABLE qq_vm_ops(status TEXT,error_code TEXT); CREATE TABLE qq_vm_receipts(x INTEGER);")
+    bridge.commit(); bridge.close()
+
+    metrics = SUPERVISOR._metrics(tmp_path, "2025-01-01T00:00:00+00:00")
+
+    assert metrics is not None
+    assert metrics["recent_planner_evaluations"] == []
+
+
+def test_run_boundary_contains_only_run_identity_and_web_port() -> None:
+    stream = BytesIO()
+    SUPERVISOR._write_run_boundary(stream, run_id="run-1", started_at="2026-01-01T00:00:00+00:00", port=12345)
+    assert stream.getvalue() == (
+        b"\n=== PMAI_RUNTIME_RUN_START run_id=run-1 started_at_utc=2026-01-01T00:00:00+00:00 web_port=12345 ===\n"
+    )
+
+
+def test_stopped_status_clears_current_web_and_driver_health_but_keeps_web_history_for_cause() -> None:
+    fields = SUPERVISOR._stop_fields(graceful_stop=False, return_code=7, ever_web_reachable=True)
+
+    assert fields["state"] == "stopped"
+    assert fields["web_reachable"] is False
+    assert fields["ready"] is False
+    assert fields["driver_state"] == "unknown"
+    assert fields["driver_state_reasons"] == ["RUNTIME_STOPPED"]
+    assert fields["error_code"] == "RUNTIME_STOPPED"
+
+
+def test_status_publish_retries_only_transient_windows_replace_locks(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(SUPERVISOR, "OUTPUT", tmp_path / "status.json")
+    monkeypatch.setattr(SUPERVISOR.os, "name", "nt", raising=False)
+    monkeypatch.setattr(SUPERVISOR.time, "sleep", lambda _: None)
+    events = []
+    monkeypatch.setattr(SUPERVISOR, "_publish_event", lambda **value: events.append(value))
+    original = SUPERVISOR.os.replace
+    attempts = 0
+
+    def replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 4:
+            error = OSError("sharing")
+            error.winerror = 32
+            raise error
+        return original(source, target)
+
+    monkeypatch.setattr(SUPERVISOR.os, "replace", replace)
+    tracker = SUPERVISOR._PublishTracker()
+    assert SUPERVISOR._publish_status({"run_id": "run-1"}, tracker) is True
+    assert attempts == 4
+    assert tracker.failures == 0
+    assert events == []
+
+
+def test_status_publish_does_not_retry_nontransient_error_and_recovers(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(SUPERVISOR, "OUTPUT", tmp_path / "status.json")
+    monkeypatch.setattr(SUPERVISOR.os, "name", "nt", raising=False)
+    monkeypatch.setattr(SUPERVISOR.time, "sleep", lambda _: None)
+    events = []
+    original = SUPERVISOR.os.replace
+    monkeypatch.setattr(SUPERVISOR, "_publish_event", lambda **value: events.append(value))
+    attempts = 0
+
+    def replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        error = OSError("denied")
+        error.winerror = 87
+        raise error
+
+    monkeypatch.setattr(SUPERVISOR.os, "replace", replace)
+    tracker = SUPERVISOR._PublishTracker()
+    assert SUPERVISOR._publish_status({"run_id": "run-1"}, tracker) is False
+    assert attempts == 1
+    assert events[0]["event"] == "publish_failed"
+    monkeypatch.setattr(SUPERVISOR.os, "replace", original)
+    assert SUPERVISOR._publish_status({"run_id": "run-1"}, tracker) is True
+    assert events[-1] == {"run_id": "run-1", "event": "publish_recovered", "count": 1}
+
+
+def test_initial_publish_failure_prevents_spawn(monkeypatch) -> None:
+    monkeypatch.setattr(SUPERVISOR, "_publish_status", lambda *_: False)
+    monkeypatch.setattr(SUPERVISOR, "_publish_event", lambda **_: None)
+    monkeypatch.setattr(SUPERVISOR.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")))
+    assert SUPERVISOR.main() == 2
+
+
+def test_postspawn_publish_failure_does_not_abandon_polling(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"data_dir": str(tmp_path)}), encoding="utf-8")
+    monkeypatch.setattr(SUPERVISOR, "CONFIG", config)
+    monkeypatch.setattr(SUPERVISOR, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(SUPERVISOR, "_reserve_loopback_port", lambda: 12345)
+    monkeypatch.setattr(SUPERVISOR, "_write_run_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(SUPERVISOR, "_http_observation", lambda _port: None)
+    monkeypatch.setattr(SUPERVISOR, "_metrics", lambda *_args: None)
+    monkeypatch.setattr(SUPERVISOR, "_worker_witness", lambda _run: (None, []))
+    monkeypatch.setattr(SUPERVISOR, "_driver_status", lambda *_args: ("unknown", []))
+    monkeypatch.setattr(SUPERVISOR, "_control_result", lambda _run: None)
+    monkeypatch.setattr(SUPERVISOR.time, "sleep", lambda _seconds: None)
+    events = []
+    monkeypatch.setattr(SUPERVISOR, "_publish_event", lambda **value: events.append(value))
+    published = []
+    def publish(_report, _tracker):
+        published.append(True)
+        return len(published) != 3
+    monkeypatch.setattr(SUPERVISOR, "_publish_status", publish)
+    class Process:
+        pid = 999
+        returncode = 0
+        def __init__(self): self.calls = 0
+        def poll(self):
+            self.calls += 1
+            return None if self.calls == 1 else 0
+    process = Process()
+    monkeypatch.setattr(SUPERVISOR.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: BytesIO())
+    assert SUPERVISOR.main() == 2
+    assert process.calls == 2
+    assert len(published) == 4
+    assert events[-1]["event"] == "process_exited"
+    assert events[-1]["exit_code"] == 0
+
+
+def test_publish_event_never_serializes_exception_message_or_path(tmp_path: Path, monkeypatch) -> None:
+    event_log = tmp_path / "supervisor-events.log"
+    monkeypatch.setattr(SUPERVISOR, "SUPERVISOR_EVENT_LOG", event_log)
+    error = OSError("SENTINEL_SECRET_TEXT C:\\sensitive\\path")
+    error.winerror = 32
+    SUPERVISOR._publish_event(run_id="run-1", event="publish_failed", count=1, exc=error)
+    written = event_log.read_text(encoding="utf-8")
+    assert "SENTINEL_SECRET_TEXT" not in written
+    assert "sensitive" not in written
+    assert '"exception_type": "OSError"' in written
+    assert '"winerror": 32' in written

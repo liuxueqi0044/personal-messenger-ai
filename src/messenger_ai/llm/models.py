@@ -80,6 +80,7 @@ class RuleProjection(StrictModel):
     rulepack_id: str = Field(min_length=1, max_length=256)
     rule_version: str = Field(min_length=1, max_length=128)
     source_hash: str = Field(min_length=1, max_length=128)
+    content_policy_checks_enabled: bool = True
     system_safety: tuple[str, ...] = ()
     persona_style: tuple[str, ...] = ()
     persona_identity: str = ""
@@ -104,7 +105,18 @@ class ReplyPlan(StrictModel):
     must_rule_results: tuple[str, ...] = ()
     prohibited_rule_results: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
-    confidence: float = Field(ge=0, le=1, default=0)
+    confidence: float = Field(
+        ge=0,
+        le=1,
+        default=0,
+        description=(
+            "对当前候选回复的支持性、上下文适配性和规则符合度的评估；"
+            "不是对联系人了解程度的评估。关系未知时保持中性，不推定亲密关系或事实；"
+            "普通礼貌回应不需要的关系资料，不作为不能回复的依据。若缺失上下文确实影响候选的正确性或边界，"
+            "应降低 confidence；若无法在现有信息下给出适当回复，选择 handoff。"
+            "不得为通过自动发送门槛而虚增分数。"
+        ),
+    )
     expires_at: datetime | None = None
     selection_reason: str = Field(default="", max_length=500)
     variation_seed: str = Field(default="", max_length=64)

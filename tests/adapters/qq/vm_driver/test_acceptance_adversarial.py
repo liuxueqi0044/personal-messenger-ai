@@ -189,6 +189,7 @@ def test_late_pipe_response_cannot_match_a_new_request() -> None:
     process = object.__new__(QQVMWorkerProcess)
     process._process = FakeProcess()
     process._parent = LatePipe()
+    process._request_lock = __import__("threading").Lock()
     first = WorkerCommand(kind=WorkerKind.OBSERVE, request_id=old_id, binding_id="b")
     timed_out = process.request(first, timeout_seconds=0)
     assert timed_out.request_id == old_id

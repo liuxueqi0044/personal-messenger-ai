@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from typing import Protocol
 
-from .models import QQBubble, QQConversation, QQSelector, QQWindow
+from .models import (QQBubble, QQCertifiedDirectIdentity, QQConversation, QQSelector,
+                     QQSessionObservedDirectIdentity, QQWindow)
 
 
 class QQAccessibilityPort(Protocol):
@@ -21,7 +22,7 @@ class QQAccessibilityPort(Protocol):
 
     def select_conversation(
         self, window: QQWindow, conversation: QQConversation, selector: QQSelector
-    ) -> Awaitable[None] | None: ...
+    ) -> Awaitable[bool] | bool: ...
 
     def write_composer(
         self, window: QQWindow, text: str, selector: QQSelector
@@ -38,3 +39,19 @@ class QQAccessibilityPort(Protocol):
     def list_bubbles(
         self, window: QQWindow, selector: QQSelector
     ) -> Awaitable[list[QQBubble]] | list[QQBubble]: ...
+
+
+class QQCurrentIdentityCertifier(Protocol):
+    """Certify the already-selected conversation; it never chooses a row."""
+
+    def certify_current(
+        self, window: QQWindow, candidate: QQConversation
+    ) -> QQCertifiedDirectIdentity | QQSessionObservedDirectIdentity: ...
+
+
+class QQCandidateLocator(Protocol):
+    """Use volatile hints to locate rows; returned candidates are uncertified."""
+
+    def locate_candidates(
+        self, binding: object, visible: list[QQConversation]
+    ) -> list[QQConversation]: ...

@@ -11,6 +11,7 @@ from messenger_ai.llm import (
     ContactProjection,
     DeepSeekResponsesProvider,
     InboundItem,
+    OpenAIResponsesProvider,
     ReplyPlanRequest,
     RuleProjection,
 )
@@ -57,9 +58,68 @@ def test_responses_request_uses_official_model_schema_and_no_secret() -> None:
     assert "test-key" not in repr(transport.kwargs)
 
 
+def _formats(node) -> list[str]:
+    if isinstance(node, dict):
+        own = [node["format"]] if isinstance(node.get("format"), str) else []
+        return own + [item for child in node.values() for item in _formats(child)]
+    if isinstance(node, list):
+        return [item for child in node for item in _formats(child)]
+    return []
+
+
+def test_deepseek_schema_removes_only_unsupported_datetime_format() -> None:
+    transport = Transport(response())
+    asyncio.run(
+        DeepSeekResponsesProvider(api_key="test-key", transport=transport).plan_reply(
+            request()
+        )
+    )
+    schema = transport.kwargs["text"]["format"]["schema"]
+    assert "date-time" not in _formats(schema)
+    expires_at = schema["properties"]["expires_at"]
+    assert {variant.get("type") for variant in expires_at["anyOf"]} == {
+        "string",
+        "null",
+    }
+
+
+def test_generic_openai_schema_preserves_datetime_format() -> None:
+    transport = Transport(response())
+    asyncio.run(
+        OpenAIResponsesProvider(
+            model="test-model", transport=transport
+        ).plan_reply(request())
+    )
+    schema = transport.kwargs["text"]["format"]["schema"]
+    assert "date-time" in _formats(schema)
+
+
+def test_invalid_datetime_is_still_rejected_locally() -> None:
+    invalid = response()
+    invalid["output_text"] = invalid["output_text"].replace(
+        '"expires_at":null', '"expires_at":"not-a-date"'
+    )
+    result = asyncio.run(
+        DeepSeekResponsesProvider(
+            api_key="test-key", transport=Transport(invalid)
+        ).plan_reply(request())
+    )
+    assert result.plan is None
+    assert result.error is not None and result.error.category == "schema"
+
+
 def test_default_model_is_current_deepseek_responses_model() -> None:
     provider = DeepSeekResponsesProvider(api_key="test-key", transport=Transport(response()))
     assert provider.model == "deepseek-v4-flash"
+
+
+def test_undocumented_flash_alias_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unsupported DeepSeek Responses model"):
+        DeepSeekResponsesProvider(
+            api_key="test-key",
+            model="deepseek-flash",
+            transport=Transport(response()),
+        )
 
 
 def test_missing_key_is_rejected_even_with_mock_transport() -> None:

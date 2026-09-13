@@ -27,7 +27,7 @@ DEFAULT_QQ_APPLICATION = (
     / "state"
     / "qq"
     / "pending-bindings"
-    / "f9b741e0-9af3-4d28-a967-816bb74c7e75.json"
+    / "pending.json"
 )
 DEFAULT_QQ_HELPER = (
     PROJECT_ROOT

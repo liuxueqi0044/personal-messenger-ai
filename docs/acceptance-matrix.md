@@ -1,5 +1,7 @@
 # M0–M13 验收矩阵
 
+本文保留历史验收矩阵和当时的测试/租约状态；它不是当前 guest 状态快照。当前 Windows、runtime setup、QQ 登录、API 查询和未完成的多联系人/真实收发状态请以 [`../qq-vm/VM-STATUS.md`](../qq-vm/VM-STATUS.md)、[`../qq-vm/install/DEPLOYMENT-HANDOFF.md`](../qq-vm/install/DEPLOYMENT-HANDOFF.md) 和 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) 为准。历史测试数量、旧 lease 和旧 UIA 状态不应覆盖新的实机证据。
+
 状态含义：`code` 表示实现存在并通过模块级静态/单元检查；`offline` 表示使用 Fake、SQLite in-memory 或合成数据完成契约验收；`live` 只表示真实 Windows/平台环境已通过对应的独立证据，不会由登录状态推断。
 
 | 模块 | code | offline | live | 当前说明 |

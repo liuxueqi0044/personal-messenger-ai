@@ -12,7 +12,7 @@ class ThreeSegmentProvider:
     async def plan_reply(self, request):
         self.requests.append(request)
         segments=['one','two','three'] if self.action is ReplyAction.DRAFT else []
-        return ReplyPlanResult(request_id=request.request_id,rule_version=request.rules.rule_version,context_fingerprint=request.context_fingerprint,plan=ReplyPlan(action=self.action,reply_text=' '.join(segments),reply_segments=segments,confidence=1),model='segments',latency_ms=0)
+        return ReplyPlanResult(request_id=request.request_id,rule_version=request.rules.rule_version,context_fingerprint=request.context_fingerprint,plan=ReplyPlan(action=self.action,reply_text=' '.join(segments),reply_segments=segments,confidence=1,selection_reason='provider chose no send'),model='segments',latency_ms=7)
 
 def _advance_due(app,harness):
     row=app.pacing.connection.execute("select earliest_send_at from m10_plans where status in ('waiting','due') order by earliest_send_at limit 1").fetchone()
@@ -52,4 +52,9 @@ def test_ignore_creates_no_draft_due_or_commit(tmp_path):
         for _ in range(10): await app.tick()
         assert app.pacing.connection.execute('select count(*) from m10_plans').fetchone()[0]==0
         assert not [x for x in harness.port.requests if x.kind.value=='commit']
+        decision=app.state.connection.execute('select request_id,action,selection_reason,model,latency_ms from runtime_planner_decisions').fetchone()
+        assert decision['request_id']
+        assert tuple(decision)[1:]==('ignore','provider chose no send','segments',7)
+        evaluation=app.state.connection.execute('select action,outcome from runtime_planner_evaluations').fetchone()
+        assert tuple(evaluation)==('ignore','ignore')
     asyncio.run(run())

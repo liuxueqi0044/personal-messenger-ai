@@ -9,6 +9,7 @@ from messenger_ai.adapters.qq.live_driver.identity import (
 from messenger_ai.adapters.qq.live_driver.profile_identity import (
     ProfileIdentityError,
     assess_pending_application,
+    parse_guest_foreground_profile_report,
     parse_profile_report,
 )
 
@@ -71,6 +72,50 @@ def report(**changes: object) -> dict[str, object]:
     }
     value.update(changes)
     return value
+
+
+def test_guest_foreground_profile_report_has_distinct_vm_and_recovery_contract():
+    value = report(
+        probe_version="qq-uia-guest-foreground-identity-v1",
+        mode="guest_foreground_current_chat_identity",
+        is_foreground_before=True,
+        is_foreground_after=True,
+        guest_environment={"certified": True, "machine": "PMAI-QQVM", "user": "qqbot", "hypervisor": "virtualbox"},
+    )
+    value["privacy"] = dict(value["privacy"], foreground_requested=True)
+    parsed = parse_guest_foreground_profile_report(value, window_handle=9001,
+        environment_fingerprint=HASH, selector_pack_version="selector-v1",
+        expected_header_digest=HASH, expected_process_id=1234)
+    assert parsed["profile_id_hmac"] == "c" * 64
+
+
+@pytest.mark.parametrize("recovery", [
+    {"attempted": True, "original_view_restored": True},
+    {"attempted": True, "original_view_restored": True, "foreground_changed": True},
+])
+def test_guest_profile_rejects_missing_or_failed_recovery(recovery):
+    value = report(probe_version="qq-uia-guest-foreground-identity-v1",
+        mode="guest_foreground_current_chat_identity", is_foreground_before=True,
+        is_foreground_after=True, recovery=recovery,
+        guest_environment={"certified": True, "machine": "PMAI-QQVM", "user": "qqbot", "hypervisor": "virtualbox"})
+    value["privacy"] = dict(value["privacy"], foreground_requested=True)
+    with pytest.raises(ProfileIdentityError, match="RECOVERY_CONTRACT_FAILED"):
+        parse_guest_foreground_profile_report(value, window_handle=9001,
+            environment_fingerprint=HASH, selector_pack_version="selector-v1",
+            expected_header_digest=HASH, expected_process_id=1234)
+
+
+def test_guest_profile_binds_the_preflight_right_region_digest():
+    value = report(probe_version="qq-uia-guest-foreground-identity-v1",
+        mode="guest_foreground_current_chat_identity", is_foreground_before=True,
+        is_foreground_after=True,
+        guest_environment={"certified": True, "machine": "PMAI-QQVM", "user": "qqbot", "hypervisor": "virtualbox"})
+    value["privacy"] = dict(value["privacy"], foreground_requested=True)
+    with pytest.raises(ProfileIdentityError, match="RIGHT_REGION_MISMATCH"):
+        parse_guest_foreground_profile_report(value, window_handle=9001,
+            environment_fingerprint=HASH, selector_pack_version="selector-v1",
+            expected_header_digest=HASH, expected_process_id=1234,
+            expected_right_region_structure_digest="e" * 64)
 
 
 def application() -> dict[str, object]:

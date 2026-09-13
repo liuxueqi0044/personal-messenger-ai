@@ -163,6 +163,7 @@ def _normalized_bounds(
 
 def _structural_q1_anchors(
     nodes: list[UiNodeInput],
+    client_version: str,
 ) -> dict[str, str]:
     """Recognize QQ NT's Chromium split panes without visible text.
 
@@ -179,6 +180,106 @@ def _structural_q1_anchors(
             return None
         left, top, right, bottom = item.normalized_rect
         return left, top, right - left, bottom - top
+
+    # QQ 9.9.33 exposes a Chromium Document with a Pane-backed recent list.
+    # The list itself has no pattern; its direct Group rows expose Invoke and
+    # deliberately have no AutomationId or SelectionItemPattern.  Keep this
+    # version-bound and require one unambiguous list plus repeated aligned rows.
+    if client_version.startswith("9.9.33."):
+        lists = []
+        for item in nodes:
+            rect = dimensions(item)
+            class_tokens = set(item.class_name.lower().split())
+            if rect is None:
+                continue
+            left, top, width, height = rect
+            if (
+                item.control_type.lower() == "pane"
+                and "recent-contact-list" in class_tokens
+                and not item.automation_id
+                and 0.03 <= left <= 0.15
+                and 0.08 <= top <= 0.20
+                and 0.15 <= width <= 0.32
+                and height >= 0.60
+            ):
+                lists.append(item)
+        if len(lists) != 1:
+            return {}
+        conversation_list = lists[0]
+        list_rect = dimensions(conversation_list)
+        assert list_rect is not None
+        list_left, list_top, list_width, _ = list_rect
+        rows = []
+        for item in nodes:
+            rect = dimensions(item)
+            if rect is None:
+                continue
+            left, top, width, height = rect
+            if (
+                item.parent_runtime_id == conversation_list.runtime_id
+                and item.control_type.lower() == "group"
+                and "recent-contact-item"
+                in set(item.class_name.lower().split())
+                and set(item.class_name.lower().split())
+                <= {"recent-contact-item", "recent-contact-item--selected"}
+                and not item.automation_id
+                and "invokepattern" in {pattern.lower() for pattern in item.patterns}
+                and abs(left - list_left) <= 0.02
+                and abs(width - list_width) <= 0.02
+                and list_top <= top < 0.94
+                and 0.05 <= height <= 0.15
+            ):
+                rows.append(item)
+        if len(rows) < 2:
+            return {}
+        row_sizes = {
+            (round(dimensions(row)[2], 2), round(dimensions(row)[3], 2))
+            for row in rows
+        }  # type: ignore[index]
+        if len(row_sizes) != 1:
+            return {}
+        # Compile from the stable base class where available.  The selected
+        # state is a transient extra token and must not become the selector.
+        base_rows = [
+            row
+            for row in rows
+            if set(row.class_name.lower().split()) == {"recent-contact-item"}
+        ]
+        exemplar = min(base_rows or rows, key=lambda item: dimensions(item)[1])  # type: ignore[index]
+        derived = {
+            conversation_list.runtime_id: "conversation_list",
+            exemplar.runtime_id: "conversation_item",
+        }
+        message_regions = []
+        for item in nodes:
+            rect = dimensions(item)
+            class_tokens = set(item.class_name.lower().split())
+            if rect is None:
+                continue
+            left, top, width, height = rect
+            if (
+                item.control_type.lower() == "group"
+                and {"q-scroll-view", "ml-container", "ml-root", "container"}
+                <= class_tokens
+                and "scrollpattern"
+                in {pattern.lower() for pattern in item.patterns}
+                and 0.28 <= left <= 0.36
+                and 0.10 <= top <= 0.18
+                and 0.42 <= width <= 0.58
+                and 0.50 <= height <= 0.70
+            ):
+                message_regions.append(item)
+        if len(message_regions) == 1:
+            derived[message_regions[0].runtime_id] = "message_region"
+        empty_shells = [
+            item
+            for item in nodes
+            if item.control_type.lower() == "group"
+            and "empty-panel_head" in set(item.class_name.lower().split())
+        ]
+        if len(empty_shells) == 1:
+            derived[empty_shells[0].runtime_id] = "empty_chat_shell"
+        return derived
 
     windows = [
         item
@@ -250,11 +351,18 @@ def _structural_q1_anchors(
     }
 
 
-def _enrich_q1_anchors(nodes: list[UiNodeInput]) -> list[UiNodeInput]:
-    derived = _structural_q1_anchors(nodes)
-    if not derived:
+def _enrich_q1_anchors(
+    nodes: list[UiNodeInput], client_version: str
+) -> list[UiNodeInput]:
+    derived = _structural_q1_anchors(nodes, client_version)
+    if not derived and not client_version.startswith("9.9.33."):
         return nodes
-    structural_roles = {"conversation_list", "conversation_item", "message_region"}
+    # Replace only the two roles certified by this recognizer.  Existing
+    # message-region evidence belongs to a separate classifier and must survive
+    # when an actual conversation is selected.
+    structural_roles = {"conversation_list", "conversation_item", "empty_chat_shell"}
+    if "message_region" in derived.values():
+        structural_roles.add("message_region")
     enriched: list[UiNodeInput] = []
     for item in nodes:
         anchors = {
@@ -270,7 +378,7 @@ def _enrich_q1_anchors(nodes: list[UiNodeInput]) -> list[UiNodeInput]:
 
 
 def _node_inputs(
-    topology: Mapping[str, Any], root_runtime_id: str
+    topology: Mapping[str, Any], root_runtime_id: str, client_version: str
 ) -> list[UiNodeInput]:
     if _bool(topology, "included", "topology") is not True:
         raise ProbeBridgeError("TOPOLOGY_MISSING", "topology.included must be true")
@@ -341,7 +449,7 @@ def _node_inputs(
     known_ids = seen | {root_runtime_id}
     if any(item.parent_runtime_id not in known_ids for item in nodes):
         raise ProbeBridgeError("INVALID_PARENT", "topology parent reference is unknown")
-    return _enrich_q1_anchors(nodes)
+    return _enrich_q1_anchors(nodes, client_version)
 
 
 def ingest_probe_report(
@@ -435,7 +543,7 @@ def ingest_probe_report(
         raise ProbeBridgeError("INVALID_FIELD", "root.class_name must be text")
     root_runtime_id = "__probe_root__"
     topology = _object(_required(value, "topology", "report"), "topology")
-    nodes = _node_inputs(topology, root_runtime_id)
+    nodes = _node_inputs(topology, root_runtime_id, runtime.client_version)
     nodes.insert(
         0,
         UiNodeInput(

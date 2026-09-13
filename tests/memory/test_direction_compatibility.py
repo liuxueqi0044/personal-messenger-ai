@@ -8,6 +8,7 @@ from uuid import uuid4
 from messenger_ai.domain import Platform
 from messenger_ai.llm import ContactProjection, InboundItem, ReplyPlanRequest, RuleProjection, build_projection
 from messenger_ai.memory import Contact, IdentityBinding, MemoryMessage, MemoryMessageDirection, MemoryService, SQLiteMemoryStore
+from messenger_ai.testing.fakes import FakeClock
 
 
 NOW = datetime(2026, 9, 9, 12, tzinfo=UTC)
@@ -33,7 +34,7 @@ def test_old_memory_messages_table_migrates_and_defaults_inbound(tmp_path):
 
 def test_outbound_direction_survives_memory_context_and_prompt(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
-    service = MemoryService(store)
+    service = MemoryService(store, clock=FakeClock(NOW))
     service.create_contact(Contact(contact_id="c", created_at=NOW))
     service.bind_identity(IdentityBinding(contact_id="c", platform=Platform.QQ, account_id="a", conversation_id="v", platform_evidence_hash=hashlib.sha256(b"proof").hexdigest(), approval={"verified_by": "owner", "verified_at": NOW, "reason": "test"}))
     service.record_message(MemoryMessage(contact_id="c", conversation_id="v", source_event_id=uuid4(), platform_message_key="out-1", text="我先忙", observed_at=NOW, expires_at=NOW + timedelta(days=1), direction=MemoryMessageDirection.HUMAN_OUTBOUND))

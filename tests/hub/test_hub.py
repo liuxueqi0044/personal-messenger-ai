@@ -15,6 +15,7 @@ from messenger_ai.domain import (
     PacingPlan,
     PlanStatus,
     Platform,
+    SendOperation,
     SendStatus,
 )
 from messenger_ai.hub import HubService, SQLiteHubStore
@@ -264,3 +265,240 @@ def test_send_uncertain_is_never_recommitted_and_recovery_keeps_it_quarantined(h
     assert second.status == SendStatus.UNCERTAIN
     assert adapter.commits == 1
     assert service.recover()["send_uncertain"] == 0
+
+
+def _outstanding_operation(hub):
+    """Create one pending send operation through the M9 authorization path."""
+    service, clock = hub
+    service.ingest(message(clock, "m1"))
+    draft = make_draft(service, clock)
+    authorization = Authorization(
+        draft_id=draft.draft_id,
+        conversation_id="conv-a",
+        expected_last_message_key="m1",
+        text_hash=draft.text_hash,
+        idempotency_key="send-1",
+        authorization_type=AuthorizationType.HUMAN,
+        policy_version="p1",
+        expires_at=clock.now() + timedelta(minutes=1),
+    )
+    service.persist_authorization(authorization)
+    command = AuthorizedSendCommand(
+        draft_id=draft.draft_id,
+        conversation_id="conv-a",
+        expected_last_message_key="m1",
+        text_hash=draft.text_hash,
+        idempotency_key="send-1",
+        authorization_type=AuthorizationType.HUMAN,
+        authorization_id=authorization.authorization_id,
+        policy_version="p1",
+        expires_at=authorization.expires_at,
+    )
+    return service.create_send_operation(command)
+
+
+class PhaseProbeAdapter:
+    """Returns a caller-chosen status from each phase to probe the Hub boundary."""
+
+    def __init__(
+        self,
+        *,
+        prepare: SendStatus = SendStatus.PREPARED,
+        commit: SendStatus = SendStatus.COMMITTED,
+        verify: SendStatus = SendStatus.VERIFIED,
+        error_code: str | None = None,
+    ) -> None:
+        self.prepare_status = prepare
+        self.commit_status = commit
+        self.verify_status = verify
+        self.error_code = error_code
+        self.prepare_calls = self.commit_calls = self.verify_calls = 0
+
+    async def prepare_send(
+        self, command, *, operation_id, segment_ref, binding_revision, conversation_revision
+    ):
+        self.prepare_calls += 1
+        return SendOperation(
+            operation_id=operation_id,
+            idempotency_key=command.idempotency_key,
+            draft_id=command.draft_id,
+            status=self.prepare_status,
+            error_code=self.error_code,
+        )
+
+    async def commit_send(self, operation):
+        self.commit_calls += 1
+        operation.status = self.commit_status
+        operation.error_code = self.error_code
+        return operation
+
+    async def verify_send(self, operation):
+        self.verify_calls += 1
+        operation.status = self.verify_status
+        operation.error_code = self.error_code
+        return operation
+
+
+class IdentitySwapAdapter(PhaseProbeAdapter):
+    def __init__(self, *, swap_phase: str) -> None:
+        super().__init__()
+        self.swap_phase = swap_phase
+
+    @staticmethod
+    def _swapped(operation: SendOperation, status: SendStatus) -> SendOperation:
+        return SendOperation(
+            idempotency_key=f"swapped:{operation.idempotency_key}",
+            draft_id=operation.draft_id,
+            status=status,
+        )
+
+    async def commit_send(self, operation):
+        self.commit_calls += 1
+        if self.swap_phase == "commit":
+            return self._swapped(operation, SendStatus.COMMITTED)
+        operation.status = SendStatus.COMMITTED
+        return operation
+
+    async def verify_send(self, operation):
+        self.verify_calls += 1
+        if self.swap_phase == "verify":
+            return self._swapped(operation, SendStatus.VERIFIED)
+        operation.status = SendStatus.VERIFIED
+        return operation
+
+
+class LegacyPrepareIdentitySwapAdapter:
+    async def prepare_send(self, operation):
+        operation.operation_id = SendOperation(
+            idempotency_key="replacement",
+            draft_id=operation.draft_id,
+        ).operation_id
+        operation.status = SendStatus.PREPARED
+        return operation
+
+
+def _operation_status(service, operation):
+    row = service.store.connection.execute(
+        "SELECT status,error_code FROM send_operations WHERE operation_id=?",
+        (str(operation.operation_id),),
+    ).fetchone()
+    return (row["status"], row["error_code"])
+
+
+@pytest.mark.parametrize("off_phase", [SendStatus.COMMITTED, SendStatus.VERIFIED])
+def test_prepare_phase_fails_closed_on_commit_or_verify_status(hub, off_phase):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter(prepare=off_phase)
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.UNCERTAIN
+    assert result.error_code == "SEND_UNCERTAIN"
+    assert adapter.commit_calls == 0
+    assert _operation_status(service, operation) == ("send_uncertain", "SEND_UNCERTAIN")
+
+
+def test_prepare_phase_pending_is_an_explicit_safe_failure(hub):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter(prepare=SendStatus.PENDING)
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.FAILED
+    assert result.error_code == "FAILED_SAFE"
+    assert adapter.commit_calls == 0
+    assert _operation_status(service, operation) == ("failed", "FAILED_SAFE")
+
+
+def test_commit_cannot_report_verified_without_a_verify_transition(hub):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter(commit=SendStatus.VERIFIED)
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.UNCERTAIN
+    assert result.error_code == "SEND_UNCERTAIN"
+    assert adapter.verify_calls == 0
+    assert _operation_status(service, operation) == ("send_uncertain", "SEND_UNCERTAIN")
+
+
+def test_commit_phase_pending_is_uncertain_after_commit_intent(hub):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter(commit=SendStatus.PENDING)
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.UNCERTAIN
+    assert result.error_code == "SEND_UNCERTAIN"
+    assert adapter.verify_calls == 0
+    assert _operation_status(service, operation) == (
+        "send_uncertain",
+        "SEND_UNCERTAIN",
+    )
+
+
+def test_verify_cannot_downgrade_back_to_committed(hub):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter(verify=SendStatus.COMMITTED)
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.UNCERTAIN
+    assert adapter.verify_calls == 1
+    assert _operation_status(service, operation) == ("send_uncertain", "SEND_UNCERTAIN")
+
+
+@pytest.mark.parametrize("off_phase", [SendStatus.FAILED, SendStatus.CANCELLED])
+def test_verify_failure_after_commit_is_uncertain(hub, off_phase):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter(verify=off_phase)
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.UNCERTAIN
+    assert result.error_code == "SEND_UNCERTAIN"
+    assert _operation_status(service, operation) == (
+        "send_uncertain",
+        "SEND_UNCERTAIN",
+    )
+
+
+def test_verified_only_arrives_through_the_verify_phase(hub):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    adapter = PhaseProbeAdapter()
+    result = asyncio.run(service.run_send(operation.operation_id, adapter))
+    assert result.status is SendStatus.VERIFIED
+    assert adapter.prepare_calls == 1 and adapter.commit_calls == 1
+    assert adapter.verify_calls == 1
+    assert _operation_status(service, operation) == ("verified", None)
+
+
+@pytest.mark.parametrize("swap_phase", ["commit", "verify"])
+def test_commit_and_verify_reject_adapter_identity_swap(hub, swap_phase):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    result = asyncio.run(
+        service.run_send(
+            operation.operation_id,
+            IdentitySwapAdapter(swap_phase=swap_phase),
+        )
+    )
+    assert result.operation_id == operation.operation_id
+    assert result.status is SendStatus.UNCERTAIN
+    assert result.error_code == "SEND_UNCERTAIN"
+    assert _operation_status(service, operation) == (
+        "send_uncertain",
+        "SEND_UNCERTAIN",
+    )
+
+
+def test_legacy_prepare_identity_alias_swap_fails_closed(hub):
+    service, _clock = hub
+    operation = _outstanding_operation(hub)
+    result = asyncio.run(
+        service.prepare_send(
+            operation.operation_id,
+            LegacyPrepareIdentitySwapAdapter(),
+            segment_ref="legacy:0",
+            binding_revision=1,
+        )
+    )
+    assert result.operation_id == operation.operation_id
+    assert result.status is SendStatus.FAILED
+    assert result.error_code == "FAILED_SAFE"
+    assert _operation_status(service, operation) == ("failed", "FAILED_SAFE")

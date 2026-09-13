@@ -244,6 +244,35 @@ def build_identity_evidence(
     )
 
 
+def parse_guest_foreground_profile_report(output: str | bytes | Mapping[str, Any], **scope: Any) -> dict[str, Any]:
+    """Validate the distinct certified-VM foreground helper report."""
+    report = _parse(output)
+    if report.get("probe_version") != "qq-uia-guest-foreground-identity-v1" or report.get("mode") != "guest_foreground_current_chat_identity":
+        raise ProfileIdentityError("MODE_MISMATCH")
+    guest = report.get("guest_environment")
+    if not isinstance(guest, Mapping) or guest != {"certified": True, "machine": "PMAI-QQVM", "user": "qqbot", "hypervisor": "virtualbox"}:
+        raise ProfileIdentityError("GUEST_ENVIRONMENT_MISMATCH")
+    if report.get("is_foreground_before") is not True or report.get("is_foreground_after") is not True:
+        raise ProfileIdentityError("QQ_FOREGROUND_NOT_RESTORED")
+    privacy = report.get("privacy")
+    if not isinstance(privacy, Mapping) or privacy.get("foreground_requested") is not True:
+        raise ProfileIdentityError("PRIVACY_CONTRACT_FAILED")
+    recovery = report.get("recovery")
+    if not isinstance(recovery, Mapping) or set(recovery) != {"attempted", "original_view_restored", "foreground_changed"}:
+        raise ProfileIdentityError("RECOVERY_CONTRACT_FAILED")
+    if recovery.get("attempted") is not True or recovery.get("original_view_restored") is not True or recovery.get("foreground_changed") is not False:
+        raise ProfileIdentityError("RECOVERY_CONTRACT_FAILED")
+    expected_right = scope.pop("expected_right_region_structure_digest", None)
+    if expected_right is not None and _digest(report.get("right_region_structure_digest")) != _digest(expected_right):
+        raise ProfileIdentityError("RIGHT_REGION_MISMATCH")
+    compatible = dict(report)
+    compatible.update(probe_version=_PROBE_VERSION, mode=_MODE,
+                      is_foreground_before=False, is_foreground_after=False)
+    compatible["privacy"] = dict(privacy, foreground_requested=False)
+    compatible["recovery"] = dict(recovery)
+    return parse_profile_report(compatible, **scope)
+
+
 def assess_pending_application(
     application: Mapping[str, Any],
     parsed: Mapping[str, Any],
@@ -295,4 +324,5 @@ __all__ = [
     "assess_pending_application",
     "build_identity_evidence",
     "parse_profile_report",
+    "parse_guest_foreground_profile_report",
 ]

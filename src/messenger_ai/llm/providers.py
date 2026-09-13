@@ -122,6 +122,11 @@ class OpenAIResponsesProvider:
         else:
             self.transport = transport
 
+    def _response_schema(self) -> dict[str, Any]:
+        """Return the provider-specific strict structured-output schema."""
+
+        return _output_schema()
+
     async def plan_reply(self, request: ReplyPlanRequest) -> ReplyPlanResult:
         started = time.perf_counter()
         kwargs = {
@@ -134,7 +139,7 @@ class OpenAIResponsesProvider:
                     "type": "json_schema",
                     "name": "reply_plan",
                     "strict": True,
-                    "schema": _output_schema(),
+                    "schema": self._response_schema(),
                 }
             },
         }

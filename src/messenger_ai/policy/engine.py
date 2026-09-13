@@ -34,12 +34,16 @@ class PolicyEngine:
         *,
         decision_ttl_seconds: float = 300,
         minimum_model_confidence: float = 0.85,
+        content_policy_checks_enabled: bool = True,
     ) -> None:
         if decision_ttl_seconds <= 0:
             raise ValueError("decision_ttl_seconds must be positive")
         self._clock = clock
         self._ttl = timedelta(seconds=decision_ttl_seconds)
         self._minimum_confidence = minimum_model_confidence
+        if not isinstance(content_policy_checks_enabled, bool):
+            raise ValueError("content_policy_checks_enabled must be a boolean")
+        self.content_policy_checks_enabled = content_policy_checks_enabled
 
     def evaluate_eligibility(self, request: PolicyRequest) -> PolicyDecision:
         return self._evaluate(request, PolicyPhase.ELIGIBILITY)
@@ -98,7 +102,7 @@ class PolicyEngine:
                 PolicyOutcome.BLOCKED,
                 (PolicyReason.NO_REPLY_REQUESTED,),
             )
-        if assessment.risk_level is RiskLevel.BLOCKED:
+        if self.content_policy_checks_enabled and assessment.risk_level is RiskLevel.BLOCKED:
             return self._decision(
                 request,
                 phase,
@@ -113,13 +117,17 @@ class PolicyEngine:
                 (PolicyReason.OUTPUT_VALIDATION_FAILED,),
             )
 
-        explicit_prohibited = tuple(
-            dict.fromkeys(
-                (
-                    *assessment.prohibited_rule_ids,
-                    *prohibited_output_rule_ids(request.draft.body),
+        explicit_prohibited = (
+            tuple(
+                dict.fromkeys(
+                    (
+                        *assessment.prohibited_rule_ids,
+                        *prohibited_output_rule_ids(request.draft.body),
+                    )
                 )
             )
+            if self.content_policy_checks_enabled
+            else ()
         )
         if explicit_prohibited:
             return self._decision(
@@ -130,24 +138,36 @@ class PolicyEngine:
                 rule_ids=explicit_prohibited,
             )
 
-        sensitive = classify_sensitive(request.inbound_text, request.draft.body)
-        injection = has_prompt_injection(request.inbound_text, request.draft.body)
+        sensitive = (
+            classify_sensitive(request.inbound_text, request.draft.body)
+            if self.content_policy_checks_enabled
+            else ()
+        )
+        injection = (
+            has_prompt_injection(request.inbound_text, request.draft.body)
+            if self.content_policy_checks_enabled
+            else False
+        )
         review_reasons: list[PolicyReason] = []
-        rule_ids: list[str] = list(assessment.manual_rule_ids)
+        rule_ids: list[str] = (
+            list(assessment.manual_rule_ids)
+            if self.content_policy_checks_enabled
+            else []
+        )
 
         if assessment.action is ReplyAction.HANDOFF:
             review_reasons.append(PolicyReason.HANDOFF_REQUESTED)
-        if assessment.risk_level in {RiskLevel.MEDIUM, RiskLevel.HIGH}:
+        if self.content_policy_checks_enabled and assessment.risk_level in {RiskLevel.MEDIUM, RiskLevel.HIGH}:
             review_reasons.append(PolicyReason.MODEL_RISK_REVIEW)
-        if assessment.confidence < self._minimum_confidence:
+        if self.content_policy_checks_enabled and assessment.confidence < self._minimum_confidence:
             review_reasons.append(PolicyReason.LOW_MODEL_CONFIDENCE)
-        if assessment.manual_rule_ids:
+        if self.content_policy_checks_enabled and assessment.manual_rule_ids:
             review_reasons.append(PolicyReason.MANUAL_RULE_HIT)
         if sensitive:
             review_reasons.append(PolicyReason.SENSITIVE_TOPIC)
         if injection:
             review_reasons.append(PolicyReason.PROMPT_INJECTION)
-        if request.state.known_or_suspected_minor:
+        if self.content_policy_checks_enabled and request.state.known_or_suspected_minor:
             review_reasons.append(PolicyReason.MINOR_SAFETY)
         if request.state.conversation_type is not ConversationType.DIRECT:
             review_reasons.append(PolicyReason.UNSUPPORTED_CONVERSATION)
@@ -155,7 +175,7 @@ class PolicyEngine:
             review_reasons.append(PolicyReason.IDENTITY_AMBIGUOUS)
         if not request.state.context_complete:
             review_reasons.append(PolicyReason.CONTEXT_INCOMPLETE)
-        if request.state.is_new_contact:
+        if self.content_policy_checks_enabled and request.state.is_new_contact:
             review_reasons.append(PolicyReason.NEW_CONTACT)
         if not request.state.contact_whitelisted:
             review_reasons.append(PolicyReason.NOT_WHITELISTED)
