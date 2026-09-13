@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -33,10 +34,22 @@ from messenger_ai.adapters.qq.vm_driver import (
     mint_selection_handoff,
     session_identity,
 )
+from messenger_ai.adapters.qq.vm_driver.contracts import (
+    PreparedBubbleAnchor,
+    PreparedTargetIdentity,
+    PreparedVerificationEvidence,
+)
 from messenger_ai.adapters.qq.vm_driver.selectors import validate_guest_selector_pack
 from messenger_ai.adapters.qq.vm_driver.session_identity import (
     QQSessionCandidateLocator,
     QQSessionIdentityCertifier,
+)
+from messenger_ai.adapters.qq.vm_driver.visual_selection import (
+    QQ_VM_ROW_PALETTE_PROFILE,
+    RowPaletteSummary,
+    ScreenRect,
+    SelectionVisualAttestation,
+    runtime_id_digest,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -70,7 +83,12 @@ def test_worker_visual_actuator_is_only_the_selection_action_boundary() -> None:
     binding = worker._bindings[binding_id]
     conversation = fake.conversations[0]
 
-    changed = worker._select_conversation(fake.window, binding, conversation)
+    changed = worker._select_conversation(
+        WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id),
+        fake.window,
+        binding,
+        conversation,
+    )
 
     assert changed is True
     assert len(actuator.calls) == 1
@@ -87,7 +105,12 @@ def test_worker_visual_rejection_keeps_reply_and_send_path_unreachable() -> None
     binding = worker._bindings[binding_id]
 
     with pytest.raises(worker_module.UIAUnavailable, match="visual_target_not_certified"):
-        worker._select_conversation(fake.window, binding, fake.conversations[0])
+        worker._select_conversation(
+            WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id),
+            fake.window,
+            binding,
+            fake.conversations[0],
+        )
 
     assert "select" not in fake.calls
     assert fake.composer == ""
@@ -521,7 +544,11 @@ def test_selection_confirmation_does_not_open_a_phase_past_command_deadline() ->
     def read_phase(_window):
         nonlocal opened
         opened += 1
-        yield object()
+        try:
+            yield object()
+        finally:
+            if opened >= 2:
+                time.sleep(0.02)
     fake.read_phase = read_phase
     fake.confirm_conversation_selected = lambda *_args: (_ for _ in ()).throw(worker_module.UIAUnavailable("conversation selection could not be independently confirmed"))
     command = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id, deadline=datetime.now(UTC) + timedelta(milliseconds=15))
@@ -691,6 +718,9 @@ class Certifier:
             right_region_digest="b" * 64,
         )
 
+    def try_certify_already_current(self, window, candidate):
+        return self.certify_current(window, candidate)
+
 
 class Locator:
     def locate_candidates(self, binding, visible):
@@ -708,9 +738,14 @@ def test_production_scope_requires_injected_current_identity_certifier() -> None
         QQVMWorker(accessibility=fake, selector_pack=adapter.selector_pack, bindings=(binding,))
 
     certifier = Certifier(binding.participant_signature)
+    @contextmanager
+    def read_phase(_window):
+        yield object()
+    fake.read_phase = read_phase
     worker = QQVMWorker(accessibility=fake, selector_pack=adapter.selector_pack,
                         bindings=(binding,), identity_certifier=certifier,
                         candidate_locator=Locator())
+    _install_visual_attestation(worker, fake)
     result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding.binding_id))
     assert result.status is WorkerStatus.OK
     assert certifier.calls == 1
@@ -731,6 +766,10 @@ def test_session_worker_uses_bootstrapped_window_when_qq_has_an_auxiliary_window
     fake.find_main_windows = lambda _selector: list(windows)
     fake._window = lambda _window: object()
     fake._descendants = lambda _root: []
+    @contextmanager
+    def read_phase(_window):
+        yield object()
+    fake.read_phase = read_phase
     proof = QQSessionObservedDirectIdentity(
         binding_id="session-contact-1",
         conversation_type="direct",
@@ -776,6 +815,7 @@ def test_session_worker_uses_bootstrapped_window_when_qq_has_an_auxiliary_window
         expected_window=certifier.window_scope,
         window_validator=certifier.validate_window,
     )
+    _install_visual_attestation(worker, fake)
 
     health = worker.execute(WorkerCommand(kind=WorkerKind.HEALTH))
     observed = worker.execute(
@@ -856,6 +896,9 @@ def test_process_serializes_complete_pipe_request_response_exchanges() -> None:
                 status=WorkerStatus.OK,
                 worker_epoch=uuid4(),
                 operation_id=command.operation_id,
+                binding_id=command.binding_id,
+                binding_revision=command.binding_revision,
+                conversation_revision=command.conversation_revision,
             ).model_dump(mode="json")
         def close(self): self.closed = True
 
@@ -1087,6 +1130,10 @@ def _already_current_fixture(monkeypatch, *, descendants=(), live_header_digest=
     certifier = QQSessionIdentityCertifier(
         accessibility=fake, selector_pack=adapter.selector_pack, evidence=(proof,)
     )
+    @contextmanager
+    def read_phase(_window):
+        yield object()
+    fake.read_phase = read_phase
     worker = QQVMWorker(
         accessibility=fake, selector_pack=adapter.selector_pack, bindings=(binding,),
         identity_certifier=certifier,
@@ -1094,10 +1141,11 @@ def _already_current_fixture(monkeypatch, *, descendants=(), live_header_digest=
         expected_window=certifier.window_scope,
         window_validator=certifier.validate_window,
     )
+    _install_visual_attestation(worker, fake)
     return worker, fake, binding, proof
 
 
-def _already_current_observe(binding) -> WorkerCommand:
+def _already_current_observe(worker, binding) -> WorkerCommand:
     """One exact OBSERVE command carrying a valid selection-refresh handoff.
 
     A plain command may never shortcut to the certified target; only a token
@@ -1105,8 +1153,9 @@ def _already_current_observe(binding) -> WorkerCommand:
     already established as trusted-current) unlocks the header shortcut.
     """
 
+    deadline = datetime.now(UTC) + timedelta(seconds=30)
     predecessor = WorkerCommand(
-        kind=WorkerKind.OBSERVE, binding_id=binding.binding_id
+        kind=WorkerKind.OBSERVE, binding_id=binding.binding_id, deadline=deadline
     )
     result = WorkerResult(
         request_id=predecessor.request_id,
@@ -1117,14 +1166,19 @@ def _already_current_observe(binding) -> WorkerCommand:
         error_code="selection_process_refresh_required",
     )
     successor = WorkerCommand(
-        kind=WorkerKind.OBSERVE, binding_id=binding.binding_id
+        kind=WorkerKind.OBSERVE, binding_id=binding.binding_id, deadline=deadline
     )
     handoff = mint_selection_handoff(
         predecessor_command=predecessor,
         predecessor_result=result,
         successor_command=successor,
         source="selection_refresh",
-        expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        successor_worker_epoch=worker._epoch,
+        target_runtime_id_digest=runtime_id_digest(
+            binding.platform_conversation_id
+        ),
+        expires_at=deadline,
+        signing_key=worker._selection_handoff_signing_key,
     )
     return successor.model_copy(update={"selection_handoff": handoff})
 
@@ -1142,7 +1196,7 @@ def test_observe_skips_selection_when_target_is_already_current(monkeypatch) -> 
     fake.select_conversation = forbidden
     fake.confirm_conversation_selected = forbidden
 
-    result = worker.execute(_already_current_observe(binding))
+    result = worker.execute(_already_current_observe(worker, binding))
 
     assert result.status is WorkerStatus.OK
     assert result.error_code is None
@@ -1187,7 +1241,7 @@ def test_observe_fails_closed_without_selection_on_non_header_identity_error(mon
         AssertionError("identity failure must not fall through to selection")
     )
 
-    result = worker.execute(_already_current_observe(binding))
+    result = worker.execute(_already_current_observe(worker, binding))
 
     assert result.status is WorkerStatus.FAILED_SAFE
     assert result.error_code == "group_marker_detected"
@@ -1207,13 +1261,17 @@ _REJECTED_HANDOFF_CODES = frozenset({
     "selection_handoff_mismatch",
     "selection_handoff_expired",
     "selection_handoff_replayed",
+    "selection_handoff_invalid",
 })
+
+
+_DEFAULT_CERTIFIED = object()
 
 
 class _CertifyingStub:
     """Stand-in current-identity certifier that records every consultation."""
 
-    def __init__(self, outcome: object = "certified-current") -> None:
+    def __init__(self, outcome: object) -> None:
         self.outcome = outcome
         self.calls: list[tuple[object, object]] = []
 
@@ -1224,7 +1282,43 @@ class _CertifyingStub:
         return self.outcome
 
 
-def _shortcut_worker(*, certified: object = "certified-current"):
+def _install_visual_attestation(worker, fake):
+    profile = QQ_VM_ROW_PALETTE_PROFILE.model_copy(update={
+        "client_version": worker._selectors.client_version,
+        "selector_pack_version": worker._selectors.fixture_suite_version,
+        "environment_fingerprint": worker._selectors.environment_fingerprint,
+    })
+    worker._selection_visual_profile = profile
+
+    def certify(window, conversation, _selector, actual_profile, *, deadline=None):
+        assert actual_profile == profile
+        assert deadline is None or deadline.tzinfo is not None
+        return SelectionVisualAttestation(
+            profile_id=profile.profile_id,
+            client_version=profile.client_version,
+            selector_pack_version=profile.selector_pack_version,
+            environment_fingerprint=profile.environment_fingerprint,
+            process_id=window.process_id,
+            window_handle=window.window_handle,
+            target_runtime_id_digest=runtime_id_digest(conversation.internal_id),
+            row_rect=ScreenRect(left=56, top=100, right=306, bottom=164),
+            sample_count=2,
+            stable_sample_count=2,
+            unselected_control_count=2,
+            selected=RowPaletteSummary(
+                dominant_rgb=(225, 225, 225), ratio=0.779592,
+                unique_count=12, pixel_count=5880,
+            ),
+            unselected=RowPaletteSummary(
+                dominant_rgb=(245, 245, 245), ratio=1.0,
+                unique_count=1, pixel_count=5880,
+            ),
+        )
+
+    fake.certify_conversation_selected_visual = certify
+
+
+def _shortcut_worker(*, certified: object = _DEFAULT_CERTIFIED):
     """A worker whose certifier could prove the target already current."""
 
     worker, fake, binding_id = _worker()
@@ -1237,19 +1331,28 @@ def _shortcut_worker(*, certified: object = "certified-current"):
     def read_phase(_window):
         yield object()
 
-    certifier = _CertifyingStub(certified)
+    outcome = (
+        SimpleNamespace(participant_signature=worker._bindings[binding_id].participant_signature)
+        if certified is _DEFAULT_CERTIFIED
+        else certified
+    )
+    certifier = _CertifyingStub(outcome)
     worker._identity_certifier = certifier
     worker._candidate_locator = Locator()
     fake.read_phase = read_phase
+    _install_visual_attestation(worker, fake)
     return worker, fake, binding_id, certifier
 
 
 def _refresh_handoff(
-    command: WorkerCommand, *, expires_at: datetime | None = None,
+    worker, command: WorkerCommand, *, expires_at: datetime | None = None,
 ) -> SelectionHandoff:
     """Mint the exact selection-refresh authority for ``command``."""
 
-    predecessor = command.model_copy(
+    successor = command.model_copy(update={
+        "deadline": command.deadline or datetime.now(UTC) + timedelta(seconds=30)
+    })
+    predecessor = successor.model_copy(
         update={"selection_handoff": None, "request_id": uuid4()}
     )
     result = WorkerResult(
@@ -1266,14 +1369,22 @@ def _refresh_handoff(
     return mint_selection_handoff(
         predecessor_command=predecessor,
         predecessor_result=result,
-        successor_command=command,
+        successor_command=successor,
         source="selection_refresh",
-        expires_at=expires_at or datetime.now(UTC) + timedelta(seconds=30),
+        successor_worker_epoch=worker._epoch,
+        target_runtime_id_digest=runtime_id_digest(
+            worker._bindings[command.binding_id or ""].platform_conversation_id
+        ),
+        expires_at=expires_at or successor.deadline,
+        signing_key=worker._selection_handoff_signing_key,
     )
 
 
 def _with_handoff(command: WorkerCommand, handoff: SelectionHandoff) -> WorkerCommand:
-    return command.model_copy(update={"selection_handoff": handoff})
+    return command.model_copy(update={
+        "selection_handoff": handoff,
+        "deadline": handoff.successor_deadline,
+    })
 
 
 def _selecting_accessibility(fake) -> None:
@@ -1301,7 +1412,7 @@ def test_a_plain_command_cannot_shortcut_to_the_already_current_target() -> None
     assert "bubbles" not in fake.calls
     assert "write-composer" not in fake.calls
     assert "invoke-send" not in fake.calls
-    assert worker._trusted_current_binding_id is None
+    assert worker._trusted_operation_lease is None
 
 
 def test_valid_handoff_authorises_already_current_observe_without_selection() -> None:
@@ -1311,7 +1422,7 @@ def test_valid_handoff_authorises_already_current_observe_without_selection() ->
         AssertionError("a valid handoff must not perform a selection action")
     )
 
-    result = worker.execute(_with_handoff(command, _refresh_handoff(command)))
+    result = worker.execute(_with_handoff(command, _refresh_handoff(worker, command)))
 
     assert result.status is WorkerStatus.OK
     assert len(certifier.calls) == 1
@@ -1321,7 +1432,7 @@ def test_valid_handoff_authorises_already_current_observe_without_selection() ->
     assert "select" not in fake.calls
 
 
-def test_valid_handoff_establishes_trusted_current_for_that_binding_only() -> None:
+def test_valid_handoff_does_not_establish_generic_binding_trust() -> None:
     worker, fake, binding_id, certifier = _shortcut_worker()
     other = worker._bindings[binding_id].model_copy(update={
         "binding_id": "approved-binding-2",
@@ -1333,22 +1444,26 @@ def test_valid_handoff_establishes_trusted_current_for_that_binding_only() -> No
 
     first = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
     assert worker.execute(
-        _with_handoff(first, _refresh_handoff(first))
+        _with_handoff(first, _refresh_handoff(worker, first))
     ).status is WorkerStatus.OK
     assert len(certifier.calls) == 1
 
-    trusted = worker.execute(
+    _selecting_accessibility(fake)
+    fake.calls.clear()
+    repeated = worker.execute(
         WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
     )
-    assert trusted.status is WorkerStatus.OK
-    assert len(certifier.calls) == 2
+    assert repeated.status is WorkerStatus.FAILED_SAFE
+    assert repeated.error_code == "selection_process_refresh_required"
+    assert len(certifier.calls) == 1
+    assert "select" in fake.calls
+    assert "bubbles" not in fake.calls
 
-    _selecting_accessibility(fake)
     fake.calls.clear()
     other_result = worker.execute(
         WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=other.binding_id)
     )
-    assert len(certifier.calls) == 2
+    assert len(certifier.calls) == 1
     assert other_result.status is WorkerStatus.FAILED_SAFE
     assert other_result.error_code == "selection_process_refresh_required"
     assert "select" in fake.calls
@@ -1367,6 +1482,8 @@ def test_valid_handoff_establishes_trusted_current_for_that_binding_only() -> No
         {"source": "commit_success"},
         {"source_kind": WorkerKind.PREPARE},
         {"predecessor_worker_epoch": UUID(int=0)},
+        {"successor_worker_epoch": uuid4()},
+        {"target_runtime_id_digest": "d" * 64},
     ],
 )
 def test_cross_wired_handoffs_never_authorise_the_shortcut(mutation) -> None:
@@ -1375,7 +1492,7 @@ def test_cross_wired_handoffs_never_authorise_the_shortcut(mutation) -> None:
         kind=WorkerKind.OBSERVE, binding_id=binding_id,
         binding_revision=2, conversation_revision=3,
     )
-    handoff = _refresh_handoff(command).model_copy(update=mutation)
+    handoff = _refresh_handoff(worker, command).model_copy(update=mutation)
     _selecting_accessibility(fake)
 
     result = worker.execute(_with_handoff(command, handoff))
@@ -1386,14 +1503,14 @@ def test_cross_wired_handoffs_never_authorise_the_shortcut(mutation) -> None:
     assert "bubbles" not in fake.calls
     assert "write-composer" not in fake.calls
     assert "invoke-send" not in fake.calls
-    assert worker._trusted_current_binding_id is None
+    assert worker._trusted_operation_lease is None
 
 
 def test_expired_handoff_never_authorises_the_shortcut() -> None:
     worker, fake, binding_id, certifier = _shortcut_worker()
     command = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
     # Minted while valid, then observed after its expiry elapsed.
-    handoff = _refresh_handoff(command).model_copy(
+    handoff = _refresh_handoff(worker, command).model_copy(
         update={"expires_at": datetime.now(UTC) - timedelta(seconds=1)}
     )
     _selecting_accessibility(fake)
@@ -1409,7 +1526,7 @@ def test_expired_handoff_never_authorises_the_shortcut() -> None:
 def test_consumed_handoff_is_never_replayed_for_a_second_observe() -> None:
     worker, fake, binding_id, certifier = _shortcut_worker()
     command = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
-    command = _with_handoff(command, _refresh_handoff(command))
+    command = _with_handoff(command, _refresh_handoff(worker, command))
 
     assert worker.execute(command).status is WorkerStatus.OK
     assert len(certifier.calls) == 1
@@ -1425,7 +1542,7 @@ def test_consumed_handoff_is_never_replayed_for_a_second_observe() -> None:
 def test_handoff_is_spent_even_when_the_live_header_drifted() -> None:
     worker, fake, binding_id, certifier = _shortcut_worker(certified=None)
     command = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
-    command = _with_handoff(command, _refresh_handoff(command))
+    command = _with_handoff(command, _refresh_handoff(worker, command))
     _selecting_accessibility(fake)
 
     drifted = worker.execute(command)
@@ -1445,7 +1562,7 @@ def test_group_marker_identity_failure_with_handoff_fails_closed() -> None:
         certified=RuntimeError("group_marker_detected"),
     )
     command = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
-    command = _with_handoff(command, _refresh_handoff(command))
+    command = _with_handoff(command, _refresh_handoff(worker, command))
     fake.select_conversation = lambda *_args: (_ for _ in ()).throw(
         AssertionError("identity failure must not fall through to selection")
     )
@@ -1464,7 +1581,7 @@ def test_group_marker_identity_failure_with_handoff_fails_closed() -> None:
 def test_handoff_never_enters_the_worker_request_diagnostics() -> None:
     _worker_instance, _fake, binding_id, _certifier = _shortcut_worker()
     command = WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding_id)
-    handoff = _refresh_handoff(command)
+    handoff = _refresh_handoff(_worker_instance, command)
 
     diagnostics = QQVMWorkerProcess._request_metadata(_with_handoff(command, handoff))
     serialized = json.dumps(diagnostics, sort_keys=True)
@@ -1474,3 +1591,430 @@ def test_handoff_never_enters_the_worker_request_diagnostics() -> None:
     assert str(handoff.predecessor_request_id) not in serialized
     assert str(handoff.predecessor_worker_epoch) not in serialized
     assert handoff.expires_at.isoformat() not in serialized
+
+
+# --------------------------------------------------------------------------
+# Bounded adversarial coverage: a minted capability is welded to exactly one
+# successor request, and an uncorrelated child reply must retire the process.
+# --------------------------------------------------------------------------
+
+
+_PREPARE_TAMPER_CASES = (
+    "forged_auth_tag",
+    "request_text",
+    "token_text_sha256",
+    "request_segment_ref",
+    "token_segment_ref",
+    "request_deadline",
+    "token_successor_deadline",
+    "request_successor_request_id",
+)
+
+
+def _full_proof_worker():
+    """Shortcut worker whose certifier returns a complete stable-target proof.
+
+    ``_shortcut_worker`` proves the participant signature only, which is enough
+    for OBSERVE.  PREPARE and VERIFY additionally derive the prepared target
+    from the proof, so the stub must expose the same bounded identity fields
+    the real certifier returns.
+    """
+
+    worker, fake, binding_id, certifier = _shortcut_worker(certified=None)
+    binding = worker._bindings[binding_id]
+    certifier.outcome = SimpleNamespace(
+        participant_signature=binding.participant_signature,
+        conversation_type=(
+            "direct" if binding.conversation_type == "direct" else "unknown"
+        ),
+        process_id=fake.window.process_id,
+        window_handle=fake.window.window_handle,
+    )
+    return worker, fake, binding_id, certifier
+
+
+def _prepare_request(binding_id: str, *, text: str = "prepare-body-1") -> WorkerCommand:
+    return WorkerCommand(
+        kind=WorkerKind.PREPARE,
+        binding_id=binding_id,
+        operation_id=uuid4(),
+        text=text,
+        segment_ref="segment-1",
+        deadline=datetime.now(UTC) + timedelta(seconds=30),
+    )
+
+
+def _flip_handoff_auth_tag(handoff: SelectionHandoff) -> SelectionHandoff:
+    """Forge one nibble of a genuine tag without touching the signed payload."""
+
+    first = "0" if handoff.auth_tag[0] != "0" else "1"
+    return handoff.model_copy(update={"auth_tag": first + handoff.auth_tag[1:]})
+
+
+def _tampered_prepare_request(
+    command: WorkerCommand, handoff: SelectionHandoff, case: str,
+) -> WorkerCommand:
+    """One PREPARE request a post-mint adversary could present to the worker."""
+
+    if case == "forged_auth_tag":
+        return _with_handoff(command, _flip_handoff_auth_tag(handoff))
+    if case == "request_text":
+        return _with_handoff(
+            command.model_copy(update={"text": f"{command.text}-tampered"}), handoff
+        )
+    if case == "token_text_sha256":
+        return _with_handoff(
+            command, handoff.model_copy(update={"text_sha256": "f" * 64})
+        )
+    if case == "request_segment_ref":
+        return _with_handoff(
+            command.model_copy(update={"segment_ref": "segment-tampered"}), handoff
+        )
+    if case == "token_segment_ref":
+        return _with_handoff(
+            command, handoff.model_copy(update={"segment_ref": "segment-tampered"})
+        )
+    if case == "request_deadline":
+        # The token still carries the original deadline; only the request moved.
+        return _with_handoff(command, handoff).model_copy(
+            update={"deadline": handoff.successor_deadline + timedelta(seconds=5)}
+        )
+    if case == "token_successor_deadline":
+        later = handoff.successor_deadline + timedelta(seconds=5)
+        return _with_handoff(
+            command, handoff.model_copy(update={"successor_deadline": later})
+        )
+    if case == "request_successor_request_id":
+        return _with_handoff(
+            command.model_copy(update={"request_id": uuid4()}), handoff
+        )
+    raise AssertionError(f"unknown tamper case {case!r}")
+
+
+@pytest.mark.parametrize("tamper", _PREPARE_TAMPER_CASES)
+def test_prepare_handoff_tampering_after_mint_fails_closed_without_authority(
+    tamper: str,
+) -> None:
+    worker, fake, binding_id, certifier = _full_proof_worker()
+    command = _prepare_request(binding_id)
+    handoff = _refresh_handoff(worker, command)
+
+    result = worker.execute(_tampered_prepare_request(command, handoff, tamper))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_handoff_invalid"
+    assert certifier.calls == []
+    assert "select" not in fake.calls
+    assert "bubbles" not in fake.calls
+    assert "write-composer" not in fake.calls
+    assert "invoke-send" not in fake.calls
+    assert fake.composer == ""
+    assert fake.bubbles == []
+    assert worker._prepared == {}
+    assert worker._reservation is None
+    assert worker._trusted_operation_lease is None
+    diagnostics = json.dumps(result.evidence, sort_keys=True)
+    assert command.text not in diagnostics
+    assert f"{command.text}-tampered" not in diagnostics
+    assert str(handoff.handoff_id) not in diagnostics
+    assert handoff.auth_tag not in diagnostics
+
+
+def test_valid_prepare_handoff_remains_the_only_shortcut_authority() -> None:
+    worker, fake, binding_id, certifier = _full_proof_worker()
+    command = _prepare_request(binding_id)
+    command = _with_handoff(command, _refresh_handoff(worker, command))
+    fake.select_conversation = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("a valid PREPARE handoff must never select")
+    )
+
+    result = worker.execute(command)
+
+    assert result.status is WorkerStatus.OK
+    assert result.error_code is None
+    assert len(certifier.calls) == 1
+    assert "bubbles" in fake.calls
+    assert "write-composer" in fake.calls
+    assert "invoke-send" not in fake.calls
+    assert "select" not in fake.calls
+    assert fake.composer == command.text
+    assert worker._prepared[command.operation_id]["composer_text"] == command.text
+    assert worker._reservation == command.operation_id
+    assert worker._trusted_operation_lease == (
+        command.operation_id,
+        binding_id,
+        command.binding_revision,
+        command.conversation_revision,
+    )
+
+
+def _verify_request(
+    binding_id: str, evidence: PreparedVerificationEvidence,
+) -> WorkerCommand:
+    return WorkerCommand(
+        kind=WorkerKind.VERIFY,
+        binding_id=binding_id,
+        binding_revision=2,
+        conversation_revision=3,
+        operation_id=uuid4(),
+        prepared_evidence=evidence,
+        deadline=datetime.now(UTC) + timedelta(seconds=30),
+    )
+
+
+def _commit_success_handoff(worker, verify_command: WorkerCommand) -> SelectionHandoff:
+    """Mint the commit-success authority issued to a fresh VERIFY successor."""
+
+    predecessor = WorkerCommand(
+        kind=WorkerKind.COMMIT,
+        binding_id=verify_command.binding_id,
+        binding_revision=verify_command.binding_revision,
+        conversation_revision=verify_command.conversation_revision,
+        operation_id=verify_command.operation_id,
+        deadline=verify_command.deadline,
+    )
+    result = WorkerResult(
+        request_id=predecessor.request_id,
+        kind=predecessor.kind,
+        status=WorkerStatus.OK,
+        worker_epoch=uuid4(),
+        operation_id=predecessor.operation_id,
+        binding_id=predecessor.binding_id,
+        binding_revision=predecessor.binding_revision,
+        conversation_revision=predecessor.conversation_revision,
+    )
+    return worker.mint_selection_handoff(
+        predecessor_command=predecessor,
+        predecessor_result=result,
+        successor_command=verify_command,
+        source="commit_success",
+        successor_worker_epoch=worker._epoch,
+        target_runtime_id_digest=runtime_id_digest(
+            worker._bindings[verify_command.binding_id or ""].platform_conversation_id
+        ),
+        expires_at=verify_command.deadline,
+    )
+
+
+def _bubble_anchors(bubbles) -> tuple[PreparedBubbleAnchor, ...]:
+    return tuple(
+        PreparedBubbleAnchor(
+            direction=item.direction.value,
+            message_key=item.message_key,
+            conversation_internal_id=item.conversation_internal_id,
+            text_hash=item.text_hash,
+        )
+        for item in bubbles
+    )
+
+
+def _prepared_evidence(
+    binding, fake, *, text: str, before_bubbles: tuple[PreparedBubbleAnchor, ...],
+) -> PreparedVerificationEvidence:
+    return PreparedVerificationEvidence(
+        owner_binding_id=binding.binding_id,
+        target_identity=PreparedTargetIdentity(
+            binding_id=binding.binding_id,
+            participant_signature=binding.participant_signature,
+            conversation_type=(
+                "direct" if binding.conversation_type == "direct" else "unknown"
+            ),
+            process_id=fake.window.process_id,
+            window_handle=fake.window.window_handle,
+        ),
+        before_bubbles=before_bubbles,
+        text_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        segment_ref="segment-1",
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"text_hash": "f" * 64},
+        {"segment_ref": "segment-2"},
+        {"before_bubbles": ()},
+    ],
+    ids=["text_hash", "segment_ref", "before_bubbles"],
+)
+def test_verify_evidence_changed_after_mint_fails_closed(change) -> None:
+    worker, fake, binding_id, certifier = _full_proof_worker()
+    binding = worker._bindings[binding_id]
+    anchored = (
+        PreparedBubbleAnchor(
+            direction="inbound",
+            message_key="incoming-1",
+            conversation_internal_id=fake.conversations[0].internal_id,
+            text_hash="b" * 64,
+        ),
+    )
+    original = _prepared_evidence(
+        binding, fake, text="verify-body-1", before_bubbles=anchored,
+    )
+    verify = _verify_request(binding_id, original)
+    handoff = _commit_success_handoff(worker, verify)
+    changed = original.model_copy(update=change)
+    assert changed != original
+
+    result = worker.execute(
+        _with_handoff(verify.model_copy(update={"prepared_evidence": changed}), handoff)
+    )
+
+    assert result.status is WorkerStatus.UNCERTAIN
+    assert result.error_code == "selection_handoff_invalid"
+    assert "receipt" not in result.evidence
+    assert certifier.calls == []
+    assert "select" not in fake.calls
+    assert "bubbles" not in fake.calls
+    assert "write-composer" not in fake.calls
+    assert "invoke-send" not in fake.calls
+    assert worker._prepared == {}
+    assert worker._reservation is None
+    assert worker._trusted_operation_lease is None
+    diagnostics = json.dumps(result.evidence, sort_keys=True)
+    assert "verify-body-1" not in diagnostics
+    assert str(handoff.handoff_id) not in diagnostics
+
+
+def test_valid_commit_success_handoff_reads_the_exact_receipt_without_sending() -> None:
+    worker, fake, binding_id, certifier = _full_proof_worker()
+    binding = worker._bindings[binding_id]
+    fake.bubbles = [
+        QQBubble(
+            conversation_internal_id=fake.conversations[0].internal_id,
+            message_key="incoming-1",
+            direction=BubbleDirection.INBOUND,
+            text="incoming one",
+            observed_at=datetime.now(UTC),
+            tree_digest=fake.digest,
+        )
+    ]
+    evidence = _prepared_evidence(
+        binding, fake, text="verify-body-1",
+        before_bubbles=_bubble_anchors(fake.bubbles),
+    )
+    verify = _verify_request(binding_id, evidence)
+    command = _with_handoff(verify, _commit_success_handoff(worker, verify))
+    fake.select_conversation = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("a valid VERIFY handoff must never select")
+    )
+    fake.bubbles.append(QQBubble(
+        conversation_internal_id=fake.conversations[0].internal_id,
+        message_key="out-0",
+        direction=BubbleDirection.OUTBOUND,
+        text="verify-body-1",
+        observed_at=datetime.now(UTC) + timedelta(seconds=1),
+        tree_digest=fake.digest,
+    ))
+
+    result = worker.execute(command)
+
+    assert result.status is WorkerStatus.OK
+    assert len(certifier.calls) == 1
+    assert "select" not in fake.calls
+    assert "write-composer" not in fake.calls
+    assert "invoke-send" not in fake.calls
+    receipt = result.evidence["receipt"]
+    assert receipt["message_key"] == "out-0"
+    assert receipt["direction"] == "outbound"
+    assert result.evidence["operation_id"] == str(command.operation_id)
+    assert worker._reservation is None
+    assert worker._trusted_operation_lease is None
+
+
+# Each mutation makes the child reply disagree with its request in exactly one
+# correlated field; the parent may never adopt the reply as a usable outcome.
+_PROCESS_RESPONSE_MISMATCHES = {
+    "request_id": lambda command, response: response.model_copy(
+        update={"request_id": uuid4()}
+    ),
+    "kind": lambda command, response: response.model_copy(
+        update={"kind": WorkerKind.HEALTH}
+    ),
+    "binding_id": lambda command, response: response.model_copy(
+        update={"binding_id": "other-binding"}
+    ),
+    "binding_revision": lambda command, response: response.model_copy(
+        update={"binding_revision": command.binding_revision + 1}
+    ),
+    "conversation_revision": lambda command, response: response.model_copy(
+        update={"conversation_revision": command.conversation_revision + 1}
+    ),
+    "operation_id": lambda command, response: response.model_copy(
+        update={"operation_id": uuid4()}
+    ),
+    "ok_with_zero_worker_epoch": lambda command, response: response.model_copy(
+        update={"status": WorkerStatus.OK, "worker_epoch": UUID(int=0)}
+    ),
+}
+
+
+@pytest.mark.parametrize("mismatch", tuple(_PROCESS_RESPONSE_MISMATCHES))
+def test_process_terminates_and_fails_uncertain_on_mismatched_child_response(
+    mismatch: str,
+) -> None:
+    command = WorkerCommand(
+        kind=WorkerKind.OBSERVE,
+        binding_id="approved-binding-1",
+        binding_revision=2,
+        conversation_revision=3,
+        operation_id=uuid4(),
+    )
+    response = WorkerResult(
+        request_id=command.request_id,
+        kind=WorkerKind.OBSERVE,
+        status=WorkerStatus.OK,
+        worker_epoch=uuid4(),
+        operation_id=command.operation_id,
+        binding_id=command.binding_id,
+        binding_revision=command.binding_revision,
+        conversation_revision=command.conversation_revision,
+        evidence={"target_label": "must-not-appear"},
+    )
+    mismatched = _PROCESS_RESPONSE_MISMATCHES[mismatch](command, response)
+    assert mismatched != response
+
+    class Process:
+        pid = 93
+        exitcode = None
+
+        def __init__(self) -> None:
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.alive = False
+            self.exitcode = -15
+
+        def join(self, _timeout):
+            pass
+
+    class Pipe:
+        def send(self, _value):
+            pass
+
+        def poll(self, _timeout):
+            return True
+
+        def recv(self):
+            return mismatched.model_dump(mode="json")
+
+    process = Process()
+    facade = _process_facade(process, Pipe())
+
+    result = facade.request(command, 1)
+    snapshot = facade.status_snapshot()
+
+    assert result.status is WorkerStatus.UNCERTAIN
+    assert result.error_code == "worker_response_mismatch"
+    assert result.worker_epoch == UUID(int=0)
+    assert result.evidence == {}
+    assert process.alive is False
+    assert snapshot["worker_alive"] is False
+    assert snapshot["parent_terminate_reason"] == "response_mismatch"
+    terminal = snapshot["first_terminal_failure"]
+    assert terminal["error_code"] == "worker_response_mismatch"
+    assert terminal["request_id"] == str(command.request_id)
+    assert "must-not-appear" not in json.dumps(snapshot, sort_keys=True)

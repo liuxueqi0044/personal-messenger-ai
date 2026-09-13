@@ -7,6 +7,7 @@ from .contracts import (
     WorkerResult,
     WorkerStatus,
     mint_selection_handoff,
+    verify_selection_handoff_auth,
 )
 from .transport import WindowsUIAQQAccessibility
 from .worker import QQVMWorker, QQVMWorkerProcess
@@ -35,6 +36,7 @@ __all__ = [
     "WorkerStatus",
     "SelectionHandoff",
     "mint_selection_handoff",
+    "verify_selection_handoff_auth",
     "ConversationSelectionActuator",
     "ConversationSelectionOutcome",
     "ConversationSelectionStatus",

@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from ctypes import wintypes
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from messenger_ai.adapters.qq.models import (
     QQBubble,
@@ -40,7 +40,18 @@ from .guest_composer import (
 )
 from .message_decoder import decode_message_region
 from .phase_index import UIAPhaseIndex
-from .visual_selection import ScreenRect, VisualRowFrame
+from .visual_selection import (
+    QQ_VM_ROW_PALETTE_PROFILE,
+    ConversationRowPaletteProfile,
+    RowBorderSample,
+    RowPaletteSummary,
+    ScreenRect,
+    SelectionVisualAttestation,
+    VisualRowFrame,
+    classify_row_border,
+    runtime_id_digest,
+    summarize_border_pixels,
+)
 
 
 class UIAUnavailable(RuntimeError):
@@ -63,6 +74,33 @@ _SM_YVIRTUALSCREEN = 77
 _SM_CXVIRTUALSCREEN = 78
 _SM_CYVIRTUALSCREEN = 79
 _GA_ROOT = 2
+
+# A neutral hover point keeps this distance from every conversation row so the
+# pointer cannot leave a leftover hover highlight on an adjacent row.  It is
+# also clamped to the guest virtual screen: a maximized window reports a
+# ``GetWindowRect`` inflated by its invisible resize border, so window-local
+# corners can fall off the visible desktop even though ``WindowFromPoint``
+# still resolves them to the QQ HWND.
+_NEUTRAL_HOVER_MARGIN = 3
+
+
+class _ConversationRowRef(NamedTuple):
+    """One enumerated conversation row bound to its runtime locator and rect."""
+
+    internal_id: str
+    item: Any
+    rect: ScreenRect
+
+
+def _check_selection_deadline(deadline: datetime | None) -> None:
+    """Fail closed as soon as a bounded selection proof runs out of time."""
+
+    if deadline is None:
+        return
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise ValueError("selection deadline must be timezone-aware")
+    if datetime.now(UTC) >= deadline:
+        raise RuntimeError("deadline_expired")
 
 
 class _MouseInput(ctypes.Structure):
@@ -385,6 +423,357 @@ class WindowsUIAQQAccessibility:
             raise UIAUnavailable("visual row mouse input was incomplete")
         return True
 
+    def certify_conversation_selected_visual(
+        self,
+        window: QQWindow,
+        conversation: QQConversation,
+        selector: QQSelector,
+        profile: ConversationRowPaletteProfile = QQ_VM_ROW_PALETTE_PROFILE,
+        *,
+        deadline: datetime | None = None,
+    ) -> SelectionVisualAttestation:
+        """Prove one exact conversation row is the selected row, locally.
+
+        The proof is deterministic, fail-closed and content-free: it samples
+        only the border band of already-located rows, requires exactly one
+        selected row (the runtime-``internal_id`` target) plus at least two
+        unselected control rows, and succeeds only after two consecutive
+        identical, fully classified samples.  No vision model, PNG bytes, chat
+        text, row text or window title is produced, returned or persisted.
+        """
+
+        if not isinstance(profile, ConversationRowPaletteProfile):
+            raise TypeError("a conversation row palette profile is required")
+        if selector.name != "conversation_item":
+            raise UIAUnavailable("conversation selection selector is not certified")
+        if getattr(self, "_active_phase", None) is not None:
+            raise RuntimeError(
+                "visual selection certification cannot retain a UIA read phase"
+            )
+        _check_selection_deadline(deadline)
+        foreground_timeout = profile.foreground_timeout_seconds
+        if deadline is not None:
+            foreground_timeout = min(
+                foreground_timeout,
+                max(0.0, (deadline - datetime.now(UTC)).total_seconds()),
+            )
+            _check_selection_deadline(deadline)
+        self.ensure_guest_foreground(
+            window, timeout_seconds=foreground_timeout
+        )
+        _check_selection_deadline(deadline)
+        rows = self._visible_conversation_rows(window, selector)
+        if not rows:
+            raise UIAUnavailable("no visible conversation rows were enumerated")
+        target_id = conversation.internal_id
+        if sum(1 for ref in rows if ref.internal_id == target_id) != 1:
+            raise UIAUnavailable(
+                "conversation target is absent or ambiguous in the visible rows"
+            )
+        bounds = self._window_screen_bounds(window)
+        row_rects = {ref.internal_id: ref.rect for ref in rows}
+        for ref in rows:
+            rect = ref.rect
+            if (
+                abs(rect.width - profile.row_width) > profile.geometry_tolerance
+                or abs(rect.height - profile.row_height) > profile.geometry_tolerance
+            ):
+                raise UIAUnavailable(
+                    "conversation row geometry does not match the certified profile"
+                )
+            if not (
+                bounds[0] <= rect.left < rect.right <= bounds[2]
+                and bounds[1] <= rect.top < rect.bottom <= bounds[3]
+            ):
+                raise UIAUnavailable(
+                    "conversation row crop left the certified QQ window"
+                )
+            if not all(
+                self._point_belongs_to_window(window, x, y)
+                for x, y in self._row_capture_points(rect)
+            ):
+                raise UIAUnavailable(
+                    "conversation rows are not all inside one certified QQ window"
+                )
+        neutral = self._neutral_hover_point(window, rows, bounds)
+        _check_selection_deadline(deadline)
+
+        previous_key: tuple[object, ...] | None = None
+        consecutive = 0
+        sample_count = 0
+        while True:
+            if sample_count >= profile.max_samples:
+                raise UIAUnavailable(
+                    "conversation selection sampling exhausted its bounded budget"
+                )
+            _check_selection_deadline(deadline)
+            sample_count += 1
+            # Clear any hover highlight before every sample: a hovered row is
+            # indistinguishable from a selected row by ratio alone.
+            self._send_guest_mouse_move(*neutral)
+            if profile.hover_settle_seconds > 0:
+                time.sleep(profile.hover_settle_seconds)
+            _check_selection_deadline(deadline)
+            if self._window_screen_bounds(window) != bounds:
+                raise UIAUnavailable(
+                    "certified QQ window changed during selection certification"
+                )
+            current = self._visible_conversation_rows(window, selector)
+            if [ref.internal_id for ref in current] != [
+                ref.internal_id for ref in rows
+            ]:
+                raise UIAUnavailable(
+                    "conversation row set changed during selection certification"
+                )
+            for ref in current:
+                if ref.rect != row_rects[ref.internal_id]:
+                    raise UIAUnavailable(
+                        "conversation row geometry changed during selection certification"
+                    )
+
+            selected_ids: list[str] = []
+            unselected_ids: list[str] = []
+            summaries: dict[str, RowBorderSample] = {}
+            key_parts: list[tuple[object, ...]] = []
+            for ref in current:
+                sample = self._sample_row_border(window, ref, profile)
+                state = classify_row_border(sample, profile)
+                if state == "hover":
+                    raise UIAUnavailable(
+                        "a conversation row reports the hover palette"
+                    )
+                if state == "unknown":
+                    raise UIAUnavailable(
+                        "a conversation row border palette is unrecognized"
+                    )
+                if state == "selected":
+                    selected_ids.append(ref.internal_id)
+                else:
+                    unselected_ids.append(ref.internal_id)
+                summaries[ref.internal_id] = sample
+                key_parts.append(
+                    (
+                        ref.internal_id,
+                        state,
+                        sample.pixel_count,
+                        sample.dominant_rgb,
+                        sample.dominant_count,
+                        sample.unique_count,
+                    )
+                )
+
+            if len(selected_ids) > 1:
+                raise UIAUnavailable(
+                    "more than one conversation row reports the selected palette"
+                )
+            if not selected_ids:
+                # The asynchronous row switch has not committed yet; keep the
+                # bounded poll running until it settles or the budget expires.
+                previous_key, consecutive = None, 0
+                time.sleep(profile.poll_interval_seconds)
+                continue
+            if selected_ids[0] != target_id:
+                raise UIAUnavailable("a different conversation row is selected")
+            if len(unselected_ids) < profile.min_unselected_control_rows:
+                raise UIAUnavailable(
+                    "too few unselected control rows to certify selection"
+                )
+
+            key = tuple(key_parts)
+            consecutive = consecutive + 1 if key == previous_key else 1
+            previous_key = key
+            if consecutive >= profile.stable_samples:
+                return SelectionVisualAttestation(
+                    profile_id=profile.profile_id,
+                    client_version=profile.client_version,
+                    selector_pack_version=profile.selector_pack_version,
+                    environment_fingerprint=profile.environment_fingerprint,
+                    process_id=window.process_id,
+                    window_handle=window.window_handle,
+                    target_runtime_id_digest=runtime_id_digest(target_id),
+                    row_rect=row_rects[target_id],
+                    sample_count=sample_count,
+                    stable_sample_count=consecutive,
+                    unselected_control_count=len(unselected_ids),
+                    selected=RowPaletteSummary.from_sample(summaries[target_id]),
+                    unselected=RowPaletteSummary.from_sample(
+                        summaries[unselected_ids[0]]
+                    ),
+                )
+            time.sleep(profile.poll_interval_seconds)
+
+    def _visible_conversation_rows(
+        self, window: QQWindow, selector: QQSelector
+    ) -> list[_ConversationRowRef]:
+        """Re-enumerate every visible conversation row with its runtime locator."""
+
+        if selector.name != "conversation_item":
+            raise UIAUnavailable("conversation selection selector is not certified")
+        refs: list[_ConversationRowRef] = []
+        for item in self._select(self._window(window), selector):
+            if bool(self._property(item, "IsOffscreen", True)):
+                continue
+            internal_id = self._conversation_id(item)
+            if not internal_id:
+                continue
+            refs.append(_ConversationRowRef(internal_id, item, self._row_screen_rect(item)))
+        return refs
+
+    def _sample_row_border(
+        self,
+        window: QQWindow,
+        ref: _ConversationRowRef,
+        profile: ConversationRowPaletteProfile,
+    ) -> RowBorderSample:
+        """Capture one row locally and reduce it to content-free palette stats."""
+
+        rect = ref.rect
+        try:
+            bgra = self._capture_row_bgra(window, rect)
+            return summarize_border_pixels(
+                bgra,
+                width=rect.width,
+                height=rect.height,
+                inset=profile.border_inset,
+            )
+        except UIAUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - capture must fail closed
+            raise UIAUnavailable("conversation row palette sampling failed") from exc
+
+    def _capture_row_bgra(self, window: QQWindow, rect: ScreenRect) -> bytes:
+        return self._capture_exact_window_row_bgra(window, rect)
+
+    def _window_screen_bounds(self, window: QQWindow) -> tuple[int, int, int, int]:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(_Rect))
+        user32.GetWindowRect.restype = wintypes.BOOL
+        window_rect = _Rect()
+        if not user32.GetWindowRect(window.window_handle, ctypes.byref(window_rect)):
+            raise UIAUnavailable("certified QQ window geometry is unavailable")
+        return (
+            int(window_rect.left),
+            int(window_rect.top),
+            int(window_rect.right),
+            int(window_rect.bottom),
+        )
+
+    def _neutral_hover_point(
+        self,
+        window: QQWindow,
+        rows: list[_ConversationRowRef],
+        bounds: tuple[int, int, int, int],
+    ) -> tuple[int, int]:
+        """Pick a deterministic same-HWND point that hovers no conversation row.
+
+        The candidate band is the certified QQ window intersected with the
+        guest virtual screen.  Clamping here is what keeps the point inside
+        the exact-HWND virtual-screen guard that ``_send_guest_mouse_move``
+        enforces at send time; without it a maximized window's invisible
+        resize border pushes every corner candidate off the visible desktop.
+        Any point that cannot satisfy both constraints fails closed.
+        """
+
+        vx, vy, width, height = self._virtual_screen_metrics()
+        if width <= 1 or height <= 1:
+            raise UIAUnavailable(
+                "no neutral hover point is available inside the certified QQ window"
+            )
+        window_left, window_top, window_right, window_bottom = bounds
+        left = max(window_left, vx)
+        top = max(window_top, vy)
+        right = min(window_right, vx + width)
+        bottom = min(window_bottom, vy + height)
+        inner_left, inner_top = left + 2, top + 2
+        inner_right, inner_bottom = right - 3, bottom - 3
+        if inner_right <= inner_left or inner_bottom <= inner_top:
+            raise UIAUnavailable(
+                "certified QQ window is too small for a neutral hover point"
+            )
+        blocked = [
+            (
+                ref.rect.left - _NEUTRAL_HOVER_MARGIN,
+                ref.rect.top - _NEUTRAL_HOVER_MARGIN,
+                ref.rect.right + _NEUTRAL_HOVER_MARGIN,
+                ref.rect.bottom + _NEUTRAL_HOVER_MARGIN,
+            )
+            for ref in rows
+        ]
+        middle_x = (inner_left + inner_right) // 2
+        candidates = (
+            (inner_right, inner_top),
+            (inner_right, inner_bottom),
+            (inner_left, inner_top),
+            (inner_left, inner_bottom),
+            (middle_x, inner_top),
+            (middle_x, inner_bottom),
+        )
+        for x, y in candidates:
+            if not (vx <= x < vx + width and vy <= y < vy + height):
+                continue
+            if any(
+                block[0] <= x < block[2] and block[1] <= y < block[3]
+                for block in blocked
+            ):
+                continue
+            if self._point_belongs_to_window(window, x, y):
+                return (x, y)
+        raise UIAUnavailable(
+            "no neutral hover point is available inside the certified QQ window"
+        )
+
+    @staticmethod
+    def _virtual_screen_metrics() -> tuple[int, int, int, int]:
+        """Return the guest virtual screen as ``(left, top, width, height)``."""
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        return (
+            int(user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)),
+            int(user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)),
+            int(user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)),
+            int(user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)),
+        )
+
+    @staticmethod
+    def _send_guest_mouse_move(x: int, y: int) -> None:
+        """Move the guest pointer without clicking, to clear any row hover."""
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.SendInput.argtypes = (
+            wintypes.UINT,
+            ctypes.POINTER(_Input),
+            ctypes.c_int,
+        )
+        user32.SendInput.restype = wintypes.UINT
+        vx, vy, width, height = WindowsUIAQQAccessibility._virtual_screen_metrics()
+        if width <= 1 or height <= 1 or not (
+            vx <= x < vx + width and vy <= y < vy + height
+        ):
+            raise UIAUnavailable(
+                "neutral hover point is outside the guest virtual screen"
+            )
+        nx = round((x - vx) * 65535 / (width - 1))
+        ny = round((y - vy) * 65535 / (height - 1))
+        events = (_Input * 1)(
+            _Input(
+                _INPUT_MOUSE,
+                _InputUnion(mi=_MouseInput(
+                    nx,
+                    ny,
+                    0,
+                    _MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_VIRTUALDESK,
+                    0,
+                    0,
+                )),
+            ),
+        )
+        if int(user32.SendInput(1, events, ctypes.sizeof(_Input))) != 1:
+            raise UIAUnavailable("hover-clearing mouse move was incomplete")
+
     def _visual_row_target(
         self, window: QQWindow, conversation: QQConversation, selector: QQSelector
     ) -> Any:
@@ -504,6 +893,13 @@ class WindowsUIAQQAccessibility:
     def _capture_exact_window_row(window: QQWindow, rect: ScreenRect) -> bytes:
         """Capture one visible, exact-HWND row and encode PNG without dependencies."""
 
+        bgra = WindowsUIAQQAccessibility._capture_exact_window_row_bgra(window, rect)
+        return _encode_bgra_png(rect.width, rect.height, bgra)
+
+    @staticmethod
+    def _capture_exact_window_row_bgra(window: QQWindow, rect: ScreenRect) -> bytes:
+        """Capture one visible, exact-HWND row as raw top-down BGRA pixels."""
+
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
         user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(_Rect))
@@ -600,7 +996,7 @@ class WindowsUIAQQAccessibility:
             ):
                 raise UIAUnavailable("conversation row exact-HWND capture failed")
             bgra = ctypes.string_at(bits, rect.width * rect.height * 4)
-            return _encode_bgra_png(rect.width, rect.height, bgra)
+            return bgra
         finally:
             if old_bitmap:
                 gdi32.SelectObject(memory_dc, old_bitmap)

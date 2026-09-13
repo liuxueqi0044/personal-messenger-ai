@@ -14,6 +14,7 @@ from messenger_ai.adapters.qq.vm_driver.contracts import (
     WorkerKind,
     WorkerResult,
     WorkerStatus,
+    mint_selection_handoff,
 )
 from messenger_ai.adapters.qq.vm_driver.message_cursor import MessageCursorStore
 
@@ -583,6 +584,12 @@ class _CaptureWorker:
     def status_snapshot(self) -> dict[str, object]:
         return {"worker_alive": self.alive}
 
+    def mint_selection_handoff(self, **kwargs):
+        return mint_selection_handoff(
+            **kwargs,
+            signing_key=b"cursor-reanchor-test-signing-key!!",
+        )
+
 
 def _worker_result(
     status: WorkerStatus,
@@ -732,7 +739,7 @@ def test_capture_handoff_is_exactly_bound_and_private(
     tokens = [
         command.selection_handoff
         for worker in (first_worker, second_worker)
-        for command in worker
+        for command in worker.commands
         if command.selection_handoff is not None
     ]
     assert tokens == [handoff]
@@ -781,3 +788,115 @@ def test_capture_does_not_retry_unavailable_selection_refresh(
         for worker in _CaptureWorker.instances
         for command in worker.commands
     )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        {"request_id": uuid4()},
+        {"kind": WorkerKind.OBSERVE},
+        {"binding_id": "binding-leak"},
+        {"binding_revision": 1},
+        {"conversation_revision": 1},
+        {"operation_id": uuid4()},
+        {"status": WorkerStatus.UNCERTAIN},
+        {"worker_epoch": UUID(int=0)},
+    ],
+)
+def test_capture_rejects_uncorrelated_initial_health(
+    monkeypatch: pytest.MonkeyPatch, corruption: dict[str, object],
+) -> None:
+    class CorruptHealthWorker:
+        def __init__(self, *args, **kwargs) -> None:
+            self.alive = False
+            self.commands: list[WorkerCommand] = []
+
+        def start(self) -> None:
+            self.alive = True
+
+        def request(self, command, timeout_seconds):
+            del timeout_seconds
+            self.commands.append(command)
+            assert command.kind is WorkerKind.HEALTH
+            return WorkerResult(
+                request_id=command.request_id, kind=command.kind,
+                status=WorkerStatus.OK, worker_epoch=uuid4(),
+            ).model_copy(update=corruption)
+
+        def stop(self) -> None:
+            self.alive = False
+
+        def status_snapshot(self) -> dict[str, object]:
+            return {"worker_alive": self.alive}
+
+    monkeypatch.setattr(MODULE, "QQVMWorkerProcess", CorruptHealthWorker)
+
+    with pytest.raises(RuntimeError, match="CURSOR_REANCHOR_WORKER_HEALTH_FAILED"):
+        MODULE._capture_current_bubbles(
+            pack=object(), bindings=(_binding(),), evidence=(), binding=_binding(),
+            state={"binding_revision": 1, "conversation_revision": 4},
+            timeout_seconds=5,
+        )
+
+
+def test_capture_rejects_uncorrelated_successor_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScriptedWorker:
+        instances: ClassVar[list["ScriptedWorker"]] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.index = len(ScriptedWorker.instances)
+            ScriptedWorker.instances.append(self)
+            self.alive = False
+            self.commands: list[WorkerCommand] = []
+
+        def start(self) -> None:
+            self.alive = True
+
+        def request(self, command, timeout_seconds):
+            del timeout_seconds
+            self.commands.append(command)
+            if command.kind is WorkerKind.HEALTH:
+                result = WorkerResult(
+                    request_id=command.request_id, kind=command.kind,
+                    status=WorkerStatus.OK, worker_epoch=uuid4(),
+                )
+                if self.index == 1:
+                    # The successor answers a correlated probe but with a
+                    # binding revision of its own, so it must never activate.
+                    result = result.model_copy(update={"binding_revision": 1})
+                return result
+            if command.kind is WorkerKind.OBSERVE and self.index == 0:
+                return WorkerResult(
+                    request_id=command.request_id, kind=command.kind,
+                    operation_id=command.operation_id, binding_id=command.binding_id,
+                    binding_revision=command.binding_revision,
+                    conversation_revision=command.conversation_revision,
+                    status=WorkerStatus.FAILED_SAFE, worker_epoch=uuid4(),
+                    error_code="selection_process_refresh_required",
+                )
+            raise AssertionError("unexpected worker command")
+
+        def stop(self) -> None:
+            self.alive = False
+
+        def status_snapshot(self) -> dict[str, object]:
+            return {"worker_alive": self.alive}
+
+    monkeypatch.setattr(MODULE, "QQVMWorkerProcess", ScriptedWorker)
+
+    with pytest.raises(RuntimeError, match="CURSOR_REANCHOR_WORKER_HEALTH_FAILED"):
+        MODULE._capture_current_bubbles(
+            pack=object(), bindings=(_binding(),), evidence=(), binding=_binding(),
+            state={"binding_revision": 1, "conversation_revision": 4},
+            timeout_seconds=5,
+        )
+
+    first, successor = ScriptedWorker.instances
+    assert [item.kind for item in first.commands] == [
+        WorkerKind.HEALTH, WorkerKind.OBSERVE,
+    ]
+    # The successor never receives the retried OBSERVE.
+    assert [item.kind for item in successor.commands] == [WorkerKind.HEALTH]
+    assert successor.status_snapshot()["worker_alive"] is False

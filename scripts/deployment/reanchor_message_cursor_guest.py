@@ -13,17 +13,19 @@ import json
 import os
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from messenger_ai.adapters.qq.vm_driver.contracts import (
     WorkerCommand,
     WorkerKind,
+    WorkerResult,
     WorkerStatus,
 )
 from messenger_ai.adapters.qq.vm_driver.message_cursor import MessageCursorStore
+from messenger_ai.adapters.qq.vm_driver.visual_selection import runtime_id_digest
 from messenger_ai.adapters.qq.vm_driver.worker import QQVMWorkerProcess
 from messenger_ai.runtime.settlement import verify_terminal_settlement
 
@@ -327,6 +329,27 @@ def _verified_send_proof(
     return int(segment[1]) == 1
 
 
+def _health_is_correlated(command: WorkerCommand, result: Any) -> bool:
+    """Accept only the exact HEALTH probe answered by a live worker epoch.
+
+    A HEALTH result may authorize the successor process, so status alone is
+    never sufficient: the request id, kind, empty binding/operation scope, zero
+    revisions and a nonzero worker epoch must all name this probe.
+    """
+
+    return bool(
+        isinstance(result, WorkerResult)
+        and result.status is WorkerStatus.OK
+        and result.request_id == command.request_id
+        and result.kind is WorkerKind.HEALTH
+        and result.binding_id is None
+        and result.binding_revision == 0
+        and result.conversation_revision == 0
+        and result.operation_id is None
+        and result.worker_epoch != UUID(int=0)
+    )
+
+
 def _capture_current_bubbles(
     *, 
     pack: Any,
@@ -336,6 +359,11 @@ def _capture_current_bubbles(
     state: dict[str, Any],
     timeout_seconds: float,
 ) -> list[dict[str, object]]:
+    deadline = datetime.now(UTC) + timedelta(seconds=timeout_seconds)
+
+    def remaining_seconds() -> float:
+        return max(0.0, (deadline - datetime.now(UTC)).total_seconds())
+
     def start_worker() -> QQVMWorkerProcess:
         worker = QQVMWorkerProcess(
             pack, bindings, session_evidence=evidence, run_id=str(uuid4())
@@ -354,31 +382,68 @@ def _capture_current_bubbles(
         if status.get("worker_alive") is not False:
             raise RuntimeError("CURSOR_REANCHOR_WORKER_NOT_RETIRED")
 
-    def observe(worker: QQVMWorkerProcess) -> Any:
-        health = worker.request(WorkerCommand(kind=WorkerKind.HEALTH), timeout_seconds)
-        if health.status is not WorkerStatus.OK:
+    def probe_health(worker: QQVMWorkerProcess) -> Any:
+        remaining = remaining_seconds()
+        if remaining <= 0:
+            raise RuntimeError("CURSOR_REANCHOR_OBSERVE_DEADLINE_EXPIRED")
+        command = WorkerCommand(kind=WorkerKind.HEALTH, deadline=deadline)
+        health = worker.request(command, remaining)
+        if not _health_is_correlated(command, health):
             raise RuntimeError("CURSOR_REANCHOR_WORKER_HEALTH_FAILED")
-        return worker.request(
-            WorkerCommand(
+        return health
+
+    def observe(
+        worker: QQVMWorkerProcess,
+        command: WorkerCommand | None = None,
+    ) -> tuple[WorkerCommand, Any]:
+        observe_command = command or WorkerCommand(
                 kind=WorkerKind.OBSERVE,
                 binding_id=binding.binding_id,
                 binding_revision=int(state["binding_revision"]),
                 conversation_revision=int(state["conversation_revision"]),
-            ),
-            timeout_seconds,
+                deadline=deadline,
+            )
+        remaining = remaining_seconds()
+        if remaining <= 0:
+            raise RuntimeError("CURSOR_REANCHOR_OBSERVE_DEADLINE_EXPIRED")
+        return observe_command, worker.request(
+            observe_command,
+            remaining,
         )
 
     worker = start_worker()
     try:
-        observed = observe(worker)
+        probe_health(worker)
+        observe_command, observed = observe(worker)
         refresh_required = (
-            observed.status in {WorkerStatus.FAILED_SAFE, WorkerStatus.UNAVAILABLE}
+            observed.status is WorkerStatus.FAILED_SAFE
             and observed.error_code == "selection_process_refresh_required"
         )
         if refresh_required:
             stop_worker(worker)
             worker = start_worker()
-            observed = observe(worker)
+            successor_health = probe_health(worker)
+            retry_command = observe_command.model_copy(
+                update={"request_id": uuid4()}
+            )
+            issue_handoff = getattr(worker, "mint_selection_handoff", None)
+            if not callable(issue_handoff):
+                raise RuntimeError("CURSOR_REANCHOR_HANDOFF_ISSUER_UNAVAILABLE")
+            handoff = issue_handoff(
+                predecessor_command=observe_command,
+                predecessor_result=observed,
+                successor_command=retry_command,
+                source="selection_refresh",
+                successor_worker_epoch=successor_health.worker_epoch,
+                target_runtime_id_digest=runtime_id_digest(
+                    binding.platform_conversation_id
+                ),
+                expires_at=deadline,
+            )
+            retry_command = retry_command.model_copy(
+                update={"selection_handoff": handoff}
+            )
+            _retry_command, observed = observe(worker, retry_command)
         if observed.status is not WorkerStatus.OK:
             raise RuntimeError("CURSOR_REANCHOR_OBSERVE_FAILED")
         raw = observed.evidence.get("bubbles")

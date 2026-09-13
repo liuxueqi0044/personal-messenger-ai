@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from test_worker import _worker
@@ -25,6 +25,7 @@ from messenger_ai.adapters.qq.vm_driver import (
     WorkerKind,
     WorkerResult,
     WorkerStatus,
+    mint_selection_handoff,
 )
 from messenger_ai.adapters.qq.vm_driver.message_cursor import (
     CURRENT_IDENTITY_SCHEMA,
@@ -34,6 +35,7 @@ from messenger_ai.adapters.qq.vm_driver.message_cursor import (
 from messenger_ai.adapters.qq.vm_driver.quarantine_release import (
     release_observation_quarantine,
 )
+from messenger_ai.adapters.qq.vm_driver.visual_selection import runtime_id_digest
 from messenger_ai.domain import (
     AuthorizationType,
     AuthorizedSendCommand,
@@ -49,6 +51,8 @@ class LocalWorker:
         self.requests.append(command)
         return self.worker.execute(command)
     def stop(self): self.stopped = True
+    def mint_selection_handoff(self, **kwargs):
+        return self.worker.mint_selection_handoff(**kwargs)
 
 
 class FreshVerifyWorker(LocalWorker):
@@ -136,6 +140,8 @@ class RecoverableWorker:
             return WorkerResult(
                 request_id=command.request_id, kind=command.kind,
                 binding_id=command.binding_id,
+                binding_revision=command.binding_revision,
+                conversation_revision=command.conversation_revision,
                 status=WorkerStatus.UNCERTAIN, worker_epoch=uuid4(),
                 error_code="worker_timeout_isolated",
             )
@@ -147,13 +153,17 @@ class RecoverableWorker:
             }
             return WorkerResult(
                 request_id=command.request_id, kind=command.kind,
-                binding_id=command.binding_id,
+                operation_id=command.operation_id, binding_id=command.binding_id,
+                binding_revision=command.binding_revision,
+                conversation_revision=command.conversation_revision,
                 status=WorkerStatus.OK, worker_epoch=uuid4(),
                 evidence={"bubbles": []},
             )
         return WorkerResult(
             request_id=command.request_id, kind=command.kind,
             operation_id=command.operation_id, binding_id=command.binding_id,
+            binding_revision=command.binding_revision,
+            conversation_revision=command.conversation_revision,
             status=WorkerStatus.UNCERTAIN, worker_epoch=uuid4(),
             error_code="worker_timeout_isolated",
         )
@@ -194,6 +204,12 @@ class SelectionRefreshWorker:
         self.stopped = False
         self._alive = True
         self._exit_code = None
+        self._selection_handoff_signing_key = b"selection-refresh-test-key-32b!!"
+
+    def mint_selection_handoff(self, **kwargs):
+        return mint_selection_handoff(
+            **kwargs, signing_key=self._selection_handoff_signing_key,
+        )
 
     def start(self):
         if self.events is not None:
@@ -332,6 +348,8 @@ def test_observation_classifies_temporary_and_identity_failures(tmp_path):
                 status=WorkerStatus.UNAVAILABLE,
                 worker_epoch=uuid4(),
                 binding_id=command.binding_id,
+                binding_revision=command.binding_revision,
+                conversation_revision=command.conversation_revision,
                 error_code=self.error_code,
             )
         def stop(self): pass
@@ -936,6 +954,8 @@ def test_prepare_failure_persists_worker_error_code_across_restart(tmp_path):
                 kind=item.kind,
                 operation_id=item.operation_id,
                 binding_id=item.binding_id,
+                binding_revision=item.binding_revision,
+                conversation_revision=item.conversation_revision,
                 status=WorkerStatus.FAILED_SAFE,
                 worker_epoch=uuid4(),
                 error_code=self.error_code,
@@ -986,6 +1006,8 @@ def test_prepare_failure_without_worker_error_code_falls_back_to_failed_safe(tmp
                 kind=item.kind,
                 operation_id=item.operation_id,
                 binding_id=item.binding_id,
+                binding_revision=item.binding_revision,
+                conversation_revision=item.conversation_revision,
                 status=WorkerStatus.UNAVAILABLE,
                 worker_epoch=uuid4(),
             )
@@ -1823,7 +1845,10 @@ def test_explicit_release_requires_exact_cas_and_full_observation_resumes_withou
         def request(self, item, _timeout):
             return WorkerResult(
                 request_id=item.request_id, kind=item.kind,
-                binding_id=item.binding_id, status=WorkerStatus.OK,
+                operation_id=item.operation_id, binding_id=item.binding_id,
+                binding_revision=item.binding_revision,
+                conversation_revision=item.conversation_revision,
+                status=WorkerStatus.OK,
                 worker_epoch=uuid4(), evidence={"bubbles": list(self.bubbles)},
             )
         def stop(self): pass
@@ -2071,6 +2096,9 @@ def test_observe_refresh_retry_mints_one_exactly_bound_handoff(tmp_path):
     assert batch.complete is True
     predecessor, refresh_result = _observe_exchange(failed)
     retried, _retry_result = _observe_exchange(successor)
+    _health_command, successor_health = _observe_exchange(
+        successor, WorkerKind.HEALTH,
+    )
     handoff = retried.selection_handoff
 
     assert handoff is not None
@@ -2081,6 +2109,10 @@ def test_observe_refresh_retry_mints_one_exactly_bound_handoff(tmp_path):
     assert handoff.predecessor_request_id == predecessor.request_id
     assert handoff.successor_request_id == retried.request_id
     assert handoff.predecessor_worker_epoch == refresh_result.worker_epoch
+    assert handoff.successor_worker_epoch == successor_health.worker_epoch
+    assert handoff.target_runtime_id_digest == runtime_id_digest(
+        first.platform_conversation_id
+    )
     assert handoff.binding_id == first.binding_id
     assert handoff.binding_revision == 4
     assert handoff.conversation_revision == 9
@@ -2156,6 +2188,9 @@ def test_prepare_refresh_retry_handoff_binds_operation_and_plan_target(tmp_path)
     assert operation.status is SendStatus.PREPARED
     predecessor, refresh_result = _observe_exchange(failed, WorkerKind.PREPARE)
     retried, _retry_result = _observe_exchange(successor, WorkerKind.PREPARE)
+    _health_command, successor_health = _observe_exchange(
+        successor, WorkerKind.HEALTH,
+    )
     handoff = retried.selection_handoff
 
     assert handoff is not None
@@ -2169,6 +2204,10 @@ def test_prepare_refresh_retry_handoff_binds_operation_and_plan_target(tmp_path)
     assert handoff.predecessor_request_id == predecessor.request_id
     assert handoff.successor_request_id == retried.request_id
     assert handoff.predecessor_worker_epoch == refresh_result.worker_epoch
+    assert handoff.successor_worker_epoch == successor_health.worker_epoch
+    assert handoff.target_runtime_id_digest == runtime_id_digest(
+        first.platform_conversation_id
+    )
 
 
 def test_commit_success_handoff_binds_fresh_verify_without_leaking_diagnostics(
@@ -2211,6 +2250,9 @@ def test_commit_success_handoff_binds_fresh_verify_without_leaking_diagnostics(
 
     commit_command, commit_result = _observe_exchange(first, WorkerKind.COMMIT)
     verify_command, _verify_result = _observe_exchange(successor, WorkerKind.VERIFY)
+    _health_command, successor_health = _observe_exchange(
+        successor, WorkerKind.HEALTH,
+    )
     handoff = verify_command.selection_handoff
 
     assert handoff is not None
@@ -2220,6 +2262,10 @@ def test_commit_success_handoff_binds_fresh_verify_without_leaking_diagnostics(
     assert handoff.predecessor_request_id == commit_command.request_id
     assert handoff.successor_request_id == verify_command.request_id
     assert handoff.predecessor_worker_epoch == commit_result.worker_epoch
+    assert handoff.successor_worker_epoch == successor_health.worker_epoch
+    assert handoff.target_runtime_id_digest == runtime_id_digest(
+        binding.platform_conversation_id
+    )
     assert handoff.operation_id == commit_command.operation_id
     assert handoff.binding_id == binding.binding_id
     assert handoff.binding_revision == 1
@@ -2232,3 +2278,402 @@ def test_commit_success_handoff_binds_fresh_verify_without_leaking_diagnostics(
     assert "handoff" not in serialized
     assert str(handoff.handoff_id) not in serialized
     assert handoff.expires_at.isoformat() not in serialized
+    assert handoff.target_runtime_id_digest not in serialized
+
+
+def test_abort_send_carries_db_revisions_and_clears_real_composer(tmp_path):
+    worker, fake, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+    local = LocalWorker(worker)
+    bridge = QQVMDriverBridge(
+        worker=local, bindings=(binding,), text_provider=lambda _: "固定测试文字",
+        sqlite_path=tmp_path / "abort-cleanup.sqlite3",
+    )
+    operation = asyncio.run(bridge.prepare_send(
+        command(), operation_id=uuid4(), segment_ref="abort-cleanup:0",
+        binding_revision=2, conversation_revision=3,
+    ))
+    assert operation.status is SendStatus.PREPARED
+    assert fake.composer == "固定测试文字"
+
+    aborted = asyncio.run(bridge.abort_send(operation))
+
+    assert aborted.status is SendStatus.CANCELLED
+    assert fake.composer == ""
+    abort_command = next(
+        item for item in local.requests if item.kind is WorkerKind.ABORT
+    )
+    assert abort_command.binding_id == binding.binding_id
+    assert abort_command.operation_id == operation.operation_id
+    assert abort_command.binding_revision == 2
+    assert abort_command.conversation_revision == 3
+    assert abort_command.deadline is not None
+    assert abort_command.deadline.tzinfo is not None
+
+
+def test_abort_send_expired_deadline_never_reaches_worker(tmp_path):
+    worker, fake, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+    local = LocalWorker(worker)
+    bridge = QQVMDriverBridge(
+        worker=local, bindings=(binding,), text_provider=lambda _: "固定测试文字",
+        sqlite_path=tmp_path / "abort-expired.sqlite3",
+    )
+    operation = asyncio.run(bridge.prepare_send(
+        command(), operation_id=uuid4(), segment_ref="abort-expired:0",
+        binding_revision=2, conversation_revision=3,
+    ))
+    assert operation.status is SendStatus.PREPARED
+    # A zero budget is already consumed, so the abort deadline is in the past.
+    bridge._timeout = 0.0
+
+    aborted = asyncio.run(bridge.abort_send(operation))
+
+    assert aborted.status is SendStatus.UNCERTAIN
+    assert aborted.error_code == ErrorCode.SEND_UNCERTAIN.value
+    assert [item.kind for item in local.requests] == [WorkerKind.PREPARE]
+    assert fake.composer == "固定测试文字"
+    assert bridge._db.execute(
+        "SELECT status FROM qq_vm_ops WHERE operation_id=?",
+        (str(operation.operation_id),),
+    ).fetchone()["status"] == SendStatus.UNCERTAIN.value
+
+
+@pytest.mark.parametrize("kind", [WorkerKind.COMMIT, WorkerKind.VERIFY])
+def test_uncorrelated_commit_verify_ok_fails_closed_uncertain(tmp_path, kind):
+    worker, _, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+
+    class DriftWorker:
+        """A worker whose terminal OK response names the wrong revision."""
+
+        def request(self, command, _timeout):
+            values = {
+                "request_id": command.request_id,
+                "kind": command.kind,
+                "operation_id": command.operation_id,
+                "binding_id": command.binding_id,
+                "binding_revision": command.binding_revision,
+                "conversation_revision": command.conversation_revision,
+                "status": WorkerStatus.OK,
+                "worker_epoch": uuid4(),
+            }
+            if command.kind is kind:
+                values["conversation_revision"] += 1
+            return WorkerResult(**values)
+
+        def stop(self): pass
+
+    bridge = QQVMDriverBridge(
+        worker=DriftWorker(), bindings=(binding,), text_provider=lambda _: "固定测试文字",
+        sqlite_path=tmp_path / f"drift-{kind.value}.sqlite3",
+    )
+    operation = asyncio.run(bridge.prepare_send(
+        command(), operation_id=uuid4(), segment_ref=f"drift-{kind.value}:0",
+        binding_revision=1, conversation_revision=1,
+    ))
+    assert operation.status is SendStatus.PREPARED
+    if kind is WorkerKind.VERIFY:
+        operation = asyncio.run(bridge.commit_send(operation))
+        assert operation.status is SendStatus.COMMITTED
+
+    result = asyncio.run(getattr(bridge, f"{kind.value}_send")(operation))
+
+    assert result.status is SendStatus.UNCERTAIN
+    assert result.error_code == ErrorCode.SEND_UNCERTAIN.value
+    assert bridge._db.execute(
+        "SELECT status FROM qq_vm_ops WHERE operation_id=?",
+        (str(operation.operation_id),),
+    ).fetchone()["status"] == SendStatus.UNCERTAIN.value
+
+
+def test_uncorrelated_observe_ok_fails_closed_without_ingesting(tmp_path):
+    worker, _, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+
+    class DriftWorker:
+        def request(self, command, _timeout):
+            return WorkerResult(
+                request_id=command.request_id, kind=command.kind,
+                operation_id=command.operation_id, binding_id=command.binding_id,
+                binding_revision=command.binding_revision + 1,
+                conversation_revision=command.conversation_revision,
+                status=WorkerStatus.OK, worker_epoch=uuid4(),
+                evidence={"bubbles": [
+                    {"direction": "inbound", "text": "leaked", "message_key": "x"},
+                ]},
+            )
+
+        def stop(self): pass
+
+    bridge = QQVMDriverBridge(
+        worker=DriftWorker(), bindings=(binding,), text_provider=lambda _: "x",
+        sqlite_path=tmp_path / "drift-observe.sqlite3",
+    )
+
+    batch = asyncio.run(bridge.observe_conversation(
+        binding.hub_conversation_id, binding_revision=1, conversation_revision=1,
+    ))
+
+    assert batch.complete is False
+    assert batch.messages == ()
+    assert batch.gap_reason == "driver_temporary:worker_response_mismatch"
+    assert bridge._cursor.has_snapshot(binding.hub_conversation_id) is False
+
+
+class ScriptedCleanupWorker:
+    """Records commands and scripts only the ABORT half of the cleanup path."""
+
+    def __init__(self, *, abort):
+        self.abort = abort
+        self.requests = []
+
+    def request(self, item, _timeout):
+        self.requests.append(item)
+        if item.kind is WorkerKind.PREPARE:
+            return WorkerResult(
+                request_id=item.request_id,
+                kind=item.kind,
+                operation_id=item.operation_id,
+                binding_id=item.binding_id,
+                binding_revision=item.binding_revision,
+                conversation_revision=item.conversation_revision,
+                status=WorkerStatus.FAILED_SAFE,
+                worker_epoch=uuid4(),
+                error_code="composer_readback_mismatch",
+                evidence={"cleanup_required": True},
+            )
+        # A COMMIT escaping here would mean PREPARE cleanup crossed the commit
+        # boundary; fail loudly instead of answering.
+        assert item.kind is WorkerKind.ABORT
+        if self.abort == "exception":
+            raise RuntimeError("abort_pipe_failed")
+        if self.abort == "non_ok":
+            return WorkerResult(
+                request_id=item.request_id,
+                kind=item.kind,
+                operation_id=item.operation_id,
+                binding_id=item.binding_id,
+                binding_revision=item.binding_revision,
+                conversation_revision=item.conversation_revision,
+                status=WorkerStatus.FAILED_SAFE,
+                worker_epoch=uuid4(),
+                error_code="needs_manual_cleanup",
+            )
+        drift = (
+            {"conversation_revision": item.conversation_revision + 1}
+            if self.abort == "mismatch"
+            else {}
+        )
+        values = {
+            "request_id": item.request_id,
+            "kind": item.kind,
+            "operation_id": item.operation_id,
+            "binding_id": item.binding_id,
+            "binding_revision": item.binding_revision,
+            "conversation_revision": item.conversation_revision,
+            "status": WorkerStatus.OK,
+            "worker_epoch": uuid4(),
+        }
+        values.update(drift)
+        return WorkerResult(**values)
+
+    def stop(self):
+        pass
+
+
+def test_prepare_cleanup_required_aborts_exactly_then_fails_with_original_error(
+    tmp_path,
+):
+    worker, _, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+    local = ScriptedCleanupWorker(abort="ok")
+    bridge = QQVMDriverBridge(
+        worker=local,
+        bindings=(binding,),
+        text_provider=lambda _: "固定测试文字",
+        sqlite_path=tmp_path / "prepare-cleanup-abort.sqlite3",
+    )
+    operation_id = uuid4()
+    issued_at = datetime.now(UTC)
+
+    operation = asyncio.run(bridge.prepare_send(
+        command(), operation_id=operation_id, segment_ref="prepare-cleanup:0",
+        binding_revision=2, conversation_revision=3,
+    ))
+    finished_at = datetime.now(UTC)
+
+    assert operation.status is SendStatus.FAILED
+    assert operation.error_code == "composer_readback_mismatch"
+    assert [item.kind for item in local.requests] == [
+        WorkerKind.PREPARE, WorkerKind.ABORT,
+    ]
+    prepare_command, abort_command = local.requests
+    assert prepare_command.deadline is not None
+    assert abort_command.operation_id == prepare_command.operation_id == operation_id
+    assert abort_command.binding_id == prepare_command.binding_id == binding.binding_id
+    assert abort_command.binding_revision == prepare_command.binding_revision == 2
+    assert abort_command.conversation_revision == prepare_command.conversation_revision == 3
+    assert abort_command.segment_ref is None
+    assert abort_command.text is None
+    assert abort_command.prepared_evidence is None
+    assert abort_command.selection_handoff is None
+    # The cleanup ABORT carries its own live deadline drawn from the same
+    # bounded request budget as PREPARE; it can only be later because it is
+    # created after PREPARE returned.
+    assert abort_command.deadline is not None
+    assert abort_command.deadline.tzinfo is not None
+    assert prepare_command.deadline >= issued_at
+    assert abort_command.deadline >= prepare_command.deadline
+    assert abort_command.deadline <= finished_at + timedelta(
+        seconds=bridge._timeout
+    )
+
+    row = bridge._db.execute(
+        "SELECT status,error_code,commit_intent FROM qq_vm_ops WHERE operation_id=?",
+        (str(operation_id),),
+    ).fetchone()
+    assert row["status"] == SendStatus.FAILED.value
+    assert row["error_code"] == "composer_readback_mismatch"
+    assert row["commit_intent"] == 0
+
+    # A terminal cleanup failure must never be recommitted, even when the
+    # runtime keeps driving the same operation object.
+    replayed = asyncio.run(bridge.commit_send(operation))
+    assert replayed.status is SendStatus.FAILED
+    assert [item.kind for item in local.requests] == [
+        WorkerKind.PREPARE, WorkerKind.ABORT,
+    ]
+
+
+@pytest.mark.parametrize("abort", ["exception", "mismatch", "non_ok"])
+def test_prepare_cleanup_abort_without_correlated_ok_requires_manual_cleanup(
+    tmp_path, abort,
+):
+    worker, _, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+    local = ScriptedCleanupWorker(abort=abort)
+    bridge = QQVMDriverBridge(
+        worker=local,
+        bindings=(binding,),
+        text_provider=lambda _: "固定测试文字",
+        sqlite_path=tmp_path / f"prepare-cleanup-{abort}.sqlite3",
+    )
+    operation_id = uuid4()
+
+    operation = asyncio.run(bridge.prepare_send(
+        command(), operation_id=operation_id, segment_ref=f"prepare-cleanup-{abort}:0",
+        binding_revision=2, conversation_revision=3,
+    ))
+
+    assert operation.status is SendStatus.UNCERTAIN
+    assert operation.error_code == "needs_manual_cleanup"
+    assert [item.kind for item in local.requests] == [
+        WorkerKind.PREPARE, WorkerKind.ABORT,
+    ]
+    abort_command = local.requests[-1]
+    assert abort_command.operation_id == operation_id
+    assert abort_command.binding_id == binding.binding_id
+    row = bridge._db.execute(
+        "SELECT status,error_code,commit_intent FROM qq_vm_ops WHERE operation_id=?",
+        (str(operation_id),),
+    ).fetchone()
+    assert row["status"] == SendStatus.UNCERTAIN.value
+    assert row["error_code"] == "needs_manual_cleanup"
+    assert row["commit_intent"] == 0
+
+    replayed = asyncio.run(bridge.commit_send(operation))
+    assert replayed.status is SendStatus.UNCERTAIN
+    assert replayed.error_code == "needs_manual_cleanup"
+    assert [item.kind for item in local.requests] == [
+        WorkerKind.PREPARE, WorkerKind.ABORT,
+    ]
+
+
+class ScriptedHealthWorker:
+    def __init__(self, build):
+        self._build = build
+        self.requests = []
+
+    def request(self, item, _timeout):
+        self.requests.append(item)
+        return self._build(item)
+
+    def stop(self):
+        pass
+
+
+def _probe_response(item, **overrides):
+    values = {
+        "request_id": item.request_id,
+        "kind": WorkerKind.HEALTH,
+        "status": WorkerStatus.OK,
+        "worker_epoch": uuid4(),
+    }
+    values.update(overrides)
+    return WorkerResult(**values)
+
+
+_PROBE_REJECTION_MUTATIONS = {
+    "request_id": {"request_id": uuid4()},
+    "kind": {"kind": WorkerKind.OBSERVE},
+    "binding_id": {"binding_id": "binding-1"},
+    "binding_revision": {"binding_revision": 1},
+    "conversation_revision": {"conversation_revision": 1},
+    "operation_id": {"operation_id": uuid4()},
+    "zero_epoch": {"worker_epoch": UUID(int=0)},
+}
+
+
+@pytest.mark.parametrize("mutation", list(_PROBE_REJECTION_MUTATIONS))
+def test_probe_health_rejects_uncorrelated_or_scoped_ok_results(tmp_path, mutation):
+    worker, _, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+    overrides = dict(_PROBE_REJECTION_MUTATIONS[mutation])
+    local = ScriptedHealthWorker(
+        lambda item: _probe_response(item, **overrides)
+    )
+    bridge = QQVMDriverBridge(
+        worker=local,
+        bindings=(binding,),
+        text_provider=lambda _: "x",
+        sqlite_path=tmp_path / f"probe-{mutation}.sqlite3",
+    )
+
+    probe = bridge.probe_health()
+
+    assert probe.status is WorkerStatus.UNCERTAIN
+    assert probe.error_code == "worker_response_mismatch"
+    assert probe.worker_epoch == UUID(int=0)
+    assert len(local.requests) == 1
+    assert probe.request_id == local.requests[0].request_id
+    # The fail-closed verdict is what gets cached, not the raw response.
+    assert bridge.health() is probe
+    assert len(local.requests) == 1
+
+
+def test_probe_health_accepts_only_exact_nonzero_epoch_result(tmp_path):
+    worker, _, _ = _worker()
+    binding = next(iter(worker._bindings.values()))
+    local = ScriptedHealthWorker(_probe_response)
+    bridge = QQVMDriverBridge(
+        worker=local,
+        bindings=(binding,),
+        text_provider=lambda _: "x",
+        sqlite_path=tmp_path / "probe-exact.sqlite3",
+    )
+
+    probe = bridge.probe_health()
+
+    assert probe.status is WorkerStatus.OK
+    assert probe.kind is WorkerKind.HEALTH
+    assert probe.request_id == local.requests[0].request_id
+    assert probe.worker_epoch != UUID(int=0)
+    assert (
+        probe.binding_id,
+        probe.binding_revision,
+        probe.conversation_revision,
+        probe.operation_id,
+    ) == (None, 0, 0, None)
+    assert bridge.health() is probe
+    assert len(local.requests) == 1

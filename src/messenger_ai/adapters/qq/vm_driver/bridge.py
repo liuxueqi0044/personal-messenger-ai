@@ -25,11 +25,11 @@ from .contracts import (
     WorkerKind,
     WorkerResult,
     WorkerStatus,
-    mint_selection_handoff,
     observation_pause_reason,
 )
 from .message_cursor import MessageCursorStore
 from .quarantine_release import ensure_quarantine_release_schema
+from .visual_selection import runtime_id_digest
 from .worker import QQVMWorkerProcess
 
 _TERMINAL = {SendStatus.VERIFIED, SendStatus.FAILED, SendStatus.UNCERTAIN, SendStatus.CANCELLED}
@@ -171,8 +171,21 @@ class QQVMDriverBridge:
     def probe_health(self) -> WorkerResult:
         """Perform an explicit worker/UIA probe and cache its result."""
 
-        self._last_health = self._worker.request(
-            WorkerCommand(kind=WorkerKind.HEALTH), self._timeout
+        command = WorkerCommand(
+            kind=WorkerKind.HEALTH,
+            deadline=datetime.now(UTC) + timedelta(seconds=self._timeout),
+        )
+        result = self._worker.request(command, self._timeout)
+        self._last_health = (
+            result
+            if self._health_matches_command(command, result)
+            else WorkerResult(
+                request_id=command.request_id,
+                kind=command.kind,
+                status=WorkerStatus.UNCERTAIN,
+                worker_epoch=UUID(int=0),
+                error_code="worker_response_mismatch",
+            )
         )
         return self._last_health
 
@@ -391,24 +404,33 @@ class QQVMDriverBridge:
                     result.evidence.get("prepared_evidence")
                 )
             except Exception:
-                abort_result = await asyncio.to_thread(
-                    self._worker.request,
-                    WorkerCommand(
-                        kind=WorkerKind.ABORT,
-                        binding_id=binding.binding_id,
-                        operation_id=operation_id,
-                    ),
-                    self._timeout,
+                abort_command = WorkerCommand(
+                    kind=WorkerKind.ABORT,
+                    binding_id=binding.binding_id,
+                    operation_id=operation_id,
+                    binding_revision=binding_revision,
+                    conversation_revision=conversation_revision,
+                    deadline=datetime.now(UTC) + timedelta(seconds=self._timeout),
                 )
+                try:
+                    abort_result = self._correlated_result(
+                        abort_command,
+                        await self._request_before_deadline(
+                            self._worker, abort_command
+                        ),
+                    )
+                except Exception:
+                    abort_result = None
                 operation.status = (
                     SendStatus.FAILED
-                    if abort_result.status is WorkerStatus.OK
+                    if abort_result is not None
+                    and abort_result.status is WorkerStatus.OK
                     else SendStatus.UNCERTAIN
                 )
                 operation.error_code = (
                     "prepared_evidence_invalid"
                     if operation.status is SendStatus.FAILED
-                    else ErrorCode.SEND_UNCERTAIN.value
+                    else "needs_manual_cleanup"
                 )
             else:
                 self._db.execute(
@@ -418,6 +440,35 @@ class QQVMDriverBridge:
                 operation.status = SendStatus.PREPARED
         elif result.status is WorkerStatus.OK:
             operation.status = SendStatus.PREPARED
+        elif (
+            result.status is WorkerStatus.FAILED_SAFE
+            and result.evidence.get("cleanup_required") is True
+        ):
+            abort_command = WorkerCommand(
+                kind=WorkerKind.ABORT,
+                binding_id=binding.binding_id,
+                operation_id=operation_id,
+                binding_revision=binding_revision,
+                conversation_revision=conversation_revision,
+                deadline=datetime.now(UTC) + timedelta(seconds=self._timeout),
+            )
+            try:
+                abort_result = self._correlated_result(
+                    abort_command,
+                    await self._request_before_deadline(
+                        self._worker, abort_command
+                    ),
+                )
+            except Exception:
+                abort_result = None
+            if abort_result is not None and abort_result.status is WorkerStatus.OK:
+                operation.status = SendStatus.FAILED
+                operation.error_code = (
+                    result.error_code or ErrorCode.FAILED_SAFE.value
+                )
+            else:
+                operation.status = SendStatus.UNCERTAIN
+                operation.error_code = "needs_manual_cleanup"
         elif result.status is WorkerStatus.UNCERTAIN:
             operation.status = SendStatus.UNCERTAIN; operation.error_code = ErrorCode.SEND_UNCERTAIN.value
         else:
@@ -451,16 +502,19 @@ class QQVMDriverBridge:
         binding = self._by_id.get(row["binding_id"])
         if binding is None:
             stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value; return self._persist(stored)
+        commit_deadline = datetime.now(UTC) + timedelta(seconds=self._timeout)
         commit_command = WorkerCommand(
             kind=WorkerKind.COMMIT,
             binding_id=binding.binding_id,
             operation_id=stored.operation_id,
             binding_revision=row["binding_revision"],
             conversation_revision=row["conversation_revision"],
+            deadline=commit_deadline,
         )
         try:
-            result = await asyncio.to_thread(
-                self._worker.request, commit_command, self._timeout
+            result = self._correlated_result(
+                commit_command,
+                await self._request_before_deadline(self._worker, commit_command),
             )
         except Exception:
             stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
@@ -502,23 +556,44 @@ class QQVMDriverBridge:
                     verify_deadline = datetime.now(UTC) + timedelta(
                         seconds=self._timeout
                     )
-                    verify_command = WorkerCommand(
-                        kind=WorkerKind.VERIFY,
-                        binding_id=binding.binding_id,
-                        operation_id=stored.operation_id,
-                        binding_revision=row["binding_revision"],
-                        conversation_revision=row["conversation_revision"],
-                        deadline=verify_deadline,
-                    )
                     try:
-                        handoff = mint_selection_handoff(
+                        prepared_row = self._db.execute(
+                            "SELECT evidence_json FROM qq_vm_prepared_evidence "
+                            "WHERE operation_id=?",
+                            (str(stored.operation_id),),
+                        ).fetchone()
+                        prepared = PreparedVerificationEvidence.model_validate_json(
+                            prepared_row["evidence_json"]
+                            if prepared_row is not None else None
+                        )
+                        verify_command = WorkerCommand(
+                            kind=WorkerKind.VERIFY,
+                            binding_id=binding.binding_id,
+                            operation_id=stored.operation_id,
+                            binding_revision=row["binding_revision"],
+                            conversation_revision=row["conversation_revision"],
+                            prepared_evidence=prepared,
+                            deadline=verify_deadline,
+                        )
+                        if self._last_health is None:
+                            raise ValueError("verify successor health is unavailable")
+                        issue_handoff = getattr(
+                            self._worker, "mint_selection_handoff", None
+                        )
+                        if not callable(issue_handoff):
+                            raise ValueError("verify successor issuer is unavailable")
+                        handoff = issue_handoff(
                             predecessor_command=commit_command,
                             predecessor_result=result,
                             successor_command=verify_command,
                             source="commit_success",
+                            successor_worker_epoch=self._last_health.worker_epoch,
+                            target_runtime_id_digest=runtime_id_digest(
+                                binding.platform_conversation_id
+                            ),
                             expires_at=verify_deadline,
                         )
-                    except ValueError:
+                    except (TypeError, ValueError):
                         stored.status = SendStatus.UNCERTAIN
                         stored.error_code = ErrorCode.SEND_UNCERTAIN.value
                     else:
@@ -574,6 +649,9 @@ class QQVMDriverBridge:
                     update={"prepared_evidence": prepared}
                 )
             else:
+                verify_deadline = datetime.now(UTC) + timedelta(
+                    seconds=self._timeout
+                )
                 verify_command = WorkerCommand(
                     kind=WorkerKind.VERIFY,
                     binding_id=binding.binding_id if binding else None,
@@ -581,9 +659,11 @@ class QQVMDriverBridge:
                     binding_revision=row["binding_revision"],
                     conversation_revision=row["conversation_revision"],
                     prepared_evidence=prepared,
+                    deadline=verify_deadline,
                 )
-            result = await asyncio.to_thread(
-                self._worker.request, verify_command, self._timeout
+            result = self._correlated_result(
+                verify_command,
+                await self._request_before_deadline(self._worker, verify_command),
             )
         except Exception:
             stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
@@ -624,8 +704,22 @@ class QQVMDriverBridge:
         if row["commit_intent"]:
             stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
             return self._persist(stored)
-        result = await asyncio.to_thread(self._worker.request, WorkerCommand(
-            kind=WorkerKind.ABORT, binding_id=row["binding_id"], operation_id=stored.operation_id), self._timeout)
+        abort_command = WorkerCommand(
+            kind=WorkerKind.ABORT,
+            binding_id=row["binding_id"],
+            operation_id=stored.operation_id,
+            binding_revision=row["binding_revision"],
+            conversation_revision=row["conversation_revision"],
+            deadline=datetime.now(UTC) + timedelta(seconds=self._timeout),
+        )
+        try:
+            result = self._correlated_result(
+                abort_command,
+                await self._request_before_deadline(self._worker, abort_command),
+            )
+        except Exception:
+            stored.status = SendStatus.UNCERTAIN; stored.error_code = ErrorCode.SEND_UNCERTAIN.value
+            return self._persist(stored)
         if result.status is WorkerStatus.OK:
             stored.status = SendStatus.CANCELLED
         else:
@@ -753,10 +847,15 @@ class QQVMDriverBridge:
         """
 
         if command.kind not in _SELECTION_REFRESH_KINDS or command.deadline is None:
-            return await asyncio.to_thread(
-                self._worker.request, command, self._timeout,
+            return self._correlated_result(
+                command,
+                await asyncio.to_thread(
+                    self._worker.request, command, self._timeout,
+                ),
             )
-        result = await self._request_before_deadline(self._worker, command)
+        result = self._correlated_result(
+            command, await self._request_before_deadline(self._worker, command)
+        )
         if not self._selection_refresh_retry_enabled:
             if self._is_selection_refresh_request(command, result):
                 await self._retire_untrusted_selection_worker(self._worker)
@@ -771,18 +870,32 @@ class QQVMDriverBridge:
 
         retry = command.model_copy(update={"request_id": uuid4()})
         try:
-            handoff = mint_selection_handoff(
+            binding = self._by_id.get(command.binding_id or "")
+            if binding is None or self._last_health is None:
+                raise ValueError("selection successor scope is unavailable")
+            issue_handoff = getattr(
+                self._worker, "mint_selection_handoff", None
+            )
+            if not callable(issue_handoff):
+                raise ValueError("selection successor issuer is unavailable")
+            handoff = issue_handoff(
                 predecessor_command=command,
                 predecessor_result=result,
                 successor_command=retry,
                 source="selection_refresh",
+                successor_worker_epoch=self._last_health.worker_epoch,
+                target_runtime_id_digest=runtime_id_digest(
+                    binding.platform_conversation_id
+                ),
                 expires_at=command.deadline,
             )
         except ValueError:
             await self._retire_untrusted_selection_worker(self._worker)
             return result
         retry = retry.model_copy(update={"selection_handoff": handoff})
-        retried = await self._request_before_deadline(self._worker, retry)
+        retried = self._correlated_result(
+            retry, await self._request_before_deadline(self._worker, retry)
+        )
         if self._is_selection_refresh_request(retry, retried):
             await self._retire_untrusted_selection_worker(self._worker)
             return retried.model_copy(update={
@@ -807,6 +920,42 @@ class QQVMDriverBridge:
                 error_code="deadline_expired",
             )
         return await asyncio.to_thread(worker.request, command, remaining)
+
+    @staticmethod
+    def _result_correlates(command: WorkerCommand, result: WorkerResult) -> bool:
+        """Require one worker response to name the exact accepted command.
+
+        The guest pipe only correlates ``request_id``/``operation_id``; the
+        bridge must additionally prove the response kind and identity
+        coordinates belong to this exact command before any normal outcome is
+        allowed to move durable state.
+        """
+
+        return bool(
+            result.request_id == command.request_id
+            and result.kind is command.kind
+            and result.binding_id == command.binding_id
+            and result.binding_revision == command.binding_revision
+            and result.conversation_revision == command.conversation_revision
+            and result.operation_id == command.operation_id
+            and (
+                result.status is not WorkerStatus.OK
+                or result.worker_epoch != UUID(int=0)
+            )
+        )
+
+    @classmethod
+    def _correlated_result(
+        cls, command: WorkerCommand, result: WorkerResult,
+    ) -> WorkerResult:
+        """Fail closed when any worker response is not exactly correlated."""
+
+        if not cls._result_correlates(command, result):
+            return result.model_copy(update={
+                "status": WorkerStatus.UNCERTAIN,
+                "error_code": "worker_response_mismatch",
+            })
+        return result
 
     @staticmethod
     def _remaining_seconds(deadline: datetime | None) -> float:
@@ -926,10 +1075,18 @@ class QQVMDriverBridge:
     def _health_matches_command(
         command: WorkerCommand, result: WorkerResult,
     ) -> bool:
+        """Accept a successor HEALTH only when it is fully correlated.
+
+        A successor may be activated by a HEALTH result, so it must prove it
+        answered this exact probe with a live, nonzero worker epoch and no
+        binding/operation coordinates of its own.
+        """
+
         return bool(
             result.status is WorkerStatus.OK
             and result.request_id == command.request_id
             and result.kind is WorkerKind.HEALTH
+            and result.worker_epoch != UUID(int=0)
             and result.binding_id is None
             and result.binding_revision == 0
             and result.conversation_revision == 0
@@ -1101,9 +1258,12 @@ class QQVMDriverBridge:
             self._pending_successor_started = False
             successor.start()
             self._pending_successor_started = True
+            health_command = WorkerCommand(
+                kind=WorkerKind.HEALTH, deadline=command.deadline
+            )
             health = await asyncio.to_thread(
                 successor.request,
-                WorkerCommand(kind=WorkerKind.HEALTH),
+                health_command,
                 self._timeout,
             )
         except asyncio.CancelledError:
@@ -1122,12 +1282,17 @@ class QQVMDriverBridge:
                 health_error_code=type(exc).__name__,
             )
         else:
-            if health.status is not WorkerStatus.OK:
+            if not self._health_matches_command(health_command, health):
+                health_error = health.error_code or (
+                    health.status.value
+                    if health.status is not WorkerStatus.OK
+                    else "health_correlation_mismatch"
+                )
                 self._finish_recovery(
                     recovery_id,
                     status="successor_health_failed",
                     health_request_id=str(health.request_id),
-                    health_error_code=health.error_code or health.status.value,
+                    health_error_code=health_error,
                 )
             else:
                 self._worker = successor

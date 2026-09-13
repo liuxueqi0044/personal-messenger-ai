@@ -17,10 +17,11 @@ import json
 import struct
 import time
 import unicodedata
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from messenger_ai.adapters.qq.models import QQConversation, QQSelector, QQWindow
 from messenger_ai.domain import DomainModel
@@ -344,6 +345,34 @@ class DeepSeekVisualSelectionProvider:
         )
 
 
+class _SelectionDeadlineExpired(RuntimeError):
+    """A bounded visual selection action ran past its deadline.
+
+    The message mirrors ``transport._check_selection_deadline`` so the worker
+    can propagate it as the established ``deadline_expired`` signal without
+    carrying any row image, row text or chat content.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("deadline_expired")
+
+
+def _ensure_selection_deadline(deadline: datetime | None) -> None:
+    """Reject an expired or non-awareness deadline before any UI action.
+
+    ``None`` keeps non-production callers working.  A naive deadline is a
+    caller bug and is rejected as such; an expired deadline aborts the action
+    so an already-stale certification can never reach ``actions.click_*``.
+    """
+
+    if deadline is None:
+        return
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise ValueError("selection deadline must be timezone-aware")
+    if datetime.now(UTC) >= deadline:
+        raise _SelectionDeadlineExpired()
+
+
 class ConversationSelectionActuator:
     """Authorize at most one row click; never certify the resulting chat."""
 
@@ -369,7 +398,11 @@ class ConversationSelectionActuator:
         binding_id: str,
         conversation: QQConversation,
         selector: QQSelector,
+        deadline: datetime | None = None,
     ) -> ConversationSelectionOutcome:
+        # Fail closed before any capture or click when the budget is already
+        # gone, and never let a naive deadline silently authorize an action.
+        _ensure_selection_deadline(deadline)
         label = self._labels.get(binding_id)
         if label is None:
             return ConversationSelectionOutcome(
@@ -382,10 +415,15 @@ class ConversationSelectionActuator:
                     status=ConversationSelectionStatus.NOT_NEEDED
                 )
             first = self._actions.capture_conversation_row(window, conversation, selector)
+            _ensure_selection_deadline(deadline)
             request = VisualSelectionRequest(
                 binding_id=binding_id, target_label=label, frame=first
             )
             provider_result = _run_provider(self._provider.inspect_row(request))
+            # The provider call is the slow, externally-visible stage.  Reject
+            # the deadline the instant it returns, before any decision is
+            # trusted or any click is attempted.
+            _ensure_selection_deadline(deadline)
             if provider_result.error is not None or provider_result.decision is None:
                 return ConversationSelectionOutcome(
                     status=ConversationSelectionStatus.REJECTED,
@@ -445,6 +483,9 @@ class ConversationSelectionActuator:
                     latency_ms=provider_result.latency_ms,
                     **decision_evidence,
                 )
+            # Last guard before the irreversible action: a deadline that
+            # expired during capture/stability re-check must never click.
+            _ensure_selection_deadline(deadline)
             try:
                 attempted = self._actions.click_conversation_row(
                     window, conversation, selector, second.rect
@@ -472,6 +513,10 @@ class ConversationSelectionActuator:
                 latency_ms=provider_result.latency_ms,
                 **decision_evidence,
             )
+        except _SelectionDeadlineExpired:
+            # Deadline expiry is a control signal, not a generic action
+            # failure; propagate it rather than masking it as a fixed code.
+            raise
         except Exception:  # noqa: BLE001 - selection must collapse to a safe fixed code
             return ConversationSelectionOutcome(
                 status=ConversationSelectionStatus.REJECTED,
@@ -489,3 +534,290 @@ def _run_provider(awaitable: Any) -> VisualSelectionProviderResult:
 
 def _elapsed_ms(started: float) -> int:
     return max(0, round((time.perf_counter() - started) * 1000))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic local row-border palette proof.
+#
+# A fresh worker proves that exactly one conversation row carries the selected
+# row-border palette by sampling raw screen pixels of the *border band* of each
+# already-located row.  No vision model, no image bytes, and no chat/row text
+# ever leave this module: only a bounded, versioned attestation is returned.
+#
+# The band is every pixel within ``border_inset`` of a row edge.  For the
+# calibrated QQ 9.9.33.51802 field row (250x64, inset 10) the band holds
+# ``250*64 - 230*44 = 5880`` pixels, so the observed selected/hover dominant
+# ratio ``4584/5880 = 0.779592`` is reproduced exactly.
+# ---------------------------------------------------------------------------
+
+QQ_VM_CLIENT_VERSION = "9.9.33.51802"
+QQ_VM_ROW_SELECTOR_PACK_VERSION = (
+    "q1-session:29e8d4b74eda5b5d97748b28f37bc094a2a4d4e5741f4bc29c93db0e64dbd771"
+)
+QQ_VM_ROW_PALETTE_PROFILE_ID = "qq-9.9.33.51802-row-250x64-inset10-v1"
+QQ_VM_ROW_WIDTH = 250
+QQ_VM_ROW_HEIGHT = 64
+QQ_VM_ROW_BORDER_INSET = 10
+
+SELECTION_ATTESTATION_SCHEMA = "pmai-qq-selection-visual-attestation-v1"
+
+
+def _environment_fingerprint(description: str) -> str:
+    return hashlib.sha256(description.encode("utf-8")).hexdigest()
+
+
+QQ_VM_ROW_ENVIRONMENT_FINGERPRINT = (
+    "eeb7a9c2ef3eab397b21173b7c6e790dbee673de3f6de40b395b64b7f543b340"
+)
+
+
+def runtime_id_digest(internal_id: str) -> str:
+    """Hash a runtime locator so an attestation never carries the raw locator."""
+
+    if not isinstance(internal_id, str) or not internal_id:
+        raise ValueError("runtime internal id is required for a selection attestation")
+    return hashlib.sha256(internal_id.encode("utf-8")).hexdigest()
+
+
+def _validate_rgb(value: tuple[int, int, int]) -> tuple[int, int, int]:
+    if len(value) != 3:
+        raise ValueError("an RGB triple is required")
+    for channel in value:
+        if (
+            not isinstance(channel, int)
+            or isinstance(channel, bool)
+            or not 0 <= channel <= 255
+        ):
+            raise ValueError("RGB channels must be integers between 0 and 255")
+    return value
+
+
+def _channel_distance(left: tuple[int, int, int], right: tuple[int, int, int]) -> int:
+    return max(abs(a - b) for a, b in zip(left, right))
+
+
+class RowPaletteState(DomainModel):
+    """One expected border-band palette state of a QQ conversation row."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dominant_rgb: tuple[int, int, int]
+    ratio: float = Field(ge=0, le=1)
+    unique_count: int = Field(ge=1, le=4096)
+
+    @field_validator("dominant_rgb")
+    @classmethod
+    def _rgb(cls, value: tuple[int, int, int]) -> tuple[int, int, int]:
+        return _validate_rgb(value)
+
+
+class ConversationRowPaletteProfile(DomainModel):
+    """Immutable, versioned field-calibrated bound for local palette proof."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile_id: str = Field(min_length=1, max_length=96)
+    client_version: str = Field(min_length=1, max_length=32)
+    selector_pack_version: str = Field(min_length=1, max_length=128)
+    environment_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    row_width: int = Field(ge=32, le=1024)
+    row_height: int = Field(ge=16, le=256)
+    border_inset: int = Field(ge=1, le=64)
+    channel_tolerance: int = Field(default=2, ge=0, le=4)
+    ratio_tolerance: float = Field(default=0.02, gt=0, le=0.05)
+    unique_tolerance: int = Field(default=1, ge=0, le=2)
+    geometry_tolerance: int = Field(default=0, ge=0, le=2)
+    min_unselected_control_rows: int = Field(default=2, ge=2, le=32)
+    poll_interval_seconds: float = Field(default=0.2, ge=0, le=2)
+    hover_settle_seconds: float = Field(default=0.1, ge=0, le=1)
+    max_samples: int = Field(default=12, ge=2, le=120)
+    stable_samples: int = Field(default=2, ge=2, le=5)
+    foreground_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    selected: RowPaletteState
+    hover: RowPaletteState
+    unselected: RowPaletteState
+
+    @model_validator(mode="after")
+    def _coherent(self) -> ConversationRowPaletteProfile:
+        if 2 * self.border_inset >= min(self.row_width, self.row_height):
+            raise ValueError("border inset leaves no interior in the calibrated row")
+        if self.max_samples < self.stable_samples:
+            raise ValueError("the sample budget must allow a stable confirmation")
+        states = {
+            "selected": self.selected.dominant_rgb,
+            "hover": self.hover.dominant_rgb,
+            "unselected": self.unselected.dominant_rgb,
+        }
+        names = tuple(states)
+        for index, name in enumerate(names):
+            for other in names[index + 1:]:
+                if (
+                    _channel_distance(states[name], states[other])
+                    <= self.channel_tolerance
+                ):
+                    raise ValueError(
+                        f"{name} and {other} palettes are not distinguishable"
+                    )
+        return self
+
+    def state_for(self, sample: "RowBorderSample") -> "RowVisualState":
+        return classify_row_border(sample, self)
+
+
+QQ_VM_ROW_PALETTE_PROFILE = ConversationRowPaletteProfile(
+    profile_id=QQ_VM_ROW_PALETTE_PROFILE_ID,
+    client_version=QQ_VM_CLIENT_VERSION,
+    selector_pack_version=QQ_VM_ROW_SELECTOR_PACK_VERSION,
+    environment_fingerprint=QQ_VM_ROW_ENVIRONMENT_FINGERPRINT,
+    row_width=QQ_VM_ROW_WIDTH,
+    row_height=QQ_VM_ROW_HEIGHT,
+    border_inset=QQ_VM_ROW_BORDER_INSET,
+    channel_tolerance=2,
+    ratio_tolerance=0.02,
+    unique_tolerance=1,
+    geometry_tolerance=0,
+    min_unselected_control_rows=2,
+    poll_interval_seconds=0.2,
+    hover_settle_seconds=0.1,
+    max_samples=12,
+    stable_samples=2,
+    foreground_timeout_seconds=2.0,
+    selected=RowPaletteState(dominant_rgb=(225, 225, 225), ratio=0.779592, unique_count=12),
+    hover=RowPaletteState(dominant_rgb=(235, 235, 235), ratio=0.779592, unique_count=8),
+    unselected=RowPaletteState(dominant_rgb=(245, 245, 245), ratio=1.0, unique_count=1),
+)
+
+
+class RowBorderSample(DomainModel):
+    """Content-free summary of one row's local border-band pixels."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pixel_count: int = Field(ge=1, le=4_000_000)
+    dominant_rgb: tuple[int, int, int]
+    dominant_count: int = Field(ge=1, le=4_000_000)
+    ratio: float = Field(ge=0, le=1)
+    unique_count: int = Field(ge=1, le=4096)
+
+    @field_validator("dominant_rgb")
+    @classmethod
+    def _rgb(cls, value: tuple[int, int, int]) -> tuple[int, int, int]:
+        return _validate_rgb(value)
+
+
+RowVisualState = Literal["selected", "hover", "unselected", "unknown"]
+
+
+def summarize_border_pixels(
+    bgra: bytes | bytearray,
+    *,
+    width: int,
+    height: int,
+    inset: int,
+) -> RowBorderSample:
+    """Summarize only the border band of one raw top-down BGRA row frame."""
+
+    if width <= 0 or height <= 0:
+        raise ValueError("row frame geometry must be positive")
+    if inset < 1 or 2 * inset >= min(width, height):
+        raise ValueError("border inset leaves no interior in the row frame")
+    if len(bgra) != width * height * 4:
+        raise ValueError("BGRA frame length does not match geometry")
+    counts: dict[tuple[int, int, int], int] = {}
+    total = 0
+    for y in range(height):
+        inside_rows = inset <= y < height - inset
+        line = y * width * 4
+        for x in range(width):
+            if inside_rows and inset <= x < width - inset:
+                continue
+            offset = line + x * 4
+            colour = (bgra[offset + 2], bgra[offset + 1], bgra[offset])
+            counts[colour] = counts.get(colour, 0) + 1
+            total += 1
+    dominant_rgb, dominant_count = max(
+        counts.items(), key=lambda item: (item[1], item[0])
+    )
+    return RowBorderSample(
+        pixel_count=total,
+        dominant_rgb=dominant_rgb,
+        dominant_count=dominant_count,
+        ratio=dominant_count / total,
+        unique_count=len(counts),
+    )
+
+
+def classify_row_border(
+    sample: RowBorderSample, profile: ConversationRowPaletteProfile
+) -> RowVisualState:
+    """Map one border sample onto a calibrated palette state, fail-closed."""
+
+    matches: list[str] = []
+    for name in ("selected", "hover", "unselected"):
+        expected: RowPaletteState = getattr(profile, name)
+        if (
+            _channel_distance(sample.dominant_rgb, expected.dominant_rgb)
+            <= profile.channel_tolerance
+            and abs(sample.ratio - expected.ratio) <= profile.ratio_tolerance
+            and abs(sample.unique_count - expected.unique_count)
+            <= profile.unique_tolerance
+        ):
+            matches.append(name)
+    if len(matches) != 1:
+        return "unknown"
+    return matches[0]  # type: ignore[return-value]
+
+
+class RowPaletteSummary(DomainModel):
+    """Bounded, content-free palette evidence for a single row."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dominant_rgb: tuple[int, int, int]
+    ratio: float = Field(ge=0, le=1)
+    unique_count: int = Field(ge=1, le=4096)
+    pixel_count: int = Field(ge=1, le=4_000_000)
+
+    @field_validator("dominant_rgb")
+    @classmethod
+    def _rgb(cls, value: tuple[int, int, int]) -> tuple[int, int, int]:
+        return _validate_rgb(value)
+
+    @classmethod
+    def from_sample(cls, sample: RowBorderSample) -> "RowPaletteSummary":
+        return cls(
+            dominant_rgb=sample.dominant_rgb,
+            ratio=sample.ratio,
+            unique_count=sample.unique_count,
+            pixel_count=sample.pixel_count,
+        )
+
+
+class SelectionVisualAttestation(DomainModel):
+    """Success-only proof; carries no PNG, row text, chat text or title."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["pmai-qq-selection-visual-attestation-v1"] = (
+        SELECTION_ATTESTATION_SCHEMA
+    )
+    profile_id: str = Field(min_length=1, max_length=96)
+    client_version: str = Field(min_length=1, max_length=32)
+    selector_pack_version: str = Field(min_length=1, max_length=128)
+    environment_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    process_id: int = Field(gt=0)
+    window_handle: int = Field(gt=0)
+    target_runtime_id_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    row_rect: ScreenRect
+    sample_count: int = Field(ge=1, le=120)
+    stable_sample_count: int = Field(ge=2, le=5)
+    unselected_control_count: int = Field(ge=2, le=64)
+    selected: RowPaletteSummary
+    unselected: RowPaletteSummary
+
+    @model_validator(mode="after")
+    def _selected_is_selected_palette(self) -> SelectionVisualAttestation:
+        # ``stable_sample_count`` cannot exceed the bounded sample budget.
+        if self.stable_sample_count > self.sample_count:
+            raise ValueError("stable sample count cannot exceed the sample count")
+        return self
