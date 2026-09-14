@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import messenger_ai.runtime.one_shot as one_shot_module
+import pytest
 from messenger_ai.adapters.qq.models import QQIdentityBinding
 from messenger_ai.domain import SendOperation, SendStatus
 from messenger_ai.runtime.due_dispatch import DueCoordinator
@@ -62,6 +64,84 @@ def test_ledger_blocks_new_attempt_id_for_same_binding_source(tmp_path) -> None:
     )
 
 
+def test_ledger_releases_only_an_explicit_terminal_pre_provider_batch(
+    tmp_path,
+) -> None:
+    ledger = OneShotAttemptLedger(tmp_path / "reclaim.sqlite3")
+    first, second = uuid4(), uuid4()
+    sources = ("source-1", "source-2")
+    assert ledger.claim(
+        attempt_id=first,
+        binding_id="session-contact-1",
+        source_keys=sources,
+    )
+    ledger.update(attempt_id=first, state="pre_provider_timeout")
+
+    assert ledger.claim(
+        attempt_id=second,
+        binding_id="session-contact-1",
+        source_keys=sources,
+    )
+    released = ledger.connection.execute(
+        "SELECT state,evidence_json FROM one_shot_attempts WHERE attempt_id=?",
+        (str(first),),
+    ).fetchone()
+    assert released["state"] == "released_safe"
+    assert json.loads(released["evidence_json"])["replaced_by_attempt_id"] == str(
+        second
+    )
+    owners = ledger.connection.execute(
+        "SELECT DISTINCT attempt_id FROM one_shot_sources"
+    ).fetchall()
+    assert [row["attempt_id"] for row in owners] == [str(second)]
+
+
+def test_ledger_never_releases_an_active_attempt_without_a_death_witness(
+    tmp_path,
+) -> None:
+    sources = ("source-1", "source-2")
+    for state in ("claimed", "events_dispatched", "planning_claimed"):
+        ledger = OneShotAttemptLedger(tmp_path / f"active-{state}.sqlite3")
+        assert ledger.claim(
+            attempt_id=uuid4(),
+            binding_id="session-contact-1",
+            source_keys=sources,
+        )
+        if state != "claimed":
+            owner = ledger.connection.execute(
+                "SELECT attempt_id FROM one_shot_attempts"
+            ).fetchone()
+            ledger.update(attempt_id=UUID(owner["attempt_id"]), state=state)
+
+        evidence = ledger.connection.execute(
+            "SELECT evidence_json FROM one_shot_attempts"
+        ).fetchone()
+        assert json.loads(evidence["evidence_json"])["provider_started"] is False
+
+        assert not ledger.claim(
+            attempt_id=uuid4(),
+            binding_id="session-contact-1",
+            source_keys=sources,
+        )
+
+
+def test_ledger_does_not_release_a_partial_pre_provider_batch(tmp_path) -> None:
+    ledger = OneShotAttemptLedger(tmp_path / "partial.sqlite3")
+    first = uuid4()
+    assert ledger.claim(
+        attempt_id=first,
+        binding_id="session-contact-1",
+        source_keys=("source-1", "source-2"),
+    )
+    ledger.update(attempt_id=first, state="planning_claimed")
+
+    assert not ledger.claim(
+        attempt_id=uuid4(),
+        binding_id="session-contact-1",
+        source_keys=("source-1",),
+    )
+
+
 def test_handoff_requires_distinct_process_and_epoch() -> None:
     operation_id = uuid4()
     assert _handoff_proves_fresh_verify(
@@ -72,6 +152,18 @@ def test_handoff_requires_distinct_process_and_epoch() -> None:
     assert not _handoff_proves_fresh_verify(
         same_process, operation_id=operation_id
     )
+
+
+def test_cancel_plan_requires_a_changed_row() -> None:
+    calls: list[object] = []
+    app = SimpleNamespace(
+        pacing=SimpleNamespace(
+            cancel_plan=lambda *args: calls.append(args) or 0,
+        )
+    )
+
+    assert not one_shot_module._cancel_plan(app, uuid4())
+    assert len(calls) == 1
 
 
 def test_one_shot_no_new_inbound_never_calls_provider_or_due(tmp_path) -> None:
@@ -196,6 +288,284 @@ def test_one_shot_does_not_observe_a_non_temporary_pause(tmp_path) -> None:
 
     assert result.error_code == "ONE_SHOT_TARGET_NOT_ACTIVE_DIRECT"
     assert observed is False
+
+
+def test_one_shot_total_deadline_times_out_observation_before_provider(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+
+    class State:
+        def execution_state(self, _conversation):
+            return 1, 1, False, 1, False
+
+    class Coordinator:
+        async def observe_driver(self, _driver, _conversation):
+            calls.append("observe")
+            await asyncio.Event().wait()
+
+    app = SimpleNamespace(
+        state=State(),
+        coordinator=Coordinator(),
+        driver=object(),
+        planning=SimpleNamespace(run_claimed=lambda *_a, **_k: calls.append("plan")),
+        due=SimpleNamespace(dispatch_exact=lambda **_k: calls.append("due")),
+    )
+
+    result = asyncio.run(
+        run_one_shot_reply(
+            app=app,
+            ledger=OneShotAttemptLedger(tmp_path / "observe-timeout.sqlite3"),
+            binding=binding(),
+            attempt_id=uuid4(),
+            max_wait_seconds=0.05,
+        )
+    )
+
+    assert result.state == "failed"
+    assert result.error_code == "ONE_SHOT_OBSERVE_TIMEOUT"
+    assert result.provider_called is False
+    assert result.action_attempted is False
+    assert calls == ["observe"]
+
+
+def test_one_shot_provider_timeout_never_dispatches_or_releases_source(tmp_path) -> None:
+    calls: list[str] = []
+    plan_id = uuid4()
+
+    class State:
+        connection = None
+
+        def execution_state(self, _conversation):
+            return 1, 1, False, 1, False
+
+        def revisions(self, _conversation):
+            return 1, 2
+
+        def pending_planning_job_for(self, *_args, **_kwargs):
+            return {"binding_revision": 1, "source_keys_json": '["source-1"]'}
+
+        def claim_planning_job_for(self, *_args, **_kwargs):
+            return {"binding_revision": 1, "source_keys_json": '["source-1"]'}
+
+        def plan_artifact_for_revision(self, *_args, **_kwargs):
+            # A provider can finish its durable planning write immediately
+            # before cancellation reaches an async boundary.  Timeout cleanup
+            # must still cancel that exact, attempt-owned plan before return.
+            return {
+                "pacing_plan_id": str(plan_id),
+                "planner_json": '{"reply_segments":["hidden"]}',
+            }
+
+    class Coordinator:
+        async def observe_driver(self, _driver, _conversation):
+            return ("new_message",)
+
+        def dispatch_events(self, **_kwargs):
+            calls.append("events")
+
+    class Planning:
+        async def run_claimed(self, *_args, **_kwargs):
+            calls.append("provider")
+            await asyncio.Event().wait()
+
+    class Due:
+        async def dispatch_exact(self, **_kwargs):
+            calls.append("due")
+            raise AssertionError("deadline must stop before due dispatch")
+
+    ledger = OneShotAttemptLedger(tmp_path / "provider-timeout.sqlite3")
+    result = asyncio.run(
+        run_one_shot_reply(
+            app=SimpleNamespace(
+                state=State(),
+                coordinator=Coordinator(),
+                planning=Planning(),
+                due=Due(),
+                driver=object(),
+                pacing=SimpleNamespace(
+                    cancel_plan=lambda *_a: calls.append("cancel") or 1
+                ),
+            ),
+            ledger=ledger,
+            binding=binding(),
+            attempt_id=uuid4(),
+            max_wait_seconds=0.05,
+        )
+    )
+
+    assert result.state == "uncertain"
+    assert result.error_code == "ONE_SHOT_PROVIDER_TIMEOUT"
+    assert result.provider_called is True
+    assert result.action_attempted is False
+    assert result.pacing_plan_id == plan_id
+    assert calls == ["events", "provider", "cancel"]
+    state = ledger.connection.execute(
+        "SELECT state FROM one_shot_attempts"
+    ).fetchone()
+    assert state["state"] == "provider_timeout_ambiguous"
+    assert not ledger.claim(
+        attempt_id=uuid4(),
+        binding_id="session-contact-1",
+        source_keys=("source-1",),
+    )
+
+
+@pytest.mark.parametrize(
+    ("cancel_result", "expected_state", "expected_error"),
+    (
+        (1, "deferred_cancelled", "ONE_SHOT_WAIT_TIMEOUT"),
+        (0, "uncertain", "ONE_SHOT_TIMEOUT_CLEANUP_FAILED"),
+    ),
+)
+def test_one_shot_expiry_after_planning_requires_confirmed_cancellation(
+    monkeypatch, tmp_path, cancel_result, expected_state, expected_error
+) -> None:
+    class Clock:
+        value = 0.0
+
+        @classmethod
+        def monotonic(cls) -> float:
+            return cls.value
+
+    monkeypatch.setattr(one_shot_module.time, "monotonic", Clock.monotonic)
+    calls: list[str] = []
+    plan_id = uuid4()
+
+    class State:
+        connection = None
+
+        def execution_state(self, _conversation):
+            return 1, 1, False, 1, False
+
+        def revisions(self, _conversation):
+            return 1, 2
+
+        def pending_planning_job_for(self, *_args, **_kwargs):
+            return {"binding_revision": 1, "source_keys_json": '["source-1"]'}
+
+        def claim_planning_job_for(self, *_args, **_kwargs):
+            return {"binding_revision": 1, "source_keys_json": '["source-1"]'}
+
+        def plan_artifact_for_revision(self, *_args, **_kwargs):
+            return {
+                "pacing_plan_id": str(plan_id),
+                "planner_json": '{"reply_segments":["hidden"]}',
+            }
+
+    class Coordinator:
+        async def observe_driver(self, _driver, _conversation):
+            return ("new_message",)
+
+        def dispatch_events(self, **_kwargs):
+            calls.append("events")
+
+    class Planning:
+        async def run_claimed(self, *_args, **_kwargs):
+            Clock.value = 2.0
+            return "scheduled"
+
+    class Due:
+        async def dispatch_exact(self, **_kwargs):
+            calls.append("due")
+            raise AssertionError("expired one-shot must not dispatch")
+
+    result = asyncio.run(
+        run_one_shot_reply(
+            app=SimpleNamespace(
+                state=State(),
+                coordinator=Coordinator(),
+                planning=Planning(),
+                due=Due(),
+                driver=object(),
+                pacing=SimpleNamespace(
+                    cancel_plan=lambda *_a: calls.append("cancel") or cancel_result
+                ),
+            ),
+            ledger=OneShotAttemptLedger(tmp_path / "post-plan-timeout.sqlite3"),
+            binding=binding(),
+            attempt_id=uuid4(),
+            max_wait_seconds=1,
+        )
+    )
+
+    assert result.state == expected_state
+    assert result.error_code == expected_error
+    assert calls == ["events", "cancel"]
+
+
+def test_one_shot_dispatch_timeout_is_quarantined_and_never_reclaimable(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+    plan_id = uuid4()
+
+    class State:
+        connection = None
+
+        def execution_state(self, _conversation):
+            return 1, 1, False, 1, False
+
+        def revisions(self, _conversation):
+            return 1, 2
+
+        def pending_planning_job_for(self, *_args, **_kwargs):
+            return {"binding_revision": 1, "source_keys_json": '["source-1"]'}
+
+        def claim_planning_job_for(self, *_args, **_kwargs):
+            return {"binding_revision": 1, "source_keys_json": '["source-1"]'}
+
+        def plan_artifact_for_revision(self, *_args, **_kwargs):
+            return {
+                "pacing_plan_id": str(plan_id),
+                "planner_json": '{"reply_segments":["hidden"]}',
+            }
+
+    class Coordinator:
+        async def observe_driver(self, _driver, _conversation):
+            return ("new_message",)
+
+        def dispatch_events(self, **_kwargs):
+            calls.append("events")
+
+    class Planning:
+        async def run_claimed(self, *_args, **_kwargs):
+            return "scheduled"
+
+    class Due:
+        async def dispatch_exact(self, **_kwargs):
+            calls.append("due")
+            await asyncio.Event().wait()
+
+    ledger = OneShotAttemptLedger(tmp_path / "dispatch-timeout.sqlite3")
+    result = asyncio.run(
+        run_one_shot_reply(
+            app=SimpleNamespace(
+                state=State(),
+                coordinator=Coordinator(),
+                planning=Planning(),
+                due=Due(),
+                driver=object(),
+                pacing=SimpleNamespace(
+                    cancel_plan=lambda *_a: calls.append("cancel") or 1
+                ),
+            ),
+            ledger=ledger,
+            binding=binding(),
+            attempt_id=uuid4(),
+            max_wait_seconds=0.05,
+        )
+    )
+
+    assert result.state == "uncertain"
+    assert result.error_code == "ONE_SHOT_DISPATCH_TIMEOUT"
+    assert result.action_attempted is True
+    assert calls == ["events", "due", "cancel"]
+    assert not ledger.claim(
+        attempt_id=uuid4(),
+        binding_id="session-contact-1",
+        source_keys=("source-1",),
+    )
 
 
 def test_one_shot_dispatches_only_exact_plan_once_and_requires_fresh_verify(

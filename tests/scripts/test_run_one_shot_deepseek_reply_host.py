@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 SOURCE = (
-    Path(__file__).parents[2].parent
-    / "qq-vm"
-    / "install"
+    Path(__file__).parents[2]
+    / "scripts"
+    / "deployment"
+    / "host"
     / "run_one_shot_deepseek_reply_host.py"
 )
 SPEC = importlib.util.spec_from_file_location("run_one_shot_reply_host", SOURCE)
@@ -33,6 +34,8 @@ def _verified_report() -> dict[str, object]:
         "succeeded": True,
         "provider_called": True,
         "action_attempted": True,
+        "send_action_attempted": True,
+        "selection_action_attempted": False,
         "intent_recorded": True,
         "active_worker_retired": True,
         "active_worker_exit_code": 0,
@@ -78,6 +81,8 @@ def test_no_new_inbound_report_proves_no_api_or_action() -> None:
         "succeeded": False,
         "provider_called": False,
         "action_attempted": False,
+        "send_action_attempted": False,
+        "selection_action_attempted": None,
         "intent_recorded": True,
         "active_worker_retired": True,
         "active_worker_exit_code": 0,
@@ -100,6 +105,18 @@ def test_report_rejects_unknown_content_bearing_field() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "field", ("send_action_attempted", "selection_action_attempted")
+)
+def test_report_requires_explicit_action_evidence_fields(field) -> None:
+    report = _verified_report()
+    del report[field]
+    with pytest.raises(RuntimeError, match="SCHEMA_INVALID"):
+        MODULE._validate_guest_report(
+            report, binding_id=BINDING, attempt_id=ATTEMPT
+        )
+
+
 def test_nonterminal_report_is_never_a_completed_result() -> None:
     report = {
         "schema": MODULE.REPORT_SCHEMA,
@@ -109,6 +126,8 @@ def test_nonterminal_report_is_never_a_completed_result() -> None:
         "succeeded": False,
         "provider_called": False,
         "action_attempted": False,
+        "send_action_attempted": False,
+        "selection_action_attempted": None,
         "intent_recorded": True,
         "active_worker_retired": False,
         "source_key_hashes": [],
@@ -200,3 +219,5 @@ def test_projection_does_not_emit_extra_fields() -> None:
         _verified_report(), binding_id=BINDING, attempt_id=ATTEMPT
     )
     assert "reply_text" not in json.dumps(projected)
+    assert projected["send_action_attempted"] is True
+    assert projected["selection_action_attempted"] is False

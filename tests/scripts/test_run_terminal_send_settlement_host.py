@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 SOURCE = (
-    Path(__file__).parents[2].parent
-    / "qq-vm"
-    / "install"
+    Path(__file__).parents[2]
+    / "scripts"
+    / "deployment"
+    / "host"
     / "run_terminal_send_settlement_host.py"
 )
 SPEC = importlib.util.spec_from_file_location(

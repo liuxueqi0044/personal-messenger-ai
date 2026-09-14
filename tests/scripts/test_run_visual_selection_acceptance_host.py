@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 SOURCE = (
-    Path(__file__).parents[2].parent
-    / "qq-vm"
-    / "install"
+    Path(__file__).parents[2]
+    / "scripts"
+    / "deployment"
+    / "host"
     / "run_visual_selection_acceptance_host.py"
 )
 SPEC = importlib.util.spec_from_file_location(
