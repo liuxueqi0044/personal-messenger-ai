@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import re
 import secrets
@@ -57,6 +58,22 @@ from .visual_selection import (
 )
 
 CurrentDirectIdentity = QQCertifiedDirectIdentity | QQSessionObservedDirectIdentity
+
+
+def _validated_prepare_write_reserve(value: object) -> float:
+    """Return a finite reserve large enough to be an effective write fence."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("prepare write reserve must be a number")
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("prepare write reserve must be a finite number") from exc
+    if not math.isfinite(parsed) or parsed < 1.0 or parsed > 600:
+        raise ValueError(
+            "prepare write reserve must be at least 1 and no more than 600 seconds"
+        )
+    return parsed
 
 
 _SAFE_EXCEPTION_MESSAGES = {
@@ -202,6 +219,7 @@ class QQVMWorker:
                  selection_actuator: ConversationSelectionActuator | None = None,
                  selection_visual_profile: ConversationRowPaletteProfile | None = None,
                  selection_handoff_signing_key: bytes | None = None,
+                 prepare_write_reserve_seconds: float = 5.0,
                  expected_window: tuple[int, int] | None = None,
                  window_validator: Callable[[QQWindow], None] | None = None,
                  run_id: str | None = None) -> None:
@@ -224,6 +242,9 @@ class QQVMWorker:
         )
         if len(self._selection_handoff_signing_key) < 32:
             raise ValueError("selection handoff signing key is too short")
+        self._prepare_write_reserve_seconds = _validated_prepare_write_reserve(
+            prepare_write_reserve_seconds
+        )
         self._expected_window = expected_window
         self._window_validator = window_validator
         self._reservation_binding_id: str | None = None
@@ -492,6 +513,22 @@ class QQVMWorker:
             "segment_ref": command.segment_ref,
             "prepared_evidence": portable.model_dump(mode="json"),
         }
+        if (
+            command.deadline is not None
+            and (command.deadline - datetime.now(UTC)).total_seconds()
+            <= self._prepare_write_reserve_seconds
+        ):
+            # Selection, identity proof and bubble reads are read-only.  Do not
+            # cross the composer-write boundary unless enough of the parent
+            # watchdog remains for write, post-write identity proof and exact
+            # readback.  This keeps a slow QQ/UIA snapshot fail-safe instead of
+            # turning a preventable pre-write delay into an uncertain draft.
+            return self._result(
+                command,
+                WorkerStatus.FAILED_SAFE,
+                "prepare_write_budget_exhausted",
+                evidence={"composer_written": False},
+            )
         # Establish cleanup ownership before crossing the composer-write
         # boundary. Any partial write or post-write identity failure remains
         # reserved to this exact operation until a proven ABORT succeeds.
@@ -1214,11 +1251,15 @@ class QQVMWorkerProcess:
                  session_evidence: tuple[QQSessionObservedDirectIdentity, ...] = (),
                  run_id: str | None = None,
                  visual_selection: VisualSelectionConfig | None = None,
-                 visual_api_key: str | None = None) -> None:
+                 visual_api_key: str | None = None,
+                 prepare_write_reserve_seconds: float = 5.0) -> None:
         self._selector_pack, self._bindings = selector_pack, bindings
         self._session_evidence = session_evidence
         self._visual_selection = visual_selection
         self._visual_api_key = visual_api_key
+        self._prepare_write_reserve_seconds = _validated_prepare_write_reserve(
+            prepare_write_reserve_seconds
+        )
         self._selection_handoff_signing_key = secrets.token_bytes(32)
         self._parent, child = mp.get_context("spawn").Pipe()
         self._process = mp.get_context("spawn").Process(
@@ -1232,6 +1273,7 @@ class QQVMWorkerProcess:
                 visual_selection,
                 visual_api_key,
                 self._selection_handoff_signing_key,
+                self._prepare_write_reserve_seconds,
             ),
             daemon=True,
         )
@@ -1268,6 +1310,7 @@ class QQVMWorkerProcess:
             run_id=self._run_id,
             visual_selection=self._visual_selection,
             visual_api_key=self._visual_api_key,
+            prepare_write_reserve_seconds=self._prepare_write_reserve_seconds,
         )
 
     def mint_selection_handoff(self, **kwargs) -> SelectionHandoff:
@@ -1595,6 +1638,7 @@ def _construct_runtime_worker(
     visual_selection: VisualSelectionConfig | None = None,
     visual_api_key: str | None = None,
     selection_handoff_signing_key: bytes | None = None,
+    prepare_write_reserve_seconds: float = 5.0,
 ) -> QQVMWorker:
     accessibility = WindowsUIAQQAccessibility()
     selection_visual_profile = (
@@ -1634,6 +1678,7 @@ def _construct_runtime_worker(
                       selection_actuator=selection_actuator,
                       selection_visual_profile=selection_visual_profile,
                       selection_handoff_signing_key=selection_handoff_signing_key,
+                      prepare_write_reserve_seconds=prepare_write_reserve_seconds,
                       expected_window=certifier.window_scope if certifier else None,
                       window_validator=certifier.validate_window if certifier else None,
                       run_id=run_id)
@@ -1644,7 +1689,8 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
            run_id: str | None = None,
            visual_selection: VisualSelectionConfig | None = None,
            visual_api_key: str | None = None,
-           selection_handoff_signing_key: bytes | None = None) -> None:
+           selection_handoff_signing_key: bytes | None = None,
+           prepare_write_reserve_seconds: float = 5.0) -> None:
     try:
         worker = _construct_runtime_worker(
             selector_pack,
@@ -1654,6 +1700,7 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
             visual_selection,
             visual_api_key,
             selection_handoff_signing_key,
+            prepare_write_reserve_seconds,
         )
     except Exception as exc:
         # Stay alive long enough to answer the parent's mandatory HEALTH

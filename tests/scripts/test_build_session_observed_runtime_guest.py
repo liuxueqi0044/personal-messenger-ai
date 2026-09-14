@@ -160,6 +160,8 @@ def test_second_contact_requires_flag_and_preserves_stable_mapping(tmp_path, mon
     assert module.main([]) == 0
     default_config = json.loads(output.read_text(encoding="utf-8"))
     assert default_config["data_dir"] == str(data_root)
+    assert default_config["worker_timeout_seconds"] == 90
+    assert default_config["prepare_write_reserve_seconds"] == 20
     assert [item["contact_id"] for item in default_config["bindings"]] == ["session-contact-1"]
     assert registration1.is_file()
     assert not registration2.exists()

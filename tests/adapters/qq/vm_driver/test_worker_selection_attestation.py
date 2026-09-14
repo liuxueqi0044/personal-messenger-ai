@@ -833,6 +833,34 @@ def test_prepare_deadline_before_write_never_touches_composer(monkeypatch) -> No
     assert harness.worker._trusted_operation_lease is None
 
 
+def test_prepare_requires_post_write_budget_before_touching_composer(
+    monkeypatch,
+) -> None:
+    harness = _session_harness(monkeypatch)
+    clock = _FrozenClock(datetime.now(UTC))
+    _FakeDateTime.clock = clock
+    monkeypatch.setattr(worker_module, "datetime", _FakeDateTime)
+    prepare = _prepare_command(harness.binding.binding_id).model_copy(
+        update={
+            "deadline": clock.value
+            + timedelta(
+                seconds=harness.worker._prepare_write_reserve_seconds - 1
+            )
+        }
+    )
+
+    result = harness.worker.execute(prepare)
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "prepare_write_budget_exhausted"
+    assert result.evidence == {"composer_written": False}
+    assert harness.fake.composer == ""
+    assert "write-composer" not in harness.fake.calls
+    assert "invoke-send" not in harness.fake.calls
+    assert harness.worker._reservation is None
+    assert harness.worker._trusted_operation_lease is None
+
+
 def test_prepare_post_write_identity_failure_remains_reserved_until_exact_abort(
     monkeypatch,
 ) -> None:

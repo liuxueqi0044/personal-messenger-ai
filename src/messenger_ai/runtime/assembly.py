@@ -88,6 +88,15 @@ class RuntimeApplication:
                 raise RuntimeError("global pause revision changed during control request")
             return revision + 1
 
+    async def dispatch_exact_with_control_fence(self, **kwargs):
+        """Dispatch one exact plan while sharing the global pause/UI fence."""
+
+        async with self._tick_lock:
+            _, globally_paused, _ = self.state.global_control()
+            if globally_paused:
+                return False, None
+            return await self.due.dispatch_exact(**kwargs)
+
     async def run_until_idle(self, *, max_ticks: int = 100) -> None:
         quiet_ticks = 0
         for _ in range(max_ticks):

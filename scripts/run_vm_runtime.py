@@ -8,6 +8,7 @@ import getpass
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import time
@@ -488,6 +489,7 @@ def validate_config(config: dict[str, Any], *, api_key: str | None) -> tuple[QQS
                 raise ValueError("session observed runtime locator does not match binding")
     elif mode is not None:
         raise ValueError("unsupported identity_mode")
+    _validated_worker_timing(config)
     _validated_visual_selection(config, bindings)
     migrations = _validated_session_identity_migrations(config, bindings, evidence)
     bootstrap = config.get("bootstrap_last_inbound_once", [])
@@ -592,12 +594,46 @@ def _validated_visual_selection(
         raise ValueError(
             "the vision model is reserved for contact selection, not reply planning"
         )
-    worker_timeout = float(config.get("worker_timeout_seconds", 15))
-    if visual.timeout_seconds > worker_timeout - 4:
+    worker_timeout, prepare_reserve = _validated_worker_timing(config)
+    if visual.timeout_seconds + prepare_reserve + 4 > worker_timeout:
         raise ValueError(
-            "visual_selection timeout must leave four seconds for worker retirement"
+            "visual_selection timeout must leave the prepare write reserve and "
+            "four seconds for worker retirement"
         )
     return visual
+
+
+def _validated_worker_timing(config: dict[str, Any]) -> tuple[float, float]:
+    raw_timeout = config.get("worker_timeout_seconds", 15)
+    raw_reserve = config.get("prepare_write_reserve_seconds", 5)
+    if (
+        isinstance(raw_timeout, bool)
+        or not isinstance(raw_timeout, (int, float))
+        or isinstance(raw_reserve, bool)
+        or not isinstance(raw_reserve, (int, float))
+    ):
+        raise ValueError("worker timing values must be numbers")
+    try:
+        worker_timeout = float(raw_timeout)
+        prepare_reserve = float(raw_reserve)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("worker timing values must be finite numbers") from exc
+    if (
+        not math.isfinite(worker_timeout)
+        or worker_timeout <= 0
+        or worker_timeout > 600
+    ):
+        raise ValueError("worker timeout must be greater than 0 and no more than 600")
+    if (
+        not math.isfinite(prepare_reserve)
+        or prepare_reserve < 1
+        or prepare_reserve > worker_timeout - 4
+    ):
+        raise ValueError(
+            "prepare write reserve must be at least one second and leave four seconds "
+            "for worker retirement"
+        )
+    return worker_timeout, prepare_reserve
 
 
 def validate_active_rules(config: dict[str, Any]) -> None:
@@ -639,6 +675,7 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
                    selection_refresh_retry_enabled: bool = True,
                    recover_persistent_state: bool = True):
     pack, bindings, session_evidence = validate_config(config, api_key=api_key)
+    worker_timeout, prepare_write_reserve = _validated_worker_timing(config)
     generation = _validated_runtime_generation(config)
     visual_selection = _validated_visual_selection(config, bindings)
     identity_migrations = _validated_session_identity_migrations(
@@ -681,6 +718,7 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
         bindings,
         session_evidence=session_evidence,
         run_id=run_id,
+        prepare_write_reserve_seconds=prepare_write_reserve,
         **worker_kwargs,
     )
     app_box: dict[str, Any] = {}
@@ -691,7 +729,7 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
     bridge = QQVMDriverBridge(worker=worker, bindings=bindings, text_provider=text_provider,
         sqlite_path=data_dir / "qq-vm-bridge.sqlite3", bootstrap_last_inbound=tuple(bootstrap),
         bootstrap_last_inbound_provenance=dict(config.get("bootstrap_last_inbound_provenance", {})),
-        timeout_seconds=float(config.get("worker_timeout_seconds", 15)),
+        timeout_seconds=worker_timeout,
         selection_refresh_retry_enabled=selection_refresh_retry_enabled,
         recover_persistent_state=recover_persistent_state)
     try:

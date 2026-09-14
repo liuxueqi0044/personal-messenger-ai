@@ -63,6 +63,51 @@ def _worker():
     return QQVMWorker(accessibility=fake, selector_pack=pack, bindings=(binding,)), fake, binding.binding_id
 
 
+@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), 0.5])
+def test_worker_rejects_invalid_prepare_write_reserve(value) -> None:
+    adapter, fake = _adapter()
+    binding = next(iter(adapter.bindings.values()))
+
+    with pytest.raises(ValueError, match="prepare write reserve"):
+        QQVMWorker(
+            accessibility=fake,
+            selector_pack=adapter.selector_pack,
+            bindings=(binding,),
+            prepare_write_reserve_seconds=value,
+        )
+
+    with pytest.raises(ValueError, match="prepare write reserve"):
+        QQVMWorkerProcess(
+            adapter.selector_pack,
+            (binding,),
+            prepare_write_reserve_seconds=value,
+        )
+
+
+def test_worker_process_successor_preserves_prepare_write_reserve() -> None:
+    original = QQVMWorkerProcess
+    captured = {}
+
+    class Successor(original):
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    facade = Successor.__new__(Successor)
+    facade._selector_pack = object()
+    facade._bindings = (object(),)
+    facade._session_evidence = (object(),)
+    facade._run_id = "run-id"
+    facade._visual_selection = object()
+    facade._visual_api_key = "visual-key"
+    facade._prepare_write_reserve_seconds = 23.0
+
+    successor = original.spawn_successor(facade)
+
+    assert isinstance(successor, Successor)
+    assert captured["kwargs"]["prepare_write_reserve_seconds"] == 23.0
+
+
 class _SelectionActuator:
     def __init__(self, outcome):
         self.outcome = outcome

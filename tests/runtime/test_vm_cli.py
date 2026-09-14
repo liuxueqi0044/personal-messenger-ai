@@ -104,6 +104,7 @@ def _write_config(path: Path, value: dict) -> None:
 
 def test_visual_selection_config_is_binding_complete_and_timeout_bounded(tmp_path):
     config = _config(tmp_path)
+    config["worker_timeout_seconds"] = 20
     config["visual_selection"] = {
         "model": "deepseek-v4-flash-vision-exp",
         "labels": {"bind-1": "联系人乙"},
@@ -124,6 +125,7 @@ def test_visual_selection_config_is_binding_complete_and_timeout_bounded(tmp_pat
 
 def test_visual_selection_rejects_text_model_and_timeout_without_retirement_budget(tmp_path):
     config = _config(tmp_path)
+    config["worker_timeout_seconds"] = 20
     config["visual_selection"] = {
         "model": "deepseek-v4-flash",
         "labels": {"bind-1": "联系人乙"},
@@ -136,12 +138,63 @@ def test_visual_selection_rejects_text_model_and_timeout_without_retirement_budg
         "labels": {"bind-1": "联系人乙"},
         "timeout_seconds": 12,
     }
-    with pytest.raises(ValueError, match="leave four seconds"):
+    with pytest.raises(ValueError, match="four seconds"):
         cli.validate_config(config, api_key="test-key")
 
     config["visual_selection"]["timeout_seconds"] = 8
     config["model"] = "deepseek-v4-flash-vision-exp"
     with pytest.raises(ValueError, match="reserved for contact selection"):
+        cli.validate_config(config, api_key="test-key")
+
+
+def test_prepare_write_reserve_is_bounded_by_worker_timeout(tmp_path):
+    config = _config(tmp_path)
+    config["worker_timeout_seconds"] = 90
+    config["prepare_write_reserve_seconds"] = 20
+
+    assert cli._validated_worker_timing(config) == (90.0, 20.0)
+    cli.validate_config(config, api_key="test-key")
+
+    config["prepare_write_reserve_seconds"] = 87
+    with pytest.raises(ValueError, match="four seconds"):
+        cli.validate_config(config, api_key="test-key")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("worker_timeout_seconds", True),
+        ("worker_timeout_seconds", float("nan")),
+        ("worker_timeout_seconds", 10**1000),
+        ("prepare_write_reserve_seconds", True),
+        ("prepare_write_reserve_seconds", float("inf")),
+        ("prepare_write_reserve_seconds", 0.5),
+    ],
+)
+def test_worker_timing_rejects_non_finite_or_ineffective_values(
+    tmp_path, field, value
+):
+    config = _config(tmp_path)
+    config[field] = value
+
+    with pytest.raises(
+        ValueError,
+        match="worker timing|worker timeout|prepare write reserve",
+    ):
+        cli.validate_config(config, api_key="test-key")
+
+
+def test_visual_selection_timeout_accounts_for_prepare_write_reserve(tmp_path):
+    config = _config(tmp_path)
+    config["worker_timeout_seconds"] = 30
+    config["prepare_write_reserve_seconds"] = 20
+    config["visual_selection"] = {
+        "model": "deepseek-v4-flash-vision-exp",
+        "labels": {"bind-1": "contact-label"},
+        "timeout_seconds": 7,
+    }
+
+    with pytest.raises(ValueError, match="prepare write reserve"):
         cli.validate_config(config, api_key="test-key")
 
 
@@ -563,6 +616,7 @@ def test_isolated_pause_exists_before_bridge_recovery(tmp_path, monkeypatch):
 def test_build_runtime_keeps_visual_selection_separate_from_reply_provider(tmp_path, monkeypatch):
     _patch_external(monkeypatch)
     cfg = _config(tmp_path)
+    cfg["worker_timeout_seconds"] = 20
     cfg["visual_selection"] = {
         "model": "deepseek-v4-flash-vision-exp",
         "labels": {"bind-1": "联系人乙"},
@@ -579,6 +633,7 @@ def test_build_runtime_keeps_visual_selection_separate_from_reply_provider(tmp_p
     assert FakeProvider.instances[-1].kwargs["model"] == "deepseek-v4-flash"
     assert worker.kwargs["visual_selection"].model == "deepseek-v4-flash-vision-exp"
     assert worker.kwargs["visual_api_key"] == "key"
+    assert worker.kwargs["prepare_write_reserve_seconds"] == 5.0
     cli._shutdown(app)
 
 

@@ -1105,7 +1105,11 @@ def main(argv: list[str] | None = None) -> int:
         "data_dir": str(DATA_ROOT),
         "secret_vault": r"C:\PMAI\secrets",
         "model": "deepseek-v4-flash",
-        "worker_timeout_seconds": 45,
+        # Cold QQ Chromium/UIA snapshots on the recovery VM have exceeded 45
+        # seconds.  Keep a bounded watchdog, but leave enough time for the
+        # worker's pre-write safety reserve and post-write verification.
+        "worker_timeout_seconds": 90,
+        "prepare_write_reserve_seconds": 20,
         "content_policy_checks_enabled": False,
         "identity_mode": "session_observed_direct",
         "session_observed_evidence": evidences,
