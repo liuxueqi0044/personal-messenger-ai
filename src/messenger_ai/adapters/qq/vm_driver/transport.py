@@ -462,7 +462,18 @@ class WindowsUIAQQAccessibility:
             window, timeout_seconds=foreground_timeout
         )
         _check_selection_deadline(deadline)
-        rows = self._visible_conversation_rows(window, selector)
+        enumerated_rows = self._visible_conversation_rows(window, selector)
+        bounds = self._window_screen_bounds(window)
+        def fully_inside_window(ref: _ConversationRowRef) -> bool:
+            return bool(
+                bounds[0] <= ref.rect.left < ref.rect.right <= bounds[2]
+                and bounds[1] <= ref.rect.top < ref.rect.bottom <= bounds[3]
+            )
+        rows = [
+            ref
+            for ref in enumerated_rows
+            if fully_inside_window(ref)
+        ]
         if not rows:
             raise UIAUnavailable("no visible conversation rows were enumerated")
         target_id = conversation.internal_id
@@ -470,7 +481,6 @@ class WindowsUIAQQAccessibility:
             raise UIAUnavailable(
                 "conversation target is absent or ambiguous in the visible rows"
             )
-        bounds = self._window_screen_bounds(window)
         row_rects = {ref.internal_id: ref.rect for ref in rows}
         for ref in rows:
             rect = ref.rect
@@ -518,7 +528,11 @@ class WindowsUIAQQAccessibility:
                 raise UIAUnavailable(
                     "certified QQ window changed during selection certification"
                 )
-            current = self._visible_conversation_rows(window, selector)
+            current = [
+                ref
+                for ref in self._visible_conversation_rows(window, selector)
+                if fully_inside_window(ref)
+            ]
             if [ref.internal_id for ref in current] != [
                 ref.internal_id for ref in rows
             ]:

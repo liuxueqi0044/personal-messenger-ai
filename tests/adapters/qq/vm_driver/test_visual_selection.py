@@ -677,6 +677,27 @@ def test_two_consecutive_identical_samples_certify_the_exact_target_row() -> Non
     assert len(moves) == 2
 
 
+def test_partially_clipped_non_target_row_is_excluded_from_certification() -> None:
+    target = "runtime:target"
+    rows = [
+        _row("runtime:control-a", 100),
+        _row(target, 200),
+        _row("runtime:control-b", 300),
+        _row("runtime:clipped", 950),
+    ]
+    capture = _capture_by_row({
+        100: UNSELECTED_FRAME,
+        200: SELECTED_FRAME,
+        300: UNSELECTED_FRAME,
+    })
+    access, _moves = _fake_access(rows=rows, capture=capture)
+
+    attestation = _certify(access, target)
+
+    assert attestation.unselected_control_count == 2
+    assert attestation.row_rect == _row_rect(200)
+
+
 def test_hover_row_is_explicitly_rejected_fail_closed() -> None:
     target = "runtime:target"
     rows = [_row("runtime:control-a", 100), _row(target, 200), _row("runtime:control-b", 300)]

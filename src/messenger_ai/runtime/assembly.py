@@ -153,7 +153,9 @@ def assemble_runtime(*, data_dir: str | Path, planner_provider: ModelProvider,
                      authorization_signing_key: bytes, model_concurrency: int = 2,
                      content_policy_checks_enabled: bool = True,
                      clock: ClockPort | None = None,
-                     recover_persistent_state: bool = True) -> RuntimeApplication:
+                     recover_persistent_state: bool = True,
+                     initially_paused: bool = False,
+                     initial_pause_reason: str = "initial_global_pause") -> RuntimeApplication:
     if model_concurrency < 1:
         raise ValueError("model_concurrency must be positive")
     root = Path(data_dir).resolve()
@@ -164,7 +166,18 @@ def assemble_runtime(*, data_dir: str | Path, planner_provider: ModelProvider,
             hub=root / "hub.sqlite3",
             pacing=root / "pacing.sqlite3",
         ),
+        initially_paused=initially_paused,
+        initial_pause_reason=initial_pause_reason,
     )
+    if initially_paused:
+        revision, paused, _reason = state.global_control()
+        if not paused and not state.set_global_pause(
+            paused=True,
+            expected_revision=revision,
+            reason=initial_pause_reason,
+        ):
+            state.close()
+            raise RuntimeError("initial global pause fence changed")
     hub = HubService(SQLiteHubStore(root / "hub.sqlite3"), clock=clock)
     memory = MemoryService(SQLiteMemoryStore(root / "memory.sqlite3"), clock=clock)
     pacing = PacingScheduler(root / "pacing.sqlite3", clock=clock)

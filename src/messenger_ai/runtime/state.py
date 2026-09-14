@@ -60,7 +60,13 @@ class RuntimeState:
         path: str | Path = ":memory:",
         *,
         verified_send_stores: VerifiedSendStorePaths | None = None,
+        initially_paused: bool = False,
+        initial_pause_reason: str = "initial_global_pause",
     ) -> None:
+        if not isinstance(initially_paused, bool):
+            raise TypeError("initially_paused must be a boolean")
+        if initially_paused and not initial_pause_reason:
+            raise ValueError("initial_pause_reason is required when initially paused")
         self._path = str(path)
         self._verified_send_stores = verified_send_stores
         self.connection = sqlite3.connect(self._path, isolation_level=None, check_same_thread=False)
@@ -92,7 +98,6 @@ class RuntimeState:
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL,
           paused INTEGER NOT NULL, reason TEXT
         );
-        INSERT OR IGNORE INTO runtime_global_control VALUES(1,1,0,NULL);
         CREATE TABLE IF NOT EXISTS runtime_segment_executions(
           pacing_plan_id TEXT NOT NULL, segment_index INTEGER NOT NULL, conversation_id TEXT NOT NULL, body_hash TEXT NOT NULL,
           authorization_id TEXT, operation_id TEXT UNIQUE, status TEXT NOT NULL,
@@ -186,6 +191,13 @@ class RuntimeState:
           completed_at TEXT
         );
         """)
+        self.connection.execute(
+            "INSERT OR IGNORE INTO runtime_global_control VALUES(1,1,?,?)",
+            (
+                int(initially_paused),
+                initial_pause_reason if initially_paused else None,
+            ),
+        )
         columns = {
             row["name"]
             for row in self.connection.execute(

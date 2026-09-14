@@ -8,6 +8,18 @@ from messenger_ai.runtime.contracts import Direction, ObservationBatch, Observed
 from messenger_ai.runtime.state import RuntimeState, VerifiedSendStorePaths
 
 
+def test_new_runtime_state_can_be_created_globally_paused(tmp_path):
+    state = RuntimeState(
+        tmp_path / "runtime.sqlite3",
+        initially_paused=True,
+        initial_pause_reason="isolated_identity_recovery",
+    )
+    try:
+        assert state.global_control() == (1, True, "isolated_identity_recovery")
+    finally:
+        state.close()
+
+
 def batch(*messages, revision=1, complete=True):
     return ObservationBatch(
         account_id="account", contact_id="contact", conversation_id="conversation",

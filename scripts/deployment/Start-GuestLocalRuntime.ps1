@@ -1,10 +1,11 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Validate','Bootstrap','BuildAndStart','Pause','Resume','GracefulStop')][string]$Phase,
+    [Parameter(Mandatory)][ValidateSet('Validate','Bootstrap','BuildAndStart','BuildIsolated','BuildIsolatedAndStart','Pause','Resume','GracefulStop')][string]$Phase,
     [ValidatePattern('^session-contact-[1-9][0-9]{0,3}$')][string]$BindingId = 'session-contact-1',
     [switch]$IncludeContact2,
     [ValidateRange(1, 9999)][int[]]$AdditionalContactIndex = @(),
     [ValidateRange(1, 9999)][int[]]$AdoptLatestInboundIndex = @(),
+    [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')][string]$IsolatedRecoveryGeneration,
     [ValidatePattern('^[1-9][0-9]{0,3}=.+$')][string[]]$VisualLabel = @()
 )
 
@@ -75,14 +76,19 @@ function Invoke-Python([string]$Stage, [string]$Script, [string[]]$Arguments) {
     & $python (Join-Path $release $Script) @Arguments 2>&1 | Tee-Object -FilePath $log -Append
     if ($LASTEXITCODE -ne 0) { throw "PYTHON_EXIT_$LASTEXITCODE`:$Stage" }
 }
-$status=[ordered]@{schema='pmai-guest-local-release-launch-v1'; state='running'; succeeded=$false; release_root=$release; phase=$Phase; binding_id=$BindingId; include_contact_2=[bool]$IncludeContact2; additional_contact_indices=@($AdditionalContactIndex); adopt_latest_inbound_indices=@($AdoptLatestInboundIndex); visual_selection_requested=($VisualLabel.Count -gt 0); stage='initialize'; error_code=$null; python_exit_code=$null}
+$status=[ordered]@{schema='pmai-guest-local-release-launch-v1'; state='running'; succeeded=$false; release_root=$release; phase=$Phase; binding_id=$BindingId; include_contact_2=[bool]$IncludeContact2; additional_contact_indices=@($AdditionalContactIndex); adopt_latest_inbound_indices=@($AdoptLatestInboundIndex); isolated_recovery_generation=$IsolatedRecoveryGeneration; visual_selection_requested=($VisualLabel.Count -gt 0); stage='initialize'; error_code=$null; python_exit_code=$null}
 try {
     Save-Status $status
     $additionalIndices = @($AdditionalContactIndex | Sort-Object -Unique)
     $adoptIndices = @($AdoptLatestInboundIndex | Sort-Object -Unique)
     if (@($additionalIndices | Where-Object { $_ -in @(1, 2) }).Count -gt 0) { throw 'ADDITIONAL_CONTACT_INDEX_1_OR_2_INVALID' }
-    if (@($adoptIndices | Where-Object { $_ -notin $additionalIndices }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_ADDITIONAL_CONTACT_INDEX' }
-    if (($additionalIndices.Count -gt 0 -or $adoptIndices.Count -gt 0) -and $Phase -ne 'BuildAndStart') { throw 'ADDITIONAL_CONTACT_OPTIONS_REQUIRE_BUILD_AND_START' }
+    $buildPhases = @('BuildAndStart','BuildIsolated','BuildIsolatedAndStart')
+    $isolatedPhases = @('BuildIsolated','BuildIsolatedAndStart')
+    if ($Phase -eq 'BuildAndStart' -and @($adoptIndices | Where-Object { $_ -notin $additionalIndices }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_ADDITIONAL_CONTACT_INDEX' }
+    if ($Phase -in $isolatedPhases -and @($adoptIndices | Where-Object { $_ -notin (@(1,2) + $additionalIndices) }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_SELECTED_CONTACT_INDEX' }
+    if (($additionalIndices.Count -gt 0 -or $adoptIndices.Count -gt 0) -and $Phase -notin $buildPhases) { throw 'ADDITIONAL_CONTACT_OPTIONS_REQUIRE_BUILD_PHASE' }
+    if ($Phase -in $isolatedPhases -and -not $IsolatedRecoveryGeneration) { throw 'ISOLATED_RECOVERY_GENERATION_REQUIRED' }
+    if ($Phase -notin $isolatedPhases -and $IsolatedRecoveryGeneration) { throw 'ISOLATED_RECOVERY_GENERATION_REQUIRES_ISOLATED_PHASE' }
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'GUEST_VENV_PYTHON_MISSING' }
     $identity=[Security.Principal.WindowsIdentity]::GetCurrent(); $principal=[Security.Principal.WindowsPrincipal]::new($identity)
     if ($env:COMPUTERNAME -ne 'PMAI-QQVM' -or $identity.Name -notlike '*\qqbot' -or $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'GUEST_GUARD_FAILED' }
@@ -110,13 +116,28 @@ try {
         Invoke-Python 'bootstrap' 'qq_session_observed_bootstrap_guest.py' @('--selector-pack',(Join-Path $release 'selector-pack-session-1.json'),'--binding-id',$BindingId,'--operator-observed-direct')
         if (-not (Test-Path -LiteralPath $report -PathType Leaf)) { throw 'BOOTSTRAP_REPORT_MISSING' }
     } else {
+        if ($Phase -eq 'BuildAndStart' -and (Test-Path -LiteralPath 'C:\PMAI\data\runtime-session-1.json' -PathType Leaf)) {
+            try { $currentConfig = Get-Content -Raw -LiteralPath 'C:\PMAI\data\runtime-session-1.json' | ConvertFrom-Json } catch { throw 'CURRENT_RUNTIME_CONFIG_UNREADABLE' }
+            if ($null -ne $currentConfig.runtime_generation) { throw 'ISOLATED_RUNTIME_CONFIG_REQUIRES_EXPLICIT_TRANSITION' }
+        }
+        Invoke-Python 'assert_runtime_stopped' 'run_vm_runtime.py' @('--assert-runtime-stopped')
         $builderArguments = @()
         if ($IncludeContact2) { $builderArguments += '--include-contact-2' }
         foreach ($index in $additionalIndices) { $builderArguments += @('--additional-contact-index', [string]$index) }
         foreach ($index in $adoptIndices) { $builderArguments += @('--adopt-latest-inbound-index', [string]$index) }
+        if ($Phase -in $isolatedPhases) { $builderArguments += @('--isolated-recovery-generation', $IsolatedRecoveryGeneration) }
         foreach ($label in $VisualLabel) { $builderArguments += @('--visual-label', $label) }
         Invoke-Python 'build_runtime_config' 'build_session_observed_runtime_guest.py' $builderArguments
-        Invoke-Python 'runtime_supervisor' 'qq_session_runtime_supervisor_guest.py' @()
+        $runtimeConfig = 'C:\PMAI\data\runtime-session-1.json'
+        $runtimeConfigDigest = (Get-FileHash -LiteralPath $runtimeConfig -Algorithm SHA256).Hash.ToLowerInvariant()
+        try { $builtConfig = Get-Content -Raw -LiteralPath $runtimeConfig | ConvertFrom-Json } catch { throw 'BUILT_RUNTIME_CONFIG_UNREADABLE' }
+        if ($Phase -in $isolatedPhases -and $builtConfig.runtime_generation.generation_id -ne $IsolatedRecoveryGeneration) { throw 'BUILT_RUNTIME_GENERATION_MISMATCH' }
+        Invoke-Python 'runtime_config_check' 'run_vm_runtime.py' @('--config',$runtimeConfig,'--check','--expected-config-sha256',$runtimeConfigDigest)
+        if ($Phase -in @('BuildAndStart','BuildIsolatedAndStart')) {
+            $supervisorArguments = @('--expected-config-sha256',$runtimeConfigDigest)
+            if ($Phase -eq 'BuildIsolatedAndStart') { $supervisorArguments += @('--expected-generation-id',$IsolatedRecoveryGeneration) }
+            Invoke-Python 'runtime_supervisor' 'qq_session_runtime_supervisor_guest.py' $supervisorArguments
+        }
     }
     $status.state='succeeded'; $status.succeeded=$true; $status.stage='complete'; Save-Status $status; exit 0
 } catch {

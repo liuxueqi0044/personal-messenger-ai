@@ -22,6 +22,19 @@ cli = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cli)
 
 
+def test_load_config_binds_the_single_read_to_expected_digest(tmp_path) -> None:
+    path = tmp_path / "runtime.json"
+    payload = json.dumps({"schema": "pmai-v5-runtime-1"}).encode("utf-8")
+    path.write_bytes(payload)
+
+    assert cli.load_config(
+        path, expected_sha256=hashlib.sha256(payload).hexdigest()
+    )["schema"] == "pmai-v5-runtime-1"
+    path.write_bytes(payload + b"\n")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        cli.load_config(path, expected_sha256=hashlib.sha256(payload).hexdigest())
+
+
 class FakeSecrets:
     key = b"deepseek-test-key"
     signing = b"s" * 32
@@ -367,6 +380,115 @@ def test_content_policy_check_config_requires_a_boolean(tmp_path):
         cli.validate_config(cfg, api_key="key")
 
 
+def _isolated_generation_config(tmp_path: Path) -> dict:
+    cli.TRUSTED_RUNTIME_ROOT = tmp_path
+    cfg = _config(tmp_path)
+    cfg["identity_mode"] = "session_observed_direct"
+    raw_proof = _session_evidence(cfg)
+    from messenger_ai.adapters.qq.models import QQSessionObservedDirectIdentity
+
+    proof = QQSessionObservedDirectIdentity.model_validate(raw_proof)
+    for row in (cfg["bindings"][0], cfg["contacts"][0]["binding"]):
+        row["participant_signature"] = proof.participant_signature
+        row["platform_conversation_id"] = (
+            "runtime:" + proof.selected_row_runtime_id_hash
+        )
+    cfg["session_observed_evidence"] = [raw_proof]
+    generation_id = str(uuid4())
+    cfg["data_dir"] = str(
+        tmp_path / "recovery-generations" / generation_id / "qq-default-account"
+    )
+    manifest = {
+        "schema": "pmai-isolated-runtime-generation-manifest-v1",
+        "generation_id": generation_id,
+        "mode": "isolated_identity_recovery",
+        "account_id": "qq-default-account",
+        "contacts": [{
+            "binding_id": proof.binding_id,
+            "account_id": cfg["bindings"][0]["account_id"],
+            "contact_id": cfg["bindings"][0]["contact_id"],
+            "conversation_id": cfg["bindings"][0]["hub_conversation_id"],
+            "platform_conversation_id": cfg["bindings"][0]["platform_conversation_id"],
+            "bootstrap_run_id": str(uuid4()),
+            "evidence_sha256": hashlib.sha256(json.dumps(
+                raw_proof, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest(),
+            "participant_evidence_sha256": hashlib.sha256(
+                proof.participant_signature.encode("utf-8")
+            ).hexdigest(),
+            "initial_adoption_sha256": None,
+        }],
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8")
+    data_dir = Path(cfg["data_dir"])
+    data_dir.mkdir(parents=True)
+    (data_dir / "generation-manifest.json").write_bytes(manifest_bytes)
+    cfg["runtime_generation"] = {
+        "schema": "pmai-isolated-runtime-generation-v1",
+        "generation_id": generation_id,
+        "mode": "isolated_identity_recovery",
+        "enforce_global_pause": True,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    cfg["start_globally_paused"] = True
+    return cfg
+
+
+def test_isolated_runtime_generation_is_path_bound_and_pause_required(tmp_path):
+    cfg = _isolated_generation_config(tmp_path)
+    generation_id = cfg["runtime_generation"]["generation_id"]
+    cli.validate_config(cfg, api_key="key")
+
+    cfg["start_globally_paused"] = False
+    with pytest.raises(ValueError, match="isolated runtime generation is invalid"):
+        cli.validate_config(cfg, api_key="key")
+    cfg["start_globally_paused"] = True
+    cfg["data_dir"] = str(tmp_path / "wrong" / generation_id / "qq-default-account")
+    with pytest.raises(ValueError, match="data directory"):
+        cli.validate_config(cfg, api_key="key")
+
+
+def test_isolated_runtime_generation_binds_exact_adoption_scope(tmp_path):
+    cfg = _isolated_generation_config(tmp_path)
+    manifest_path = Path(cfg["data_dir"]) / "generation-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["contacts"][0]["initial_adoption_sha256"] = "a" * 64
+    manifest_bytes = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+    cfg["runtime_generation"]["manifest_sha256"] = hashlib.sha256(
+        manifest_bytes
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="adoption scope"):
+        cli.validate_config(cfg, api_key="key")
+
+
+def test_isolated_runtime_generation_rejects_reparse_components(
+    tmp_path, monkeypatch
+):
+    cfg = _isolated_generation_config(tmp_path)
+    monkeypatch.setattr(cli, "_has_reparse_component", lambda _path: True)
+    with pytest.raises(ValueError, match="reparse point"):
+        cli.validate_config(cfg, api_key="key")
+
+
+def test_isolated_runtime_generation_rejects_linked_mutable_state(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = _isolated_generation_config(tmp_path)
+    state = Path(cfg["data_dir"]) / "runtime.sqlite3"
+    state.write_bytes(b"state")
+    original = cli._has_reparse_component
+    monkeypatch.setattr(
+        cli,
+        "_has_reparse_component",
+        lambda path: path == state or original(path),
+    )
+
+    with pytest.raises(ValueError, match="state cannot use a reparse point"):
+        cli.validate_config(cfg, api_key="key")
+
+
 def _activate_rule(data_dir: Path) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     store = AtomicRulePackStore(str(data_dir / "rules.sqlite3"))
@@ -398,6 +520,44 @@ def test_build_runtime_uses_real_shared_sqlite_and_cleans_external_worker(tmp_pa
     for connection in (app.state.connection, app.hub.store.connection, app.memory.store.connection, app.pacing.connection, app.rules.connection):
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
+
+
+def test_isolated_generation_starts_globally_paused(tmp_path, monkeypatch):
+    _patch_external(monkeypatch)
+    cfg = _isolated_generation_config(tmp_path)
+    _activate_rule(Path(cfg["data_dir"]))
+
+    app = cli.build_runtime(
+        cfg, api_key="key", authorization_signing_key=b"a" * 32
+    )
+    revision, paused, reason = app.state.global_control()
+    assert revision == 1
+    assert paused is True
+    assert reason == "isolated_identity_recovery"
+    cli._shutdown(app)
+
+
+def test_isolated_pause_exists_before_bridge_recovery(tmp_path, monkeypatch):
+    _patch_external(monkeypatch)
+    cfg = _isolated_generation_config(tmp_path)
+    data_dir = Path(cfg["data_dir"])
+    _activate_rule(data_dir)
+    base = cli.QQVMDriverBridge
+
+    class PauseWitnessBridge(base):
+        def __init__(self, **kwargs):
+            with sqlite3.connect(data_dir / "runtime.sqlite3") as connection:
+                row = connection.execute(
+                    "SELECT paused FROM runtime_global_control WHERE singleton=1"
+                ).fetchone()
+            assert row == (1,)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(cli, "QQVMDriverBridge", PauseWitnessBridge)
+    app = cli.build_runtime(
+        cfg, api_key="key", authorization_signing_key=b"a" * 32
+    )
+    cli._shutdown(app)
 
 
 def test_build_runtime_keeps_visual_selection_separate_from_reply_provider(tmp_path, monkeypatch):
@@ -517,6 +677,24 @@ def test_duplicate_runtime_owner_blocks_before_worker_construction(tmp_path, mon
     assert cli.main(["--config", str(path), "--run-id", str(uuid4())]) == 2
     assert owner.closed
     assert not FakeWorker.instances
+
+
+def test_runtime_stopped_assertion_uses_owner_without_config_or_secrets(monkeypatch):
+    class Owner:
+        acquired = False
+        closed = False
+
+        def acquire(self):
+            self.acquired = True
+
+        def close(self):
+            self.closed = True
+
+    owner = Owner()
+    monkeypatch.setattr(cli, "QQRuntimeInstanceOwner", lambda: owner)
+    assert cli.main(["--assert-runtime-stopped"]) == 0
+    assert owner.acquired is True
+    assert owner.closed is True
 
 
 @pytest.mark.skipif(os.name != "nt", reason="production owner is a Windows named mutex")

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+
+import pytest
 
 
 SOURCE = Path(__file__).parents[2] / "scripts" / "deployment" / "qq_session_runtime_supervisor_guest.py"
@@ -224,6 +227,53 @@ def test_initial_publish_failure_prevents_spawn(monkeypatch) -> None:
     assert SUPERVISOR.main() == 2
 
 
+def test_isolated_supervisor_uses_exact_generation_config_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_dir = tmp_path / "generation"
+    data_dir.mkdir()
+    canonical = tmp_path / "runtime.json"
+    value = {"data_dir": str(data_dir), "runtime_generation": {"generation_id": "x"}}
+    payload = json.dumps(value, sort_keys=True).encode("utf-8")
+    canonical.write_bytes(payload)
+    generation_config = data_dir / "runtime-config.json"
+    generation_config.write_bytes(payload)
+    monkeypatch.setattr(SUPERVISOR, "CONFIG", canonical)
+
+    loaded, selected, digest = SUPERVISOR._runtime_config_snapshot()
+
+    assert loaded == value
+    assert selected == generation_config
+    assert len(digest) == 64
+    generation_config.write_bytes(payload + b"\n")
+    with pytest.raises(ValueError, match="does not match"):
+        SUPERVISOR._runtime_config_snapshot()
+
+
+def test_supervisor_binds_start_to_requested_generation_and_digest() -> None:
+    value = {"runtime_generation": {"generation_id": "generation-a"}}
+    SUPERVISOR._validate_requested_snapshot(
+        value,
+        "a" * 64,
+        expected_config_sha256="A" * 64,
+        expected_generation_id="generation-a",
+    )
+    with pytest.raises(ValueError, match="requested build"):
+        SUPERVISOR._validate_requested_snapshot(
+            value,
+            "a" * 64,
+            expected_config_sha256="b" * 64,
+            expected_generation_id="generation-a",
+        )
+    with pytest.raises(ValueError, match="requested build"):
+        SUPERVISOR._validate_requested_snapshot(
+            value,
+            "a" * 64,
+            expected_config_sha256="a" * 64,
+            expected_generation_id="generation-b",
+        )
+
+
 def test_postspawn_publish_failure_does_not_abandon_polling(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"data_dir": str(tmp_path)}), encoding="utf-8")
@@ -252,13 +302,21 @@ def test_postspawn_publish_failure_does_not_abandon_polling(tmp_path: Path, monk
             self.calls += 1
             return None if self.calls == 1 else 0
     process = Process()
-    monkeypatch.setattr(SUPERVISOR.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    commands = []
+    monkeypatch.setattr(
+        SUPERVISOR.subprocess,
+        "Popen",
+        lambda command, **_kwargs: commands.append(command) or process,
+    )
     monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: BytesIO())
     assert SUPERVISOR.main() == 2
     assert process.calls == 2
     assert len(published) == 4
     assert events[-1]["event"] == "process_exited"
     assert events[-1]["exit_code"] == 0
+    digest_index = commands[0].index("--expected-config-sha256")
+    expected = hashlib.sha256(config.read_bytes()).hexdigest()
+    assert commands[0][digest_index + 1] == expected
 
 
 def test_publish_event_never_serializes_exception_message_or_path(tmp_path: Path, monkeypatch) -> None:

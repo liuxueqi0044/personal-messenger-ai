@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import functools
+import getpass
 import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
+import subprocess
+import sys
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,15 +22,202 @@ from uuid import UUID
 from messenger_ai.adapters.qq.models import QQSessionObservedDirectIdentity
 
 OUTPUT = Path(r"C:\PMAI\data\runtime-session-1.json")
-DATA_ROOT = Path(r"C:\PMAI\data\runtime\qq-default-account")
+ACCOUNT_ID = "qq-default-account"
+RUNTIME_ROOT = Path(r"C:\PMAI\data\runtime")
+DATA_ROOT = RUNTIME_ROOT / ACCOUNT_ID
 BOOTSTRAP_ROOT = Path(r"C:\PMAI\data")
 BRIDGE_DB = DATA_ROOT / "qq-vm-bridge.sqlite3"
 CURSOR_DB = BRIDGE_DB.with_suffix(".cursor.sqlite3")
 RUNTIME_DB = DATA_ROOT / "runtime.sqlite3"
 SOURCE_RULES = Path(r"C:\PMAI\data\rules.sqlite3")
 SELECTOR_PACK = Path(__file__).resolve().parent / "selector-pack-session-1.json"
-ACCOUNT_ID = "qq-default-account"
 MAX_CONTACT_INDEX = 9999
+ISOLATED_GENERATION_SCHEMA = "pmai-isolated-runtime-generation-v1"
+ISOLATED_GENERATION_MANIFEST_SCHEMA = "pmai-isolated-runtime-generation-manifest-v1"
+
+
+class _RuntimeBuildFence:
+    """Hold the runtime ownership mutex while an isolated config is built."""
+
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self) -> None:
+        self._handle: int | None = None
+        self._kernel32: Any | None = None
+
+    def acquire(self) -> None:
+        if os.name != "nt":
+            return
+        identity = "\\".join(
+            part for part in (os.environ.get("USERDOMAIN"), getpass.getuser()) if part
+        )
+        digest = hashlib.sha256(identity.casefold().encode("utf-8")).hexdigest()[:24]
+        name = f"Local\\PersonalMessengerAI.QQRuntime.{digest}"
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_wchar_p,
+        )
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.ReleaseMutex.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, True, name)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "cannot create QQ runtime build fence")
+        if ctypes.get_last_error() == self.ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            raise RuntimeError("QQ runtime must be stopped before isolated recovery build")
+        self._kernel32 = kernel32
+        self._handle = int(handle)
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None or self._kernel32 is None:
+            return
+        self._kernel32.ReleaseMutex(handle)
+        self._kernel32.CloseHandle(handle)
+
+
+def _current_runtime_data_root() -> Path:
+    if not OUTPUT.is_file():
+        return RUNTIME_ROOT / ACCOUNT_ID
+    try:
+        config = json.loads(OUTPUT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("previous runtime config is unreadable") from exc
+    if not isinstance(config, dict) or config.get("schema") != "pmai-v5-runtime-1":
+        raise RuntimeError("previous runtime config is invalid")
+    data_dir = config.get("data_dir")
+    if not isinstance(data_dir, str) or not data_dir:
+        raise RuntimeError("previous runtime data directory is invalid")
+    candidate = Path(data_dir)
+    generation = config.get("runtime_generation")
+    if generation is None:
+        expected = RUNTIME_ROOT / ACCOUNT_ID
+    else:
+        if not isinstance(generation, dict):
+            raise RuntimeError("previous runtime generation is invalid")
+        try:
+            generation_id = str(UUID(str(generation.get("generation_id", ""))))
+        except ValueError as exc:
+            raise RuntimeError("previous runtime generation is invalid") from exc
+        expected = _isolated_generation_root(generation_id)
+    if (
+        not candidate.is_absolute()
+        or ".." in candidate.parts
+        or os.path.normcase(os.path.abspath(str(candidate)))
+        != os.path.normcase(os.path.abspath(str(expected)))
+    ):
+        raise RuntimeError("previous runtime data directory is invalid")
+    return candidate
+
+
+def _previous_runtime_is_paused() -> None:
+    """Require the currently published generation to retain a fail-closed fence."""
+
+    database = _current_runtime_data_root() / "runtime.sqlite3"
+    if not database.is_file():
+        return
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT paused FROM runtime_global_control WHERE singleton=1"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError("previous runtime pause state is unreadable") from exc
+    if row is None or not bool(row[0]):
+        raise RuntimeError("previous runtime must be globally paused before isolated recovery")
+
+
+def _has_reparse_component(path: Path) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    try:
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+    except OSError as exc:
+        raise RuntimeError("isolated generation path is unavailable") from exc
+    return path.is_symlink() or bool(attributes & 0x400)
+
+
+def _prepare_isolated_generation_root(path: Path) -> None:
+    """Create and verify one private, flat generation directory before writes."""
+
+    existing_chain = tuple(
+        component
+        for component in reversed((path, *path.parents))
+        if component.exists() or component.is_symlink()
+    )
+    for component in existing_chain:
+        if _has_reparse_component(component):
+            raise RuntimeError("isolated generation path cannot use a reparse point")
+    path.mkdir(parents=True, exist_ok=True)
+    for component in reversed((path, *path.parents)):
+        if (component.exists() or component.is_symlink()) and _has_reparse_component(component):
+            raise RuntimeError("isolated generation path cannot use a reparse point")
+    for entry in path.iterdir():
+        if _has_reparse_component(entry):
+            raise RuntimeError("isolated generation contents cannot use a reparse point")
+        try:
+            stat = os.stat(entry, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("isolated generation contents are unavailable") from exc
+        if entry.is_file() and int(getattr(stat, "st_nlink", 1)) != 1:
+            raise RuntimeError("isolated generation files must not be hard linked")
+        if entry.is_dir():
+            raise RuntimeError("isolated generation data root must remain flat")
+
+
+def _validate_frozen_candidate(config_path: Path, expected_sha256: str) -> None:
+    """Validate a frozen release candidate before publishing the global pointer."""
+
+    runner = Path(__file__).resolve().with_name("run_vm_runtime.py")
+    if not runner.is_file():
+        # Source-tree unit tests load this deployment module before release
+        # flattening.  Every installable release contains the sibling runner.
+        return
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--config",
+            str(config_path),
+            "--check",
+            "--expected-config-sha256",
+            expected_sha256,
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("isolated generation candidate validation failed")
+
+
+def _fence_isolated_build(function):
+    @functools.wraps(function)
+    def wrapped(argv: list[str] | None = None) -> int:
+        arguments = list(sys.argv[1:] if argv is None else argv)
+        if not any(
+            argument == "--isolated-recovery-generation"
+            or argument.startswith("--isolated-recovery-generation=")
+            for argument in arguments
+        ):
+            return function(argv)
+        fence = _RuntimeBuildFence()
+        fence.acquire()
+        try:
+            _previous_runtime_is_paused()
+            return function(argv)
+        finally:
+            fence.close()
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -61,6 +253,89 @@ CONTACTS = (
 )
 
 
+def _use_data_root(path: Path) -> None:
+    """Retarget all durable paths before contact discovery or validation."""
+
+    global DATA_ROOT, BRIDGE_DB, CURSOR_DB, RUNTIME_DB, CONTACTS
+    DATA_ROOT = path
+    BRIDGE_DB = DATA_ROOT / "qq-vm-bridge.sqlite3"
+    CURSOR_DB = BRIDGE_DB.with_suffix(".cursor.sqlite3")
+    RUNTIME_DB = DATA_ROOT / "runtime.sqlite3"
+    CONTACTS = tuple(
+        ContactRegistration(
+            index,
+            BOOTSTRAP_ROOT / f"qq-session-observed-bootstrap-{index}.json",
+            DATA_ROOT
+            / (
+                "registered-session-scope.json"
+                if index == 1
+                else f"registered-session-scope-{index}.json"
+            ),
+        )
+        for index in (1, 2)
+    )
+
+
+def _isolated_generation_root(generation_id: str) -> Path:
+    try:
+        canonical = str(UUID(generation_id))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("isolated recovery generation must be a UUID") from exc
+    return RUNTIME_ROOT / "recovery-generations" / canonical / ACCOUNT_ID
+
+
+def _isolated_generation_manifest(
+    generation_id: str,
+    selected: tuple[ContactRegistration, ...],
+    evidences: list[dict[str, Any]],
+    signatures: list[str],
+    bootstrap_reports: list[dict[str, Any]],
+    adoptions: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    entries = []
+    for item, evidence, signature, bootstrap in zip(
+        selected, evidences, signatures, bootstrap_reports, strict=True
+    ):
+        try:
+            bootstrap_run_id = str(UUID(str(bootstrap["run_id"])))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"isolated generation bootstrap audit invalid for {item.binding_id}"
+            ) from exc
+        entries.append({
+            "binding_id": item.binding_id,
+            "account_id": ACCOUNT_ID,
+            "contact_id": item.contact_id,
+            "conversation_id": item.conversation_id,
+            "platform_conversation_id": (
+                "runtime:" + evidence["selected_row_runtime_id_hash"]
+            ),
+            "bootstrap_run_id": bootstrap_run_id,
+            "evidence_sha256": hashlib.sha256(
+                json.dumps(
+                    evidence, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+            "participant_evidence_sha256": _memory_evidence_hash(signature),
+            "initial_adoption_sha256": (
+                hashlib.sha256(
+                    json.dumps(
+                        adoptions[item.index], sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                if item.index in adoptions
+                else None
+            ),
+        })
+    return {
+        "schema": ISOLATED_GENERATION_MANIFEST_SCHEMA,
+        "generation_id": generation_id,
+        "mode": "isolated_identity_recovery",
+        "account_id": ACCOUNT_ID,
+        "contacts": entries,
+    }
+
+
 def _contact_registration(index: int) -> ContactRegistration:
     if isinstance(index, bool) or not 1 <= index <= MAX_CONTACT_INDEX:
         raise ValueError(f"contact index must be between 1 and {MAX_CONTACT_INDEX}")
@@ -79,6 +354,62 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(".tmp.json")
     temporary.write_text(json.dumps(value, sort_keys=True, indent=2), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _atomic_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(value)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _validate_rules_database(path: Path, contact_ids: tuple[str, ...]) -> None:
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+            row = connection.execute("PRAGMA quick_check").fetchone()
+            if row is None or row[0] != "ok":
+                raise RuntimeError("RulePack database integrity check failed")
+            active = connection.execute(
+                "SELECT version,payload_json,report_json FROM m7_rulepack_sources "
+                "WHERE status='active' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if (
+                active is None
+                or not isinstance(active[0], str)
+                or not active[0]
+                or not contact_ids
+            ):
+                raise RuntimeError("active RulePack is unavailable")
+            json.loads(active[1])
+            json.loads(active[2])
+    except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("RulePack database integrity check failed") from exc
+
+
+def _install_rules_database(source: Path, target: Path, contact_ids: tuple[str, ...]) -> None:
+    """Create a verified SQLite snapshot and never trust existence after interruption."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        _validate_rules_database(target, contact_ids)
+        return
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as source_db:
+            with closing(sqlite3.connect(temporary)) as target_db:
+                source_db.backup(target_db)
+        _validate_rules_database(temporary, contact_ids)
+        os.replace(temporary, target)
+        _validate_rules_database(target, contact_ids)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _load_successful_bootstrap(
@@ -466,7 +797,9 @@ def _registration_write(
             updated["session_identity_migration"] = migration
         return item.registration, updated, migration
     if item.index == 1 and DATA_ROOT.exists() and any(DATA_ROOT.iterdir()):
-        raise RuntimeError("durable account has no contact-1 registration; explicit rebind required")
+        raise RuntimeError(
+            "durable account has no contact-1 registration; explicit rebind required"
+        )
     if item.index > 1 and _runtime_conversation_exists(item.conversation_id):
         raise RuntimeError(
             f"durable conversation exists without registration for {item.binding_id}; explicit rebind required"
@@ -534,6 +867,7 @@ def _parse_visual_labels(values: list[str]) -> dict[int, str]:
     return labels
 
 
+@_fence_isolated_build
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -579,7 +913,23 @@ def main(argv: list[str] | None = None) -> int:
             "for every selected contact"
         ),
     )
+    parser.add_argument(
+        "--isolated-recovery-generation",
+        help=(
+            "write a fresh, globally paused runtime generation under a UUID-scoped "
+            "data root instead of mutating the current durable account"
+        ),
+    )
     args = parser.parse_args(argv)
+    isolated_generation: str | None = None
+    if args.isolated_recovery_generation is not None:
+        try:
+            isolated_generation = str(UUID(args.isolated_recovery_generation))
+            isolated_root = _isolated_generation_root(isolated_generation)
+            _prepare_isolated_generation_root(isolated_root)
+            _use_data_root(isolated_root)
+        except ValueError as exc:
+            parser.error(str(exc))
     additional = set(args.additional_contact_index)
     adopt = set(args.adopt_latest_inbound_index)
     refresh = set(args.refresh_session_index)
@@ -587,13 +937,15 @@ def main(argv: list[str] | None = None) -> int:
     for index in additional | adopt | refresh | header_upgrade:
         if not 1 <= index <= MAX_CONTACT_INDEX:
             parser.error(f"contact index must be between 1 and {MAX_CONTACT_INDEX}")
-    if adopt - additional:
+    if isolated_generation is None and adopt - additional:
         parser.error("latest inbound adoption requires the same explicit additional contact index")
     if additional & {1, 2}:
         parser.error("contact 1/2 use the existing compatibility options")
     selected_indices = {1} | additional | _existing_registration_indices() | _existing_runtime_indices()
     if args.include_contact_2:
         selected_indices.add(2)
+    if isolated_generation is not None and adopt - selected_indices:
+        parser.error("latest inbound adoption must reference a selected contact index")
     if refresh - selected_indices:
         parser.error("session refresh requires an existing or explicitly included contact index")
     if refresh and refresh != selected_indices:
@@ -653,12 +1005,12 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_last_inbound_once = []
     bootstrap_last_inbound_provenance: dict[str, dict[str, Any]] = {}
     for item in selected:
-        if _bootstrap_consumed(item.conversation_id):
+        if isolated_generation is None and _bootstrap_consumed(item.conversation_id):
             continue
         if item.index in adoptions:
             bootstrap_last_inbound_once.append(item.conversation_id)
             bootstrap_last_inbound_provenance[item.conversation_id] = adoptions[item.index]
-        elif item.index in {1, 2}:
+        elif isolated_generation is None and item.index in {1, 2}:
             # Preserve the original operator-approved compatibility behavior.
             bootstrap_last_inbound_once.append(item.conversation_id)
     pending_registrations = []
@@ -714,10 +1066,39 @@ def main(argv: list[str] | None = None) -> int:
         by_binding[item.binding_id] = persisted_m
     session_identity_migrations = list(by_binding.values())
 
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    generation_manifest: dict[str, Any] | None = None
+    generation_manifest_sha256: str | None = None
+    if isolated_generation is not None:
+        generation_manifest = _isolated_generation_manifest(
+            isolated_generation,
+            selected,
+            evidences,
+            signatures,
+            bootstrap_reports,
+            adoptions,
+        )
+        manifest_path = DATA_ROOT / "generation-manifest.json"
+        if manifest_path.is_file():
+            try:
+                existing_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("isolated generation manifest is invalid") from exc
+            if existing_manifest != generation_manifest:
+                raise RuntimeError("isolated generation manifest changed")
+        else:
+            _atomic_json(manifest_path, generation_manifest)
+        generation_manifest_sha256 = hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest()
+
     target_rules = DATA_ROOT / "rules.sqlite3"
-    if not target_rules.exists():
-        shutil.copy2(SOURCE_RULES, target_rules)
+    _install_rules_database(
+        SOURCE_RULES,
+        target_rules,
+        tuple(item.contact_id for item in selected),
+    )
 
     config = {
         "schema": "pmai-v5-runtime-1",
@@ -749,6 +1130,17 @@ def main(argv: list[str] | None = None) -> int:
             "binding_revision": 1,
         },
     }
+    if isolated_generation is not None:
+        if generation_manifest is None or generation_manifest_sha256 is None:
+            raise RuntimeError("isolated generation manifest missing")
+        config["runtime_generation"] = {
+            "schema": ISOLATED_GENERATION_SCHEMA,
+            "generation_id": isolated_generation,
+            "mode": "isolated_identity_recovery",
+            "enforce_global_pause": True,
+            "manifest_sha256": generation_manifest_sha256,
+        }
+        config["start_globally_paused"] = True
     if session_identity_migrations:
         config["session_identity_migrations"] = session_identity_migrations
     if visual_labels:
@@ -761,7 +1153,31 @@ def main(argv: list[str] | None = None) -> int:
             "min_confidence": 0.98,
             "timeout_seconds": 8,
         }
-    _atomic_json(OUTPUT, config)
+    if isolated_generation is not None:
+        generation_config = DATA_ROOT / "runtime-config.json"
+        if generation_config.is_file():
+            try:
+                existing_config = json.loads(
+                    generation_config.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("isolated generation runtime config is invalid") from exc
+            if existing_config != config:
+                raise RuntimeError("isolated generation runtime config changed")
+        else:
+            _atomic_json(generation_config, config)
+        generation_config_sha256 = hashlib.sha256(
+            generation_config.read_bytes()
+        ).hexdigest()
+        _validate_frozen_candidate(generation_config, generation_config_sha256)
+        previous_config = DATA_ROOT / "previous-runtime-config.json"
+        if not previous_config.exists() and OUTPUT.is_file():
+            current_bytes = OUTPUT.read_bytes()
+            if current_bytes != generation_config.read_bytes():
+                _atomic_bytes(previous_config, current_bytes)
+        _atomic_bytes(OUTPUT, generation_config.read_bytes())
+    else:
+        _atomic_json(OUTPUT, config)
     return 0
 
 

@@ -6,7 +6,9 @@ supervisor does not currently possess; it must not be inferred from HTTP 200.
 """
 from __future__ import annotations
 
+import argparse
 import http.client
+import hashlib
 import json
 import os
 import sqlite3
@@ -32,6 +34,44 @@ _TRANSIENT_WINDOWS_FILE_ERRORS = frozenset({5, 32, 33})
 _PUBLISH_RETRY_DELAYS = (0.05, 0.10, 0.15)
 SUPERVISOR_EVENT_LOG = Path(r"C:\PMAI\data\logs\qq-session-runtime-supervisor.stderr.log")
 LOG_DIR = Path(r"C:\PMAI\data\logs")
+
+
+def _runtime_config_snapshot() -> tuple[dict[str, object], Path, str]:
+    canonical_bytes = CONFIG.read_bytes()
+    value = json.loads(canonical_bytes.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("runtime config must be an object")
+    runtime_config = CONFIG
+    if value.get("runtime_generation") is not None:
+        data_dir = value.get("data_dir")
+        if not isinstance(data_dir, str) or not data_dir:
+            raise ValueError("isolated runtime config has no data directory")
+        runtime_config = Path(data_dir) / "runtime-config.json"
+        generation_bytes = runtime_config.read_bytes()
+        if generation_bytes != canonical_bytes:
+            raise ValueError("canonical config does not match isolated generation snapshot")
+    return value, runtime_config, hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def _validate_requested_snapshot(
+    config: dict[str, object],
+    config_sha256: str,
+    *,
+    expected_config_sha256: str | None,
+    expected_generation_id: str | None,
+) -> None:
+    if (
+        expected_config_sha256 is not None
+        and config_sha256 != expected_config_sha256.casefold()
+    ):
+        raise ValueError("runtime config does not match requested build")
+    if expected_generation_id is not None:
+        generation = config.get("runtime_generation")
+        if (
+            not isinstance(generation, dict)
+            or generation.get("generation_id") != expected_generation_id
+        ):
+            raise ValueError("runtime generation does not match requested build")
 
 
 def _publish_event(*, run_id: str, event: str, count: int,
@@ -377,7 +417,11 @@ def _metrics(data: Path, started_at: str) -> dict[str, object] | None:
         return None
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-config-sha256")
+    parser.add_argument("--expected-generation-id")
+    args = parser.parse_args([] if argv is None else argv)
     run_id = str(uuid.uuid4())
     started_at = datetime.now(UTC).isoformat()
     port = _reserve_loopback_port()
@@ -406,14 +450,34 @@ def main() -> int:
         return 2
     runtime = Path(__file__).resolve().parent / "run_vm_runtime.py"
     try:
-        data = Path(json.loads(CONFIG.read_text(encoding="utf-8"))["data_dir"])
-    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        config, runtime_config, config_sha256 = _runtime_config_snapshot()
+        _validate_requested_snapshot(
+            config,
+            config_sha256,
+            expected_config_sha256=args.expected_config_sha256,
+            expected_generation_id=args.expected_generation_id,
+        )
+        data = Path(str(config["data_dir"]))
+    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         report.update({"state": "stopped", "error_code": "RUNTIME_CONFIG_UNREADABLE",
                        "stopped_at": datetime.now(UTC).isoformat()})
         _publish_status(report, publish_tracker)
         return 2
-    command = [sys.executable, str(runtime), "--config", str(CONFIG), "--run-id", run_id,
-               "--web-host", "127.0.0.1", "--web-port", str(port)]
+    report["runtime_config_sha256"] = config_sha256
+    command = [
+        sys.executable,
+        str(runtime),
+        "--config",
+        str(runtime_config),
+        "--expected-config-sha256",
+        config_sha256,
+        "--run-id",
+        run_id,
+        "--web-host",
+        "127.0.0.1",
+        "--web-port",
+        str(port),
+    ]
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout_log = open(LOG_DIR / "qq-session-runtime.stdout.log", "ab", buffering=0)
     stderr_log = open(LOG_DIR / "qq-session-runtime.stderr.log", "ab", buffering=0)
@@ -482,4 +546,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
