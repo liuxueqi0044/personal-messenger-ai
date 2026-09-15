@@ -44,6 +44,13 @@ class RuntimeApplication:
     _rr_index: int = 0
     _planning_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
     _tick_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _pause_requested: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False
+    )
+    _pause_request_count: int = field(default=0, init=False, repr=False)
+    _pause_request_tokens: set[object] = field(
+        default_factory=set, init=False, repr=False
+    )
 
     async def tick(self) -> dict[str, int]:
         async with self._tick_lock:
@@ -51,6 +58,7 @@ class RuntimeApplication:
 
     async def _tick_once(self) -> dict[str, int]:
         _, globally_paused, _ = self.state.global_control()
+        globally_paused = globally_paused or self._pause_requested.is_set()
         rows = self.state.connection.execute(
             "SELECT conversation_id FROM runtime_conversations ORDER BY conversation_id"
         ).fetchall()
@@ -60,6 +68,12 @@ class RuntimeApplication:
             self._rr_index += 1
             await self.coordinator.observe_driver(self.driver, conversation_id)
             observed = 1
+        # A file-control pause request can arrive while a slow OBSERVE is
+        # draining under this tick lock.  Re-read both the durable state and
+        # the in-memory request fence before this same tick can start planning
+        # or enter the send path.
+        _, globally_paused, _ = self.state.global_control()
+        globally_paused = globally_paused or self._pause_requested.is_set()
         delivered = self.coordinator.dispatch_events()
         finished = {task for task in self._planning_tasks if task.done()}
         for task in finished:
@@ -74,8 +88,62 @@ class RuntimeApplication:
         sent = int(await self.due.dispatch_one()) if not globally_paused else 0
         return {"observed": observed, "events": delivered, "planning_started": started, "due": sent}
 
-    async def set_global_pause_from_control(self, *, paused: bool, reason: str) -> int:
-        """Change global control only after the current UI-bearing tick has ended."""
+    def begin_global_pause_from_control(self) -> object:
+        """Install a synchronous fence before acknowledging a pause request."""
+
+        token = object()
+        self._pause_request_tokens.add(token)
+        self._pause_request_count = len(self._pause_request_tokens)
+        self._pause_requested.set()
+        return token
+
+    def cancel_global_pause_from_control(self, token: object) -> None:
+        """Release a fence whose acknowledgement could not be published."""
+
+        self._release_global_pause_token(token)
+
+    def _release_global_pause_token(self, token: object) -> None:
+        if token not in self._pause_request_tokens:
+            raise RuntimeError("global pause fence token is not active")
+        self._pause_request_tokens.remove(token)
+        self._pause_request_count = len(self._pause_request_tokens)
+        if not self._pause_request_tokens:
+            self._pause_requested.clear()
+
+    async def set_global_pause_from_control(
+        self,
+        *,
+        paused: bool,
+        reason: str,
+        pause_fence_token: object | None = None,
+    ) -> int:
+        """Fence new work immediately, then publish pause after UI work drains."""
+        if paused:
+            token = (
+                pause_fence_token
+                if pause_fence_token is not None
+                else self.begin_global_pause_from_control()
+            )
+            if token not in self._pause_request_tokens:
+                raise RuntimeError("global pause fence token is not active")
+            try:
+                async with self._tick_lock:
+                    revision, current, _ = self.state.global_control()
+                    if current:
+                        return revision
+                    if not self.state.set_global_pause(
+                        paused=True,
+                        expected_revision=revision,
+                        reason=reason,
+                    ):
+                        raise RuntimeError(
+                            "global pause revision changed during control request"
+                        )
+                    return revision + 1
+            finally:
+                self._release_global_pause_token(token)
+        if pause_fence_token is not None:
+            raise RuntimeError("resume cannot consume a pause fence token")
         async with self._tick_lock:
             revision, current, _ = self.state.global_control()
             if current == paused:
@@ -93,7 +161,7 @@ class RuntimeApplication:
 
         async with self._tick_lock:
             _, globally_paused, _ = self.state.global_control()
-            if globally_paused:
+            if globally_paused or self._pause_requested.is_set():
                 return False, None
             return await self.due.dispatch_exact(**kwargs)
 

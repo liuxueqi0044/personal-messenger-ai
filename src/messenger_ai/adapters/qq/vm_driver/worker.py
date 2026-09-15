@@ -1725,12 +1725,18 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
         except (EOFError, BrokenPipeError, OSError, ValueError):
             pass
         return
-    while True:
-        command = WorkerCommand.model_validate(connection.recv())
-        result = worker.execute(command)
-        connection.send(result.model_dump(mode="json"))
-        if command.kind is WorkerKind.STOP:
-            return
+    try:
+        while True:
+            command = WorkerCommand.model_validate(connection.recv())
+            result = worker.execute(command)
+            connection.send(result.model_dump(mode="json"))
+            if command.kind is WorkerKind.STOP:
+                return
+    finally:
+        selection_actuator = getattr(worker, "_selection_actuator", None)
+        close = getattr(selection_actuator, "close", None)
+        if callable(close):
+            close()
 
 
 def _new_suffix(before: list[object], after: list[dict[str, object]]) -> list[dict[str, object]]:

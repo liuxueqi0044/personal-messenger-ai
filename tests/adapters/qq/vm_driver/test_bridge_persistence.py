@@ -1665,6 +1665,39 @@ def test_observe_timeout_quarantines_once_and_successor_serves_other_contact(tmp
     assert status["last_read_only_recovery"]["status"] == "successor_active"
 
 
+def test_observe_recovery_health_uses_bounded_lifecycle_budget(tmp_path):
+    first, _ = _two_bindings()
+
+    class RecordingSuccessor(RecoverableWorker):
+        def __init__(self):
+            super().__init__(run_id="run-deadline", fail_observe=False)
+            self.request_timeouts = []
+
+        def request(self, command, timeout):
+            self.request_timeouts.append(timeout)
+            return super().request(command, timeout)
+
+    successor = RecordingSuccessor()
+    failed = RecoverableWorker(
+        run_id="run-deadline", fail_observe=True, successor=successor,
+    )
+    bridge = QQVMDriverBridge(
+        worker=failed,
+        bindings=(first,),
+        text_provider=lambda _: "x",
+        sqlite_path=tmp_path / "observe-recovery-deadline.sqlite3",
+        timeout_seconds=90,
+    )
+    asyncio.run(bridge.observe_conversation(
+        first.hub_conversation_id,
+        binding_revision=1,
+        conversation_revision=1,
+    ))
+
+    assert len(successor.request_timeouts) == 1
+    assert 0 < successor.request_timeouts[0] <= 5
+
+
 def test_observe_recovery_budget_is_one_per_run_and_never_retries_failed_request(tmp_path):
     first, second = _two_bindings()
     forbidden = RecoverableWorker(run_id="run-budget", fail_observe=False)

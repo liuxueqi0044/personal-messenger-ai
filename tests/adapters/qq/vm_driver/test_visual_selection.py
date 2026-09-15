@@ -84,6 +84,26 @@ class Transport:
         }
 
 
+class LoopBoundTransport(Transport):
+    def __init__(self, output: dict) -> None:
+        super().__init__(output)
+        self.loop = None
+        self.closed_loop = None
+        self.calls = 0
+
+    async def create(self, **kwargs):
+        current = asyncio.get_running_loop()
+        if self.loop is None:
+            self.loop = current
+        elif self.loop is not current:
+            raise RuntimeError("visual transport event loop changed")
+        self.calls += 1
+        return super().create(**kwargs)
+
+    async def aclose(self):
+        self.closed_loop = asyncio.get_running_loop()
+
+
 def test_visual_provider_sends_only_one_row_image_and_no_tools() -> None:
     transport = Transport(
         {
@@ -136,6 +156,35 @@ def test_visual_provider_rejects_non_vision_or_undocumented_model() -> None:
         DeepSeekVisualSelectionProvider(
             api_key="test-key", model="deepseek-flash", transport=Transport({})
         )
+
+
+def test_visual_provider_reuses_one_sync_event_loop_across_worker_calls() -> None:
+    transport = LoopBoundTransport(
+        {
+            "decision": "match",
+            "observed_label": "联系人乙",
+            "confidence": 0.99,
+            "reason": "exact_label",
+        }
+    )
+    provider = DeepSeekVisualSelectionProvider(
+        api_key="test-key", transport=transport
+    )
+    actions = Actions([frame(), frame(), frame(), frame()])
+    selection = ConversationSelectionActuator(
+        actions=actions,
+        provider=provider,
+        labels={"session-contact-2": "联系人乙"},
+        min_confidence=0.98,
+    )
+
+    try:
+        assert call(selection).status is ConversationSelectionStatus.ACTION_ATTEMPTED
+        assert call(selection).status is ConversationSelectionStatus.ACTION_ATTEMPTED
+        assert transport.calls == 2
+    finally:
+        selection.close()
+    assert transport.closed_loop is transport.loop
 
 
 def test_full_screen_image_is_rejected_before_provider_call() -> None:

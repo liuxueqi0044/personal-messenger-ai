@@ -46,17 +46,31 @@ function Invoke-RuntimeControl([ValidateSet('pause','resume','graceful_stop')][s
     $status.stage=('control_' + $Action + '_requested'); Save-Status $status
     Write-AtomicJson $controlRequestPath $request
     $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    $acceptedPending = $null
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Test-Path -LiteralPath $controlResultPath -PathType Leaf) {
             try { $result = Get-Content -Raw -LiteralPath $controlResultPath | ConvertFrom-Json } catch { $result = $null }
             if ($null -ne $result -and $result.schema -eq 'pmai-qq-runtime-control-result-v1' -and $result.request_id -eq $requestId -and $result.target_run_id -eq $targetRunId.ToString() -and $result.action -eq $Action) {
                 if (-not [bool]$result.accepted) { $code = if ($result.error_code) { [string]$result.error_code } else { 'CONTROL_REJECTED' }; throw $code }
+                if ($result.state -eq 'pausing' -and $Action -in @('pause','graceful_stop')) { $acceptedPending = $result; Start-Sleep -Milliseconds 200; continue }
                 $expectedState = @{ pause='paused'; resume='running'; graceful_stop='stopping' }[$Action]
                 if ($result.state -ne $expectedState) { throw ('CONTROL_RESULT_STATE_INVALID_' + [string]$result.state) }
                 return $result
             }
         }
         Start-Sleep -Milliseconds 200
+    }
+    if ($null -ne $acceptedPending) {
+        return [pscustomobject][ordered]@{
+            schema='pmai-qq-runtime-control-result-v1'
+            request_id=$requestId
+            target_run_id=$targetRunId.ToString()
+            action=$Action
+            accepted=$true
+            state='pausing'
+            error_code='DRAIN_PENDING'
+            completed_at=$null
+        }
     }
     return [pscustomobject][ordered]@{
         schema='pmai-qq-runtime-control-result-v1'
@@ -99,6 +113,11 @@ try {
     if ($Phase -in @('Pause','Resume','GracefulStop')) {
         $action = @{ Pause='pause'; Resume='resume'; GracefulStop='graceful_stop' }[$Phase]
         $result = Invoke-RuntimeControl $action
+        if ($result.state -eq 'pausing') {
+            $status.state='pending'; $status.succeeded=$false; $status.stage='control_drain_pending'; $status.error_code='CONTROL_DRAIN_PENDING'; $status.runtime_control=$result; Save-Status $status
+            $result | ConvertTo-Json -Depth 6
+            exit 4
+        }
         if ($result.state -eq 'pending') {
             $status.state='pending'; $status.succeeded=$false; $status.stage='control_timeout_unknown'; $status.error_code='CONTROL_TIMEOUT_UNKNOWN'; $status.runtime_control=$result; Save-Status $status
             $result | ConvertTo-Json -Depth 6

@@ -264,6 +264,7 @@ class DeepSeekVisualSelectionProvider:
         self.model = model
         self.transport = transport
         self.timeout_seconds = timeout_seconds
+        self._sync_loop: asyncio.AbstractEventLoop | None = None
 
     @staticmethod
     def _response_schema() -> dict[str, Any]:
@@ -344,6 +345,45 @@ class DeepSeekVisualSelectionProvider:
             usage=_extract_usage(response),
         )
 
+    def inspect_row_sync(
+        self, request: VisualSelectionRequest
+    ) -> VisualSelectionProviderResult:
+        """Run repeated worker calls on one transport-owned event loop."""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "synchronous visual selection requires a dedicated worker"
+            )
+        if self._sync_loop is None or self._sync_loop.is_closed():
+            self._sync_loop = asyncio.new_event_loop()
+        return self._sync_loop.run_until_complete(self.inspect_row(request))
+
+    def close_sync(self) -> None:
+        """Close the async transport on the same loop that served it."""
+
+        loop = self._sync_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            close = getattr(self.transport, "aclose", None)
+            if not callable(close):
+                close = getattr(self.transport, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    loop.run_until_complete(
+                        asyncio.wait_for(result, timeout=2.0)
+                    )
+        except Exception:
+            pass
+        finally:
+            loop.close()
+            self._sync_loop = None
+
 
 class _SelectionDeadlineExpired(RuntimeError):
     """A bounded visual selection action ran past its deadline.
@@ -419,7 +459,12 @@ class ConversationSelectionActuator:
             request = VisualSelectionRequest(
                 binding_id=binding_id, target_label=label, frame=first
             )
-            provider_result = _run_provider(self._provider.inspect_row(request))
+            inspect_sync = getattr(self._provider, "inspect_row_sync", None)
+            provider_result = (
+                inspect_sync(request)
+                if callable(inspect_sync)
+                else _run_provider(self._provider.inspect_row(request))
+            )
             # The provider call is the slow, externally-visible stage.  Reject
             # the deadline the instant it returns, before any decision is
             # trusted or any click is attempted.
@@ -522,6 +567,11 @@ class ConversationSelectionActuator:
                 status=ConversationSelectionStatus.REJECTED,
                 error_code="visual_selection_action_failed",
             )
+
+    def close(self) -> None:
+        close = getattr(self._provider, "close_sync", None)
+        if callable(close):
+            close()
 
 
 def _run_provider(awaitable: Any) -> VisualSelectionProviderResult:

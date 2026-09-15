@@ -802,7 +802,14 @@ def test_file_control_rejects_wrong_run_then_acknowledges_graceful_stop(tmp_path
     class App:
         calls = []
 
-        async def set_global_pause_from_control(self, *, paused, reason):
+        def begin_global_pause_from_control(self):
+            return object()
+
+        async def set_global_pause_from_control(
+            self, *, paused, reason, pause_fence_token=None
+        ):
+            if paused:
+                assert pause_fence_token is not None
             self.calls.append((paused, reason))
 
     async def wait_for_result(request_id):
@@ -852,6 +859,78 @@ def test_file_control_rejects_wrong_run_then_acknowledges_graceful_stop(tmp_path
         assert accepted["accepted"] is True and accepted["state"] == "stopping"
         assert stop_event.is_set()
         assert app.calls and app.calls[-1][0] is True
+
+    asyncio.run(run())
+
+
+def test_file_control_acknowledges_pause_fence_before_drain_completes(tmp_path):
+    run_id = str(uuid4())
+    request_path = tmp_path / "control-request.json"
+    result_path = tmp_path / "control-result.json"
+
+    class App:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        fence_installed = False
+        token = None
+
+        def begin_global_pause_from_control(self):
+            self.fence_installed = True
+            self.token = object()
+            return self.token
+
+        async def set_global_pause_from_control(
+            self, *, paused, reason, pause_fence_token=None
+        ):
+            assert paused is True
+            assert reason.startswith("runtime_control:pause:")
+            assert self.fence_installed is True
+            assert pause_fence_token is self.token
+            self.entered.set()
+            await self.release.wait()
+
+    async def wait_for_state(state):
+        for _ in range(100):
+            if result_path.exists():
+                value = json.loads(result_path.read_text(encoding="utf-8"))
+                if value.get("state") == state:
+                    return value
+            await asyncio.sleep(.01)
+        raise AssertionError(f"control result never reached {state}")
+
+    async def run():
+        app = App()
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(cli._watch_runtime_control(
+            app,
+            run_id=run_id,
+            stop_event=stop_event,
+            request_path=request_path,
+            result_path=result_path,
+            poll_interval=.01,
+        ))
+        request_id = str(uuid4())
+        request_path.write_text(json.dumps({
+            "schema": cli.CONTROL_REQUEST_SCHEMA,
+            "request_id": request_id,
+            "target_run_id": run_id,
+            "action": "pause",
+            "requested_at": datetime.now(UTC).isoformat(),
+        }), encoding="utf-8")
+
+        accepted = await wait_for_state("pausing")
+        assert accepted["accepted"] is True
+        assert app.fence_installed is True
+        await app.entered.wait()
+        assert not task.done()
+
+        app.release.set()
+        paused = await wait_for_state("paused")
+        assert paused["accepted"] is True
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     asyncio.run(run())
 
@@ -976,6 +1055,9 @@ def test_worker_witness_failure_is_reported_and_stops_serve(
         cancelled = False
         closed = False
 
+        def begin_global_pause_from_control(self):
+            return object()
+
         async def run_forever(self, *, stop_event):
             try:
                 await stop_event.wait()
@@ -1067,6 +1149,9 @@ def test_graceful_stop_keeps_worker_witness_clean(tmp_path, monkeypatch, capsys)
         driver = Driver()
         closed = False
 
+        def begin_global_pause_from_control(self):
+            return object()
+
         async def run_forever(self, *, stop_event):
             await stop_event.wait()
 
@@ -1125,6 +1210,9 @@ def test_graceful_stop_timeout_cancels_tasks_and_preserves_timeout(
         _planning_tasks = set()
         state = hub = pacing = rules = driver = object()
         closed = False
+
+        def begin_global_pause_from_control(self):
+            return object()
 
         async def run_forever(self, *, stop_event):
             await stop_event.wait()

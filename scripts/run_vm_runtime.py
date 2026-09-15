@@ -894,13 +894,32 @@ async def _watch_runtime_control(
                     )
                 else:
                     action = request["action"]
+                    pause_fence_token = None
+                    pause_fence_handed_off = False
                     try:
                         paused = action != "resume"
+                        if paused:
+                            pause_fence_token = app.begin_global_pause_from_control()
+                            # Acknowledge the in-memory pause fence before a
+                            # potentially long UI-bearing tick drains.  This is
+                            # deliberately not a claim that durable pause has
+                            # completed; the final state is written below.
+                            await asyncio.to_thread(
+                                _write_control_result,
+                                result_path,
+                                request=request,
+                                accepted=True,
+                                state="pausing",
+                            )
+                        pause_fence_handed_off = paused
                         await app.set_global_pause_from_control(
                             paused=paused,
                             reason=f"runtime_control:{action}:{request['request_id']}",
+                            pause_fence_token=pause_fence_token,
                         )
                     except Exception:
+                        if pause_fence_token is not None and not pause_fence_handed_off:
+                            app.cancel_global_pause_from_control(pause_fence_token)
                         await asyncio.to_thread(
                             _write_control_result,
                             result_path,
