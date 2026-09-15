@@ -254,6 +254,20 @@ class Provider:
         )
 
 
+class SequencedProvider(Provider):
+    def __init__(self, decisions: list[VisualRowDecision]) -> None:
+        super().__init__()
+        self.decisions = list(decisions)
+
+    async def inspect_row(self, request):
+        self.requests.append(request)
+        return VisualSelectionProviderResult(
+            decision=self.decisions.pop(0),
+            model="deepseek-v4-flash-vision-exp",
+            latency_ms=7,
+        )
+
+
 class Actions:
     def __init__(self, frames, *, selected=False, click_error=False) -> None:
         self.frames = list(frames)
@@ -345,7 +359,7 @@ def test_exact_stable_visual_match_attempts_one_row_click() -> None:
 )
 def test_uncertified_visual_result_never_clicks(decision) -> None:
     row = frame()
-    actions = Actions([row])
+    actions = Actions([row, row])
     outcome = call(actuator(actions, Provider(decision)))
     assert outcome.status is ConversationSelectionStatus.REJECTED
     assert outcome.error_code == "visual_target_not_certified"
@@ -356,6 +370,90 @@ def test_uncertified_visual_result_never_clicks(decision) -> None:
         decision.observed_label == "联系人乙"
     )
     assert actions.click_calls == 0
+    assert actions.capture_calls == 2
+
+
+def test_uncertified_first_reviewed_match_attempts_exactly_one_click() -> None:
+    row = frame()
+    actions = Actions([row, row, row])
+    provider = SequencedProvider(
+        [
+            VisualRowDecision(
+                decision="not_match",
+                observed_label="联系人丙",
+                confidence=1,
+                reason="different_label",
+            ),
+            exact_match(),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.ACTION_ATTEMPTED
+    assert actions.capture_calls == 3
+    assert actions.click_calls == 1
+    assert len(provider.requests) == 2
+
+
+def test_two_uncertified_decisions_are_rejected_without_clicking() -> None:
+    row = frame()
+    actions = Actions([row, row])
+    provider = SequencedProvider(
+        [
+            exact_match(confidence=0.97),
+            exact_match(label="联系人乙 2"),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.REJECTED
+    assert outcome.error_code == "visual_target_not_certified"
+    assert actions.capture_calls == 2
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 2
+
+
+def test_row_change_before_uncertified_review_stops_without_second_provider_call() -> None:
+    actions = Actions([frame(), frame(suffix=b"changed")])
+    provider = SequencedProvider(
+        [
+            VisualRowDecision(
+                decision="not_match",
+                observed_label="联系人丙",
+                confidence=1,
+                reason="different_label",
+            ),
+            exact_match(),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.REJECTED
+    assert outcome.error_code == "visual_row_changed_before_action"
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 1
+
+
+def test_row_change_after_uncertified_review_before_click_never_clicks() -> None:
+    row = frame()
+    actions = Actions([row, row, frame(suffix=b"changed")])
+    provider = SequencedProvider(
+        [
+            exact_match(confidence=0.97),
+            exact_match(),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.REJECTED
+    assert outcome.error_code == "visual_row_changed_before_action"
+    assert actions.capture_calls == 3
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 2
 
 
 def test_changed_row_after_model_response_never_clicks() -> None:
@@ -472,6 +570,20 @@ def test_deadline_expiring_before_the_click_never_clicks() -> None:
 
     assert actions.capture_calls == 2
     assert actions.click_calls == 0
+
+
+def test_deadline_expiring_during_uncertified_review_never_clicks() -> None:
+    row = frame()
+    deadline = datetime.now(UTC) + timedelta(milliseconds=400)
+    actions = DeadlineBurningActions([row, row], deadline=deadline)
+    provider = SequencedProvider([exact_match(confidence=0.97), exact_match()])
+
+    with pytest.raises(RuntimeError, match="deadline_expired"):
+        call_with_deadline(actuator(actions, provider), deadline)
+
+    assert actions.capture_calls == 2
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 1
 
 
 def test_naive_deadline_is_rejected() -> None:

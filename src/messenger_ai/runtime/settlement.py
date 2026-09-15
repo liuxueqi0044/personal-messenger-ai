@@ -990,6 +990,20 @@ def _collect_evidence(
     return evidence, str(segment["status"]), str(artifact["status"])
 
 
+def _assert_consistent_runtime_state(
+    segment_status: str,
+    artifact_status: str,
+    target: TerminalSettlementTarget,
+) -> None:
+    """Require one of the two complete runtime states for first settlement."""
+
+    if (segment_status, artifact_status) not in {
+        ("authorized", "waiting"),
+        (target.terminal_status, _TERMINAL[target.terminal_status]),
+    }:
+        raise SettlementRefused("SEND_SETTLEMENT_RUNTIME_CAS_STATE_MISMATCH")
+
+
 def _existing_certificate(
     connection: sqlite3.Connection, target: TerminalSettlementTarget
 ) -> sqlite3.Row | None:
@@ -1075,7 +1089,7 @@ def _validate_existing_certificate(
 
 def _inspect_settlement_state(
     connection: sqlite3.Connection, target: TerminalSettlementTarget
-) -> tuple[dict[str, object], str, str, str, sqlite3.Row | None]:
+) -> tuple[dict[str, object], str, str, str, str, sqlite3.Row | None]:
     evidence, segment_status, artifact_status = _collect_evidence(connection, target)
     evidence_json = _canonical(evidence)
     evidence_sha256 = _sha256(evidence_json)
@@ -1090,13 +1104,14 @@ def _inspect_settlement_state(
             segment_status=segment_status,
             artifact_status=artifact_status,
         )
-    elif segment_status != "authorized" or artifact_status != "waiting":
-        raise SettlementRefused("SEND_SETTLEMENT_RUNTIME_CAS_STATE_MISMATCH")
+    else:
+        _assert_consistent_runtime_state(segment_status, artifact_status, target)
     return (
         evidence,
         evidence_json,
         evidence_sha256,
         segment_status,
+        artifact_status,
         existing,
     )
 
@@ -1133,6 +1148,7 @@ def settle_terminal_send(
             evidence_json,
             evidence_sha256,
             _segment_status,
+            _artifact_status,
             existing,
         ) = _inspect_settlement_state(preflight, target)
         preflight.execute("ROLLBACK")
@@ -1164,7 +1180,8 @@ def settle_terminal_send(
             locked_evidence,
             locked_evidence_json,
             locked_evidence_sha256,
-            _locked_segment_status,
+            locked_segment_status,
+            locked_artifact_status,
             locked_existing,
         ) = _inspect_settlement_state(connection, target)
         if locked_existing is not None:
@@ -1191,29 +1208,33 @@ def settle_terminal_send(
         )
         if (
             _canonical(post_evidence) != locked_evidence_json
-            or post_segment_status != "authorized"
-            or post_artifact_status != "waiting"
+            or (post_segment_status, post_artifact_status)
+            != (locked_segment_status, locked_artifact_status)
         ):
             raise SettlementRefused("SEND_SETTLEMENT_TRANSACTION_EVIDENCE_CHANGED")
-        changed_segment = connection.execute(
-            """UPDATE runtime_segment_executions SET status=?
-               WHERE pacing_plan_id=? AND segment_index=? AND status='authorized'
-                 AND operation_id=? AND authorization_id=?""",
-            (
-                target.terminal_status,
-                target.pacing_plan_id,
-                target.segment_index,
-                target.operation_id,
-                target.authorization_id,
-            ),
-        ).rowcount
-        changed_artifact = connection.execute(
-            """UPDATE runtime_plan_artifacts SET status=?
-               WHERE pacing_plan_id=? AND conversation_id=? AND status='waiting'""",
-            (expected_artifact, target.pacing_plan_id, target.conversation_id),
-        ).rowcount
-        if changed_segment != 1 or changed_artifact != 1:
-            raise SettlementRefused("SEND_SETTLEMENT_RUNTIME_CAS_LOST")
+        if (locked_segment_status, locked_artifact_status) == (
+            "authorized",
+            "waiting",
+        ):
+            changed_segment = connection.execute(
+                """UPDATE runtime_segment_executions SET status=?
+                   WHERE pacing_plan_id=? AND segment_index=? AND status='authorized'
+                     AND operation_id=? AND authorization_id=?""",
+                (
+                    target.terminal_status,
+                    target.pacing_plan_id,
+                    target.segment_index,
+                    target.operation_id,
+                    target.authorization_id,
+                ),
+            ).rowcount
+            changed_artifact = connection.execute(
+                """UPDATE runtime_plan_artifacts SET status=?
+                   WHERE pacing_plan_id=? AND conversation_id=? AND status='waiting'""",
+                (expected_artifact, target.pacing_plan_id, target.conversation_id),
+            ).rowcount
+            if changed_segment != 1 or changed_artifact != 1:
+                raise SettlementRefused("SEND_SETTLEMENT_RUNTIME_CAS_LOST")
         connection.execute(
             """INSERT INTO runtime_send_settlement_audit_v2(
                    settlement_id,conversation_id,pacing_plan_id,segment_index,

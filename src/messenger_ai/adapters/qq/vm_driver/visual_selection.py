@@ -413,6 +413,35 @@ def _ensure_selection_deadline(deadline: datetime | None) -> None:
         raise _SelectionDeadlineExpired()
 
 
+def _decision_evidence(
+    decision: VisualRowDecision, target_label: str
+) -> dict[str, str | float | bool]:
+    normalized_label_match = (
+        decision.observed_label is not None
+        and normalize_visual_label(decision.observed_label)
+        == normalize_visual_label(target_label)
+    )
+    return {
+        "visual_decision": decision.decision,
+        "visual_reason": decision.reason,
+        "visual_confidence": decision.confidence,
+        "normalized_label_match": normalized_label_match,
+    }
+
+
+def _is_certified_visual_target(
+    decision: VisualRowDecision, target_label: str, min_confidence: float
+) -> bool:
+    return (
+        decision.decision == "match"
+        and decision.reason == "exact_label"
+        and decision.confidence >= min_confidence
+        and decision.observed_label is not None
+        and normalize_visual_label(decision.observed_label)
+        == normalize_visual_label(target_label)
+    )
+
+
 class ConversationSelectionActuator:
     """Authorize at most one row click; never certify the resulting chat."""
 
@@ -483,33 +512,69 @@ class ConversationSelectionActuator:
                     ),
                 )
             decision = provider_result.decision
-            normalized_label_match = (
-                decision.observed_label is not None
-                and normalize_visual_label(decision.observed_label)
-                == normalize_visual_label(label)
-            )
-            decision_evidence = {
-                "visual_decision": decision.decision,
-                "visual_reason": decision.reason,
-                "visual_confidence": decision.confidence,
-                "normalized_label_match": normalized_label_match,
-            }
-            if (
-                decision.decision != "match"
-                or decision.reason != "exact_label"
-                or decision.confidence < self._min_confidence
-                or decision.observed_label is None
-                or normalize_visual_label(decision.observed_label)
-                != normalize_visual_label(label)
+            decision_evidence = _decision_evidence(decision, label)
+            if not _is_certified_visual_target(
+                decision, label, self._min_confidence
             ):
-                return ConversationSelectionOutcome(
-                    status=ConversationSelectionStatus.REJECTED,
-                    error_code="visual_target_not_certified",
-                    frame_sha256=first.sha256,
-                    model=provider_result.model,
-                    latency_ms=provider_result.latency_ms,
-                    **decision_evidence,
+                # A structured but insufficient first opinion may be caused by
+                # a transient rendering/model ambiguity.  Re-check exactly
+                # once without acting, and only while the same row is still
+                # present under the original action deadline.
+                _ensure_selection_deadline(deadline)
+                review_frame = self._actions.capture_conversation_row(
+                    window, conversation, selector
                 )
+                _ensure_selection_deadline(deadline)
+                if (
+                    review_frame.rect != first.rect
+                    or review_frame.sha256 != first.sha256
+                ):
+                    return ConversationSelectionOutcome(
+                        status=ConversationSelectionStatus.REJECTED,
+                        error_code="visual_row_changed_before_action",
+                        frame_sha256=review_frame.sha256,
+                        model=provider_result.model,
+                        latency_ms=provider_result.latency_ms,
+                        **decision_evidence,
+                    )
+                review_request = VisualSelectionRequest(
+                    binding_id=binding_id, target_label=label, frame=review_frame
+                )
+                provider_result = (
+                    inspect_sync(review_request)
+                    if callable(inspect_sync)
+                    else _run_provider(self._provider.inspect_row(review_request))
+                )
+                _ensure_selection_deadline(deadline)
+                if (
+                    provider_result.error is not None
+                    or provider_result.decision is None
+                ):
+                    return ConversationSelectionOutcome(
+                        status=ConversationSelectionStatus.REJECTED,
+                        error_code="visual_provider_failed",
+                        frame_sha256=review_frame.sha256,
+                        model=provider_result.model,
+                        latency_ms=provider_result.latency_ms,
+                        provider_error_category=(
+                            provider_result.error.category
+                            if provider_result.error is not None
+                            else "schema"
+                        ),
+                    )
+                decision = provider_result.decision
+                decision_evidence = _decision_evidence(decision, label)
+                if not _is_certified_visual_target(
+                    decision, label, self._min_confidence
+                ):
+                    return ConversationSelectionOutcome(
+                        status=ConversationSelectionStatus.REJECTED,
+                        error_code="visual_target_not_certified",
+                        frame_sha256=review_frame.sha256,
+                        model=provider_result.model,
+                        latency_ms=provider_result.latency_ms,
+                        **decision_evidence,
+                    )
             if self._actions.is_conversation_selected(window, conversation, selector):
                 return ConversationSelectionOutcome(
                     status=ConversationSelectionStatus.NOT_NEEDED,
