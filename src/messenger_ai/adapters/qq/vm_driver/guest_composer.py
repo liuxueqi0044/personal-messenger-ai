@@ -168,6 +168,32 @@ def write_with_text_pattern(control: Any, text: str, *,
         raise GuestComposerError("composer_readback_mismatch")
 
 
+def write_with_value_pattern(control: Any, text: str, *,
+                             scope_guard: Callable[[], bool],
+                             focus_guard: Callable[[Any], bool]) -> None:
+    """Set one empty, focused editor and verify its exact value without Send."""
+    if not scope_guard():
+        raise GuestComposerError("composer_scope_rejected")
+    pattern = get_uia_pattern(control, "GetValuePattern", 10002)
+    if pattern is None or bool(getattr(pattern, "IsReadOnly", True)):
+        raise GuestComposerError("composer_value_not_writable")
+    if read_composer_text(control) != "":
+        raise GuestComposerError("composer_not_empty")
+    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
+    if read_composer_text(control) != "":
+        raise GuestComposerError("composer_not_empty")
+    # A property read/focus transition can yield to the provider. Check the
+    # live scope and focus again at the SetValue boundary, as for text input.
+    if bool(getattr(pattern, "IsReadOnly", True)):
+        raise GuestComposerError("composer_value_not_writable")
+    if not scope_guard() or not focus_guard(control):
+        raise GuestComposerError("composer_focus_or_scope_drift")
+    pattern.SetValue(text)
+    if not _wait_for_exact_text(control, text, scope_guard=scope_guard,
+                                focus_guard=focus_guard):
+        raise GuestComposerError("composer_readback_mismatch")
+
+
 def clear_with_local_selection(control: Any, *, clear_action: Callable[[], None],
                                expected_text: str, scope_guard: Callable[[], bool],
                                focus_guard: Callable[[Any], bool]) -> None:

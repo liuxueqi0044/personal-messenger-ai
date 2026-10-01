@@ -8,6 +8,7 @@ from messenger_ai.adapters.qq.vm_driver import guest_composer
 from messenger_ai.adapters.qq.vm_driver.guest_composer import (
     GuestComposerError, clear_with_local_selection, read_composer_text,
     write_with_text_pattern,
+    write_with_value_pattern,
 )
 
 
@@ -29,6 +30,101 @@ class Control:
     def GetValuePattern(self): return None
     def GetTextPattern(self): return TextPattern(self)
     def SetFocus(self): self.focused = True
+
+
+class ValueControl(Control):
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.value_calls = []
+        self.IsReadOnly = False
+
+    @property
+    def Value(self):
+        return self.text
+
+    def GetValuePattern(self):
+        return self
+
+    def SetValue(self, value):
+        self.value_calls.append(value)
+        self.text = value
+
+
+def test_value_pattern_writes_only_empty_focused_editor_and_reads_back():
+    control = ValueControl()
+    write_with_value_pattern(control, "你好\n🙂", scope_guard=lambda: True,
+                             focus_guard=lambda item: item.focused)
+    assert control.focused
+    assert control.value_calls == ["你好\n🙂"]
+    assert read_composer_text(control) == "你好\n🙂"
+
+
+@pytest.mark.parametrize("mode", ["scope", "draft", "readonly", "missing"])
+def test_value_pattern_rejects_invalid_preconditions_without_writing(mode):
+    control = ValueControl("user draft" if mode == "draft" else "")
+    control.IsReadOnly = mode == "readonly"
+    if mode == "missing":
+        control.GetValuePattern = lambda: None
+    with pytest.raises(GuestComposerError):
+        write_with_value_pattern(control, "bot reply", scope_guard=lambda: mode != "scope",
+                                 focus_guard=lambda item: item.focused)
+    assert control.value_calls == []
+    assert not control.focused
+
+
+def test_value_pattern_preserves_draft_that_arrives_during_focus():
+    control = ValueControl()
+    def focus():
+        control.focused = True
+        control.text = "new user draft"
+    control.SetFocus = focus
+    with pytest.raises(GuestComposerError, match="composer_not_empty"):
+        write_with_value_pattern(control, "bot reply", scope_guard=lambda: True,
+                                 focus_guard=lambda item: item.focused)
+    assert control.value_calls == [] and control.text == "new user draft"
+
+
+@pytest.mark.parametrize("drift", ["scope", "focus"])
+def test_value_pattern_rechecks_scope_and_focus_after_final_empty_read(drift):
+    live = {"scope": True, "focus": True}
+    class DriftOnRead(ValueControl):
+        reads = 0
+        @property
+        def Value(self):
+            self.reads += 1
+            if self.reads == 2:
+                live[drift] = False
+            return self.text
+    control = DriftOnRead()
+    with pytest.raises(GuestComposerError, match="composer_focus_or_scope_drift"):
+        write_with_value_pattern(control, "bot reply", scope_guard=lambda: live["scope"],
+                                 focus_guard=lambda _item: live["focus"])
+    assert control.value_calls == []
+
+
+def test_value_pattern_refuses_mismatched_readback(monkeypatch):
+    control = ValueControl()
+    control.SetValue = lambda value: control.value_calls.append(value)
+    _virtual_focus_clock(monkeypatch)
+    with pytest.raises(GuestComposerError, match="composer_readback_mismatch"):
+        write_with_value_pattern(control, "bot reply", scope_guard=lambda: True,
+                                 focus_guard=lambda item: item.focused)
+    assert control.value_calls == ["bot reply"]
+
+
+def test_transport_value_pattern_path_uses_guarded_write():
+    from messenger_ai.adapters.qq.models import QQWindow
+    from messenger_ai.adapters.qq.vm_driver.transport import WindowsUIAQQAccessibility
+    control = ValueControl("existing draft")
+    access = object.__new__(WindowsUIAQQAccessibility)
+    access._window = lambda _window: object()
+    access._select = lambda _root, _selector: [control]
+    access._guest_scope = lambda _window: True
+    access._composer_focused = lambda target, _window: target.focused
+    with pytest.raises(GuestComposerError, match="composer_not_empty"):
+        access.write_composer(QQWindow(process_id=7, window_handle=9, class_name="QQ"),
+                              "bot reply", object())
+    assert control.value_calls == [] and control.text == "existing draft"
 
 
 def test_nonempty_text_is_preserved_exactly_including_newlines():

@@ -14,6 +14,7 @@ import time
 import traceback
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -21,6 +22,7 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from messenger_ai.adapters.qq.models import (
+    QQBubble,
     QQCertifiedDirectIdentity,
     QQConversation,
     QQIdentityBinding,
@@ -63,6 +65,14 @@ from .visual_selection import (
 
 CurrentDirectIdentity = QQCertifiedDirectIdentity | QQSessionObservedDirectIdentity
 _SPAWN_EXECUTABLE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _PrepareReadSnapshot:
+    """Value data returned only after the complete visual/header/read fence."""
+
+    before_bubbles: tuple[QQBubble, ...]
+    composer_text: str
 
 
 def _start_without_console(process) -> None:
@@ -534,30 +544,59 @@ class QQVMWorker:
                     window, self._selectors.selector("bubbles")
                 )
 
-        window, conversation, proof, before = self._resolve(
-            command, binding, current_reader=read_bubbles
+        def read_composer(window, _conversation, _proof):
+            with self._stage(command, "composer_read"):
+                return self._accessibility.read_composer(
+                    window, self._selectors.selector("composer")
+                )
+
+        def read_prepare_snapshot(window, conversation, proof):
+            return _PrepareReadSnapshot(
+                before_bubbles=tuple(read_bubbles(window, conversation, proof)),
+                composer_text=read_composer(window, conversation, proof),
+            )
+
+        window, conversation, proof, current = self._resolve(
+            command,
+            binding,
+            current_reader=read_bubbles,
+            certified_current_reader=read_prepare_snapshot,
         )
         expected_target = self._stable_target(
             binding=binding, window=window, proof=proof
         )
-        if isinstance(proof, QQSessionObservedDirectIdentity):
-            self._revalidate_expected_target(
-                command=command,
-                binding=binding,
-                window=window,
-                conversation=conversation,
-                expected=expected_target,
-            )
-        if self._accessibility.read_composer(window, self._selectors.selector("composer")):
+        if isinstance(current, _PrepareReadSnapshot):
+            # Both content reads share one header phase, bracketed by complete
+            # visual attestations. No UIA controls survive that phase. The
+            # transport must still enforce its fresh write-entry guards;
+            # this snapshot is not an atomic guarantee against external input.
+            before = current.before_bubbles
+            composer_text = current.composer_text
+        else:
+            # Legacy/fallback identity reads do not establish the full fence.
+            # Keep their existing independent checks around the composer read.
+            before = current
+            if isinstance(proof, QQSessionObservedDirectIdentity):
+                self._revalidate_expected_target(
+                    command=command,
+                    binding=binding,
+                    window=window,
+                    conversation=conversation,
+                    expected=expected_target,
+                )
+            composer_text = read_composer(window, conversation, proof)
+            if composer_text:
+                return self._result(command, WorkerStatus.FAILED_SAFE, "composer_not_empty")
+            if isinstance(proof, QQSessionObservedDirectIdentity):
+                self._revalidate_expected_target(
+                    command=command,
+                    binding=binding,
+                    window=window,
+                    conversation=conversation,
+                    expected=expected_target,
+                )
+        if composer_text:
             return self._result(command, WorkerStatus.FAILED_SAFE, "composer_not_empty")
-        if isinstance(proof, QQSessionObservedDirectIdentity):
-            self._revalidate_expected_target(
-                command=command,
-                binding=binding,
-                window=window,
-                conversation=conversation,
-                expected=expected_target,
-            )
         text_hash = __import__("hashlib").sha256(command.text.encode()).hexdigest()
         portable = PreparedVerificationEvidence(
             owner_binding_id=binding.binding_id,
@@ -615,15 +654,18 @@ class QQVMWorker:
         self._ensure_command_live(command)
         self._accessibility.write_composer(window, command.text, self._selectors.selector("composer"))
         if isinstance(proof, QQSessionObservedDirectIdentity):
-            self._revalidate_expected_target(
+            _, actual = self._revalidate_expected_target(
                 command=command,
                 binding=binding,
                 window=window,
                 conversation=conversation,
                 expected=expected_target,
+                current_reader=read_composer,
             )
+        else:
+            self._ensure_command_live(command)
+            actual = read_composer(window, conversation, proof)
         self._ensure_command_live(command)
-        actual = self._accessibility.read_composer(window, self._selectors.selector("composer"))
         if actual != command.text:
             return self._result(
                 command,
@@ -960,26 +1002,35 @@ class QQVMWorker:
         window: QQWindow,
         conversation: QQConversation,
         expected: dict[str, object],
-    ) -> CurrentDirectIdentity:
+        current_reader: Callable[
+            [QQWindow, QQConversation, CurrentDirectIdentity | None], object
+        ]
+        | None = None,
+    ) -> tuple[CurrentDirectIdentity, object | None]:
         read_phase = getattr(self._accessibility, "read_phase", None)
         if not callable(read_phase):
             raise RuntimeError("selection visual profile is unavailable")
-        proof, _current = self._certify_visual_header_current(
+        proof, current = self._certify_visual_header_current(
             command=command,
             binding=binding,
             window=window,
             conversation=conversation,
             read_phase=read_phase,
-            current_reader=None,
+            current_reader=current_reader,
         )
         if self._stable_target(binding=binding, window=window, proof=proof) != expected:
             raise RuntimeError("binding proof drift after selection")
-        return proof
+        return proof, current
 
     def _resolve(self, command: WorkerCommand, binding: QQIdentityBinding,
                  current_reader: Callable[[QQWindow, QQConversation,
                                            CurrentDirectIdentity | None], object]
+                 | None = None,
+                 certified_current_reader: Callable[[QQWindow, QQConversation,
+                                                     CurrentDirectIdentity | None], object]
                  | None = None):
+        # This optional reader is used only by the complete before/header/after
+        # fence. A legacy confirmation must never return its stronger snapshot.
         with self._stage(command, "target_window"):
             window = self._target_window()
         with self._stage(command, "guest_foreground"):
@@ -1013,7 +1064,7 @@ class QQVMWorker:
                         window=window,
                         conversation=conversation,
                         read_phase=read_phase,
-                        current_reader=current_reader,
+                        current_reader=certified_current_reader or current_reader,
                     )
                 return window, conversation, proof, current
             if (
@@ -1043,6 +1094,7 @@ class QQVMWorker:
                     command=command, binding=binding, window=window,
                     conversation=conversation, read_phase=read_phase,
                     current_reader=current_reader,
+                    certified_current_reader=certified_current_reader,
                 )
             return window, conversation, proof, current
 
@@ -1138,6 +1190,7 @@ class QQVMWorker:
         self, *, command: WorkerCommand, binding: QQIdentityBinding,
         window: QQWindow, conversation: QQConversation, read_phase,
         current_reader: Callable[[QQWindow, QQConversation, CurrentDirectIdentity | None], object] | None,
+        certified_current_reader: Callable[[QQWindow, QQConversation, CurrentDirectIdentity | None], object] | None = None,
     ) -> tuple[CurrentDirectIdentity | None, object | None]:
         """Certify only a settled selection, using a fresh UIA phase per retry."""
         if binding.authorization_scope == "all_direct_including_temporary":
@@ -1147,7 +1200,7 @@ class QQVMWorker:
                 window=window,
                 conversation=conversation,
                 read_phase=read_phase,
-                current_reader=current_reader,
+                current_reader=certified_current_reader or current_reader,
             )
             return proof, current
         now = datetime.now(UTC)

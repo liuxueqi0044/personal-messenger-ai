@@ -727,6 +727,127 @@ def test_preexisting_draft_is_never_overwritten() -> None:
     assert fake.composer == "人工草稿"
 
 
+@pytest.mark.parametrize("existing_draft", ["", "operator draft"])
+def test_prepare_without_read_phase_keeps_composer_check_for_ordinary_proof(
+    existing_draft: str,
+) -> None:
+    adapter, fake = _adapter()
+    binding = next(iter(adapter.bindings.values())).model_copy(update={
+        "conversation_type": "direct",
+        "participant_signature": "qq-profile-hmac:" + "c" * 64,
+    })
+    worker = QQVMWorker(
+        accessibility=fake,
+        selector_pack=adapter.selector_pack,
+        bindings=(binding,),
+        identity_certifier=Certifier(binding.participant_signature),
+        candidate_locator=Locator(),
+    )
+    assert not callable(getattr(fake, "read_phase", None))
+    assert binding.authorization_scope == "legacy_explicit_contacts"
+    fake.composer = existing_draft
+    command = WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="fallback:0", text="prepared reply",
+    )
+
+    result = worker.execute(command)
+
+    content_calls = [call for call in fake.calls if call in {
+        "bubbles", "read-composer", "write-composer", "invoke-send",
+    }]
+    if existing_draft:
+        assert result.status is WorkerStatus.FAILED_SAFE
+        assert result.error_code == "composer_not_empty"
+        assert content_calls == ["bubbles", "read-composer"]
+        assert fake.composer == existing_draft
+        assert worker._prepared == {}
+        assert worker._reservation is None
+    else:
+        assert result.status is WorkerStatus.OK
+        assert content_calls == ["bubbles", "read-composer", "write-composer", "read-composer"]
+        assert fake.composer == command.text
+        assert worker._reservation == command.operation_id
+
+
+def test_prepare_session_proof_with_narrow_scope_keeps_all_full_revalidations(
+    monkeypatch,
+) -> None:
+    worker, fake, binding, proof = _already_current_fixture(monkeypatch)
+    binding = binding.model_copy(update={"authorization_scope": "legacy_explicit_contacts"})
+    worker._bindings[binding.binding_id] = binding
+    assert isinstance(proof, QQSessionObservedDirectIdentity)
+    assert callable(fake.read_phase)
+    fake.confirm_conversation_selected = lambda *_args: None
+    events = []
+    full_revalidations = []
+    revalidate = worker._revalidate_expected_target
+    certify = worker._certify_visual_header_current
+    list_bubbles = fake.list_bubbles
+    read_composer = fake.read_composer
+    write_composer = fake.write_composer
+    attest = fake.certify_conversation_selected_visual
+    certify_header = worker._identity_certifier.try_certify_already_current
+
+    def spy_revalidate(**kwargs):
+        events.append("revalidate")
+        return revalidate(**kwargs)
+
+    def spy_certify(**kwargs):
+        # A narrow-scope resolution cannot issue a certified PREPARE snapshot.
+        # Every call here must still execute the complete identity/visual check.
+        full_revalidations.append(kwargs)
+        return certify(**kwargs)
+
+    def spy_attest(*args, **kwargs):
+        events.append("attest")
+        return attest(*args, **kwargs)
+
+    def spy_header(*args):
+        events.append("header")
+        return certify_header(*args)
+
+    def spy_bubbles(*args):
+        events.append("bubbles")
+        return list_bubbles(*args)
+
+    def spy_read(*args):
+        events.append("read-composer")
+        return read_composer(*args)
+
+    def spy_write(*args):
+        events.append("write-composer")
+        return write_composer(*args)
+
+    monkeypatch.setattr(worker, "_revalidate_expected_target", spy_revalidate)
+    monkeypatch.setattr(worker, "_certify_visual_header_current", spy_certify)
+    monkeypatch.setattr(fake, "list_bubbles", spy_bubbles)
+    monkeypatch.setattr(fake, "read_composer", spy_read)
+    monkeypatch.setattr(fake, "write_composer", spy_write)
+    monkeypatch.setattr(fake, "certify_conversation_selected_visual", spy_attest)
+    monkeypatch.setattr(worker._identity_certifier, "try_certify_already_current", spy_header)
+    command = WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="fallback:0", text="prepared reply",
+    )
+
+    result = worker.execute(command)
+
+    assert result.status is WorkerStatus.OK
+    full_check = ["revalidate", "attest", "header", "attest"]
+    assert events == (
+        ["bubbles"] + full_check + ["read-composer"] + full_check
+        + ["write-composer", "revalidate", "attest", "header", "read-composer", "attest"]
+    )
+    assert len(full_revalidations) == 3
+    assert all(call["current_reader"] is None for call in full_revalidations[:2])
+    assert callable(full_revalidations[2]["current_reader"])
+    assert all(call["binding"] is binding for call in full_revalidations)
+    assert fake.composer == command.text
+    assert worker._reservation == command.operation_id
+    assert "invoke-send" not in fake.calls
+
+
 def test_verify_requires_a_new_unique_outbound_bubble() -> None:
     worker, fake, binding_id = _worker()
     operation_id = uuid4()

@@ -37,6 +37,7 @@ from .guest_composer import (
     get_uia_pattern,
     read_composer_text,
     write_with_text_pattern,
+    write_with_value_pattern,
 )
 from .message_decoder import decode_message_region
 from .phase_index import UIAPhaseIndex
@@ -1054,7 +1055,8 @@ class WindowsUIAQQAccessibility:
         control = matches[0]
         pattern = self._pattern(control, "GetValuePattern", 10002)
         if pattern is not None and not bool(getattr(pattern, "IsReadOnly", False)):
-            pattern.SetValue(text)
+            write_with_value_pattern(control, text, scope_guard=lambda: self._guest_scope(window),
+                                     focus_guard=lambda target: self._composer_focused(target, window))
         else:
             if self._pattern(control, "GetTextPattern", 10014) is None:
                 raise UIAUnavailable("composer has no writable ValuePattern or readable TextPattern")
