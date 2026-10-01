@@ -1317,3 +1317,45 @@ def test_v2_transport_rejects_hover_ambiguity_and_unknown_background(colors, rea
     profile = STRIP_PROFILE.model_copy(update={"hover_settle_seconds":0, "poll_interval_seconds":0})
     with pytest.raises(UIAUnavailable, match=reason):
         _certify(access, target, profile)
+
+
+def _transient_enumerator(*, error_code=-2147220991, always_fail=False, active_phase=None):
+    access = object.__new__(WindowsUIAQQAccessibility)
+    roots = []
+    def fresh_root(_window):
+        root = object()
+        roots.append(root)
+        return root
+    def select_rows(root, _selector):
+        if always_fail or len(roots) == 1:
+            yield "discarded-partial-row"
+            error = RuntimeError("provider element unavailable")
+            error.hresult = error_code
+            raise error
+        yield "fresh-row"
+    access._window = fresh_root
+    access._select = select_rows
+    access._property = lambda _item, _name, _default: False
+    access._conversation_id = lambda item: "runtime:" + item
+    access._row_screen_rect = lambda _item: _row_rect(100)
+    access._active_phase = active_phase
+    return access, roots
+
+
+def test_row_enumeration_discards_partial_snapshot_when_element_disappears():
+    access, roots = _transient_enumerator()
+    rows = access._visible_conversation_rows(window(), selector())
+    assert len(roots) == 2 and roots[0] is not roots[1]
+    assert [row.internal_id for row in rows] == ["runtime:fresh-row"]
+
+
+@pytest.mark.parametrize("settings,attempts", [
+    ({"always_fail":True}, 2),
+    ({"error_code":-2147467259}, 1),
+    ({"active_phase":object()}, 1),
+])
+def test_row_enumeration_retry_is_bounded_and_does_not_reuse_active_phase(settings, attempts):
+    access, roots = _transient_enumerator(**settings)
+    with pytest.raises(RuntimeError, match="provider element unavailable"):
+        access._visible_conversation_rows(window(), selector())
+    assert len(roots) == attempts

@@ -463,6 +463,7 @@ class WindowsUIAQQAccessibility:
         )
         _check_selection_deadline(deadline)
         enumerated_rows = self._visible_conversation_rows(window, selector)
+        _check_selection_deadline(deadline)
         bounds = self._window_screen_bounds(window)
         def fully_inside_window(ref: _ConversationRowRef) -> bool:
             return bool(
@@ -533,6 +534,7 @@ class WindowsUIAQQAccessibility:
                 for ref in self._visible_conversation_rows(window, selector)
                 if fully_inside_window(ref)
             ]
+            _check_selection_deadline(deadline)
             if [ref.internal_id for ref in current] != [
                 ref.internal_id for ref in rows
             ]:
@@ -623,15 +625,27 @@ class WindowsUIAQQAccessibility:
 
         if selector.name != "conversation_item":
             raise UIAUnavailable("conversation selection selector is not certified")
-        refs: list[_ConversationRowRef] = []
-        for item in self._select(self._window(window), selector):
-            if bool(self._property(item, "IsOffscreen", True)):
-                continue
-            internal_id = self._conversation_id(item)
-            if not internal_id:
-                continue
-            refs.append(_ConversationRowRef(internal_id, item, self._row_screen_rect(item)))
-        return refs
+        for attempt in range(2):
+            # QQ may destroy a transient UIA element during enumeration. Never
+            # skip that element or return partial rows: discard the entire read
+            # and rebuild once from the exact HWND. No action is retried here.
+            refs: list[_ConversationRowRef] = []
+            try:
+                for item in self._select(self._window(window), selector):
+                    if bool(self._property(item, "IsOffscreen", True)):
+                        continue
+                    internal_id = self._conversation_id(item)
+                    if not internal_id:
+                        continue
+                    refs.append(_ConversationRowRef(internal_id, item, self._row_screen_rect(item)))
+                return refs
+            except Exception as exc:
+                if (attempt != 0 or getattr(self, "_active_phase", None) is not None
+                        or getattr(exc, "hresult", None) != -2147220991):
+                    raise
+                # UIA_E_ELEMENTNOTAVAILABLE (0x80040201) only. Other provider
+                # failures remain visible rather than being treated as drift.
+        raise AssertionError("unreachable")
 
     def _sample_row_border(
         self,
