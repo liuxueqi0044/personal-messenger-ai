@@ -21,6 +21,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from contextlib import closing
 from messenger_ai.runtime.config_publication import assert_publication_complete
+from messenger_ai.runtime.session_revision import (
+    session_revision_number,
+    validate_session_revision,
+)
 
 
 OUTPUT = Path(r"C:\PMAI\data\qq-session-runtime-status.json")
@@ -44,7 +48,12 @@ def _runtime_config_snapshot() -> tuple[dict[str, object], Path, str]:
     if not isinstance(value, dict):
         raise ValueError("runtime config must be an object")
     runtime_config = CONFIG
-    if value.get("runtime_generation") is not None:
+    session_revision = validate_session_revision(value)
+    if session_revision is not None:
+        runtime_config = session_revision.snapshot_path
+        if runtime_config.read_bytes() != canonical_bytes:
+            raise ValueError("canonical config does not match isolated session revision snapshot")
+    elif value.get("runtime_generation") is not None:
         data_dir = value.get("data_dir")
         if not isinstance(data_dir, str) or not data_dir:
             raise ValueError("isolated runtime config has no data directory")
@@ -61,7 +70,13 @@ def _validate_requested_snapshot(
     *,
     expected_config_sha256: str | None,
     expected_generation_id: str | None,
+    expected_session_binding_revision: int | None = None,
 ) -> None:
+    if (
+        expected_session_binding_revision is not None
+        and session_revision_number(config) != expected_session_binding_revision
+    ):
+        raise ValueError("session binding revision does not match requested build")
     if (
         expected_config_sha256 is not None
         and config_sha256 != expected_config_sha256.casefold()
@@ -420,9 +435,16 @@ def _metrics(data: Path, started_at: str) -> dict[str, object] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    def positive_revision(value: str) -> int:
+        revision = int(value)
+        if revision < 1:
+            raise argparse.ArgumentTypeError("session binding revision must be positive")
+        return revision
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-config-sha256")
     parser.add_argument("--expected-generation-id")
+    parser.add_argument("--expected-session-binding-revision", type=positive_revision)
     args = parser.parse_args([] if argv is None else argv)
     run_id = str(uuid.uuid4())
     started_at = datetime.now(UTC).isoformat()
@@ -438,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
         "runtime_started": False,
         "runtime_process_alive": False,
         "runtime_process_id": None,
+        "generation_id": None,
+        "session_binding_revision": None,
+        "base_config_sha256": None,
         "web_port": port,
         "web_reachable": False,
         "this_run_web_observation": None,
@@ -458,14 +483,25 @@ def main(argv: list[str] | None = None) -> int:
             config_sha256,
             expected_config_sha256=args.expected_config_sha256,
             expected_generation_id=args.expected_generation_id,
+            expected_session_binding_revision=args.expected_session_binding_revision,
         )
+        session_binding_revision = session_revision_number(config)
         data = Path(str(config["data_dir"]))
     except (OSError, KeyError, TypeError, ValueError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
         report.update({"state": "stopped", "error_code": "RUNTIME_CONFIG_UNREADABLE",
                        "stopped_at": datetime.now(UTC).isoformat()})
         _publish_status(report, publish_tracker)
         return 2
-    report["runtime_config_sha256"] = config_sha256
+    generation = config.get("runtime_generation")
+    binding = config.get("session_binding")
+    report.update({
+        "runtime_config_sha256": config_sha256,
+        "generation_id": generation.get("generation_id") if isinstance(generation, dict) else None,
+        "session_binding_revision": session_binding_revision,
+        "base_config_sha256": (
+            str(binding["base_config_sha256"]).casefold() if isinstance(binding, dict) else config_sha256
+        ),
+    })
     command = [
         sys.executable,
         str(runtime),
@@ -475,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
         str(CONFIG),
         "--expected-config-sha256",
         config_sha256,
+        "--expected-session-binding-revision",
+        str(session_binding_revision),
         "--run-id",
         run_id,
         "--web-host",

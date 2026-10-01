@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import functools
 import getpass
@@ -21,6 +22,10 @@ from uuid import UUID
 
 from messenger_ai.adapters.qq.models import QQSessionObservedDirectIdentity
 from messenger_ai.runtime.config_publication import ConfigPublication, atomic_bytes
+from messenger_ai.runtime.session_revision import (
+    SCHEMA as SESSION_BINDING_SCHEMA, revision_snapshot_path,
+    session_revision_number, validate_session_revision,
+)
 
 OUTPUT = Path(r"C:\PMAI\data\runtime-session-1.json")
 ACCOUNT_ID = "qq-default-account"
@@ -130,7 +135,7 @@ def _previous_runtime_is_paused() -> None:
             ).fetchone()
     except sqlite3.Error as exc:
         raise RuntimeError("previous runtime pause state is unreadable") from exc
-    if row is None or not bool(row[0]):
+    if row is None or type(row[0]) is not int or row[0] != 1:
         raise RuntimeError("previous runtime must be globally paused before isolated recovery")
 
 
@@ -439,8 +444,14 @@ def _load_successful_bootstrap(
         or value.get("succeeded") is not True
     ):
         raise RuntimeError(f"fresh bootstrap required for {item.binding_id}")
+    raw_evidence = value.get("evidence")
+    if not isinstance(raw_evidence, dict) or any(
+        type(raw_evidence.get(field)) is not int or raw_evidence[field] <= 0
+        for field in ("process_id", "window_handle", "process_started_at_100ns")
+    ):
+        raise RuntimeError(f"invalid bootstrap process locators for {item.binding_id}")
     try:
-        proof = QQSessionObservedDirectIdentity.model_validate(value["evidence"])
+        proof = QQSessionObservedDirectIdentity.model_validate(raw_evidence)
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(f"invalid bootstrap evidence for {item.binding_id}") from exc
     if proof.binding_id != item.binding_id:
@@ -883,9 +894,119 @@ def _parse_visual_labels(values: list[str]) -> dict[int, str]:
     return labels
 
 
+def _refresh_current_session(*, expected_generation: str, expected_sha256: str) -> int:
+    """Publish metadata only; the outer build fence owns the stopped runtime."""
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise RuntimeError("expected current config digest is invalid")
+    try:
+        expected_generation = str(UUID(expected_generation))
+        previous_bytes = OUTPUT.read_bytes()
+        current = json.loads(previous_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("current generation configuration is unavailable") from exc
+    if hashlib.sha256(previous_bytes).hexdigest() != expected_sha256:
+        raise RuntimeError("current config digest changed before session refresh")
+    generation = current.get("runtime_generation") if isinstance(current, dict) else None
+    if not isinstance(generation, dict) or generation.get("generation_id") != expected_generation:
+        raise RuntimeError("current generation does not match requested session refresh")
+    data_root = _current_runtime_data_root()
+    _validate_isolated_generation_root(data_root)
+    # A session refresh must never become a fresh install of missing business data.
+    databases = (
+        "runtime.sqlite3", "hub.sqlite3", "memory.sqlite3", "pacing.sqlite3",
+        "rules.sqlite3", "authorization.sqlite3", "qq-vm-bridge.sqlite3",
+        "qq-vm-bridge.cursor.sqlite3",
+    )
+    if any(not (data_root / name).is_file() for name in databases):
+        raise RuntimeError("session refresh requires all existing business databases")
+    _previous_runtime_is_paused()
+    previous_revision = session_revision_number(current)
+    validated = validate_session_revision(current, trusted_runtime_root=RUNTIME_ROOT)
+    previous_snapshot = revision_snapshot_path(data_root, previous_revision)
+    if previous_snapshot.read_bytes() != previous_bytes:
+        raise RuntimeError("current config does not match its frozen session snapshot")
+    base_bytes = (data_root / "runtime-config.json").read_bytes()
+    base_hash = validated.base_config_sha256 if validated is not None else hashlib.sha256(base_bytes).hexdigest()
+    bindings = current.get("bindings")
+    if not isinstance(bindings, list) or not bindings:
+        raise RuntimeError("current generation contact set is invalid")
+    _use_data_root(data_root)
+    selected = []
+    for binding in bindings:
+        match = re.fullmatch(r"session-contact-([1-9][0-9]{0,3})", str(binding.get("binding_id", "")))
+        if match is None:
+            raise RuntimeError("current generation binding is outside the contact registry")
+        item = _contact_registration(int(match.group(1)))
+        if (binding.get("account_id"), binding.get("contact_id"), binding.get("hub_conversation_id")) != (
+            ACCOUNT_ID, item.contact_id, item.conversation_id,
+        ):
+            raise RuntimeError("current generation business identity is invalid")
+        selected.append(item)
+    indices = {item.index for item in selected}
+    if len(indices) != len(selected) or _existing_registration_indices() != indices or _existing_runtime_indices() != indices:
+        raise RuntimeError("session refresh must preserve the complete existing contact set")
+    loaded = [_load_successful_bootstrap(item) for item in selected]
+    evidences = [entry[0] for entry in loaded]
+    _validate_same_process_session(evidences)
+    old_proofs = {proof["binding_id"]: proof for proof in current["session_observed_evidence"]}
+    pending_registrations = []
+    for item, binding, (evidence, signature, _legacy, _report) in zip(selected, bindings, loaded, strict=True):
+        if signature != binding.get("participant_signature"):
+            raise RuntimeError(f"stable participant identity changed for {item.binding_id}")
+        _validate_selector_scope(current["selector_pack"], evidence)
+        registered = json.loads(item.registration.read_text(encoding="utf-8"))
+        if (
+            _registration_identity(registered) != _registration_identity(_registration(item, old_proofs[item.binding_id], signature))
+            or registered.get("participant_signature") != signature
+            or registered.get("session_evidence") != old_proofs[item.binding_id]
+        ):
+            raise RuntimeError(f"current registration does not match frozen binding for {item.binding_id}")
+        updated = copy.deepcopy(registered)
+        updated["session_evidence"] = evidence
+        pending_registrations.append((item.registration, updated))
+    candidate = copy.deepcopy(current)
+    candidate["session_observed_evidence"] = evidences
+    locators = {proof["binding_id"]: "runtime:" + proof["selected_row_runtime_id_hash"] for proof in evidences}
+    for binding in candidate["bindings"]:
+        binding["platform_conversation_id"] = locators[binding["binding_id"]]
+    for contact in candidate["contacts"]:
+        binding = contact["binding"]
+        binding["platform_conversation_id"] = locators[binding["binding_id"]]
+    if candidate == current:
+        raise RuntimeError("session evidence has not changed")
+    candidate["session_binding"] = {
+        "schema": SESSION_BINDING_SCHEMA,
+        "revision": previous_revision + 1,
+        "base_config_sha256": base_hash,
+        "previous_config_sha256": expected_sha256,
+    }
+    revision = validate_session_revision(candidate, trusted_runtime_root=RUNTIME_ROOT, require_snapshot=False)
+    assert revision is not None
+    snapshot = revision.snapshot_path
+    if snapshot.exists():
+        raise RuntimeError("next session binding revision already exists")
+    candidate_bytes = json.dumps(candidate, sort_keys=True, indent=2).encode("utf-8")
+    paths = [path for path, _ in pending_registrations] + [snapshot]
+    with ConfigPublication(OUTPUT, paths):
+        _atomic_bytes(snapshot, candidate_bytes)
+        for path, registration in pending_registrations:
+            _atomic_json(path, registration)
+        validate_session_revision(candidate, trusted_runtime_root=RUNTIME_ROOT)
+        _validate_frozen_candidate(snapshot, hashlib.sha256(candidate_bytes).hexdigest())
+        # Recheck the same predecessor after validation; canonical is published last.
+        if OUTPUT.read_bytes() != previous_bytes:
+            raise RuntimeError("current config changed during session refresh")
+        _atomic_bytes(OUTPUT, candidate_bytes)
+    return 0
+
+
 @_fence_isolated_build
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--refresh-current-session", action="store_true",
+                        help="publish only new QQ session locators within the current paused generation")
+    parser.add_argument("--expected-current-generation")
+    parser.add_argument("--expected-current-config-sha256")
     parser.add_argument(
         "--contact-index",
         type=int,
@@ -946,6 +1067,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.refresh_current_session:
+        if (not args.expected_current_generation or not args.expected_current_config_sha256
+                or args.isolated_recovery_generation or args.contact_index
+                or args.include_contact_2 or args.additional_contact_index
+                or args.adopt_latest_inbound_index or args.refresh_session_index
+                or args.migrate_header_digest_index or args.visual_label):
+            parser.error("current session refresh requires generation/digest only; contact, adoption and migration options are forbidden")
+        return _refresh_current_session(
+            expected_generation=args.expected_current_generation,
+            expected_sha256=args.expected_current_config_sha256,
+        )
+    if args.expected_current_generation or args.expected_current_config_sha256:
+        parser.error("expected current generation/digest requires --refresh-current-session")
     isolated_generation: str | None = None
     if args.isolated_recovery_generation is not None:
         try:

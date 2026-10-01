@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import time
 import traceback
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ from messenger_ai.observability import WindowsDPAPISecretStore
 from messenger_ai.policy import CapabilitySnapshot
 from messenger_ai.runtime.assembly import assemble_runtime
 from messenger_ai.runtime.state import RuntimeState, VerifiedSendStorePaths
+from messenger_ai.runtime.session_revision import session_revision_number, validate_session_revision
 from messenger_ai.runtime.webui_projection import RuntimeWebUIProjection
 from messenger_ai.webui import LiveHubFacade, create_app
 
@@ -427,6 +429,7 @@ def _validated_session_identity_migrations(
 
 
 def validate_config(config: dict[str, Any], *, api_key: str | None) -> tuple[QQSelectorPack, tuple[QQIdentityBinding, ...], tuple[QQSessionObservedDirectIdentity, ...]]:
+    session_revision = validate_session_revision(config, trusted_runtime_root=TRUSTED_RUNTIME_ROOT)
     generation = _validated_runtime_generation(config)
     contacts = config.get("contacts")
     if not config.get("data_dir"):
@@ -571,7 +574,18 @@ def validate_config(config: dict[str, Any], *, api_key: str | None) -> tuple[QQS
             or ordinal != count - 1
         ):
             raise ValueError("bootstrap adoption provenance does not match session binding")
-    _validate_generation_contacts(generation, config, bindings, evidence)
+    if session_revision is None:
+        _validate_generation_contacts(generation, config, bindings, evidence)
+    else:
+        # The original manifest remains the immutable generation/adoption root.
+        # The shared revision validator separately restricts the current snapshot
+        # to same-identity locator changes and validates every hash-chain link.
+        base = session_revision.base_config
+        _validate_generation_contacts(
+            generation, base,
+            tuple(QQIdentityBinding.model_validate(item) for item in base["bindings"]),
+            tuple(QQSessionObservedDirectIdentity.model_validate(item) for item in base["session_observed_evidence"]),
+        )
     return pack, bindings, evidence
 
 
@@ -640,8 +654,18 @@ def _validated_worker_timing(config: dict[str, Any]) -> tuple[float, float]:
 def validate_active_rules(config: dict[str, Any]) -> None:
     from messenger_ai.rules.service import AtomicRulePackStore
     path = Path(config["data_dir"]).expanduser() / "rules.sqlite3"
-    store = AtomicRulePackStore(str(path))
+    # --check is also used before publishing a session-only revision. Resolve
+    # rules against an in-memory snapshot, never run schema setup on the live DB.
+    store = AtomicRulePackStore()
     try:
+        try:
+            source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                source.backup(store.connection)
+            finally:
+                source.close()
+        except sqlite3.Error as exc:
+            raise ValueError("active M7 RulePack database is unavailable") from exc
         for item in config["contacts"]:
             try:
                 store.resolve(str(item["contact_id"]))
@@ -1335,11 +1359,13 @@ def main(argv: list[str] | None = None) -> int:
         "--expected-config-sha256",
         help="require the single config read to match this supervisor/build digest",
     )
+    parser.add_argument("--expected-session-binding-revision", type=int,
+                        help="require the immutable QQ session metadata revision (legacy=1)")
     args = parser.parse_args(argv)
     owner: QQRuntimeInstanceOwner | None = None
     try:
         if args.assert_runtime_stopped:
-            if args.config or args.check or args.run_id or args.expected_config_sha256:
+            if args.config or args.check or args.run_id or args.expected_config_sha256 or args.expected_session_binding_revision is not None:
                 raise ValueError("runtime stopped assertion cannot be combined with runtime options")
             owner = QQRuntimeInstanceOwner()
             owner.acquire()
@@ -1357,6 +1383,13 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             expected_sha256=args.expected_config_sha256,
         )
+        revision = session_revision_number(config)
+        if args.expected_session_binding_revision is not None and (
+            args.expected_session_binding_revision < 1
+            or revision != args.expected_session_binding_revision
+        ):
+            raise ValueError("runtime session binding revision mismatch")
+        validate_session_revision(config, trusted_runtime_root=TRUSTED_RUNTIME_ROOT)
         vault = config.get("secret_vault")
         if not vault:
             raise ValueError("secret_vault is required; configure DPAPI secrets before startup")

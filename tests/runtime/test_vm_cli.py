@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import importlib.util
 import json
@@ -631,6 +632,129 @@ def test_isolated_pause_exists_before_bridge_recovery(tmp_path, monkeypatch):
         cfg, api_key="key", authorization_signing_key=b"a" * 32
     )
     cli._shutdown(app)
+
+
+def _session_revision_config(tmp_path: Path) -> tuple[dict, dict]:
+    from messenger_ai.runtime.session_revision import SCHEMA
+    base = _isolated_generation_config(tmp_path)
+    data = Path(base["data_dir"])
+    payload = json.dumps(base, sort_keys=True, indent=2).encode()
+    (data / "runtime-config.json").write_bytes(payload)
+    value = copy.deepcopy(base)
+    proof = value["session_observed_evidence"][0]
+    proof.update(process_id=9123, window_handle=9456,
+                 process_started_at_100ns=9789, selected_row_runtime_id_hash="f" * 64)
+    for binding in (value["bindings"][0], value["contacts"][0]["binding"]):
+        binding["platform_conversation_id"] = "runtime:" + "f" * 64
+    digest = hashlib.sha256(payload).hexdigest()
+    value["session_binding"] = {
+        "schema": SCHEMA, "revision": 2,
+        "base_config_sha256": digest, "previous_config_sha256": digest,
+    }
+    (data / "runtime-config.session-2.json").write_text(
+        json.dumps(value, sort_keys=True, indent=2), encoding="utf-8",
+    )
+    return base, value
+
+
+def test_runner_validates_new_session_against_unchanged_generation_root(tmp_path):
+    base, value = _session_revision_config(tmp_path)
+    root_path = Path(base["data_dir"]) / "runtime-config.json"
+    before = root_path.read_bytes()
+    _pack, bindings, proofs = cli.validate_config(value, api_key="test-key")
+    assert proofs[0].process_id == 9123
+    assert bindings[0].participant_signature == base["bindings"][0]["participant_signature"]
+    assert root_path.read_bytes() == before
+    # Removing the revision envelope cannot escape the original manifest's
+    # exact evidence check, even though all other config fields are valid.
+    value.pop("session_binding")
+    with pytest.raises(ValueError, match="evidence digest mismatch"):
+        cli.validate_config(value, api_key="test-key")
+
+
+def test_runner_revision_mismatch_is_rejected_before_secrets(tmp_path, monkeypatch):
+    _base, value = _session_revision_config(tmp_path)
+    path = Path(value["data_dir"]) / "runtime-config.session-2.json"
+    monkeypatch.setattr(cli, "WindowsDPAPISecretStore", lambda *_args: pytest.fail("read secrets before revision check"))
+    monkeypatch.setattr(cli, "QQVMWorkerProcess", lambda *_args: pytest.fail("created worker"))
+    assert cli.main(["--config", str(path), "--check", "--expected-session-binding-revision", "1"]) == 2
+
+
+def test_rules_check_never_changes_or_repairs_business_database(tmp_path):
+    cfg = _config(tmp_path)
+    data = Path(cfg["data_dir"])
+    _activate_rule(data)
+    path = data / "rules.sqlite3"
+    # Missing a non-reading table must not cause --check to create it in place.
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE m7_rulepack_audit")
+    before = path.read_bytes()
+    cli.validate_active_rules(cfg)
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='m7_rulepack_audit'").fetchone() is None
+
+
+def test_revision_restart_keeps_pause_and_quarantines_old_sends_without_ui_replay(tmp_path, monkeypatch):
+    from messenger_ai.adapters.qq.vm_driver.bridge import QQVMDriverBridge
+    from messenger_ai.adapters.qq.vm_driver.contracts import WorkerKind, WorkerResult
+    from messenger_ai.domain import SendStatus
+    _patch_external(monkeypatch)
+    base, value = _session_revision_config(tmp_path)
+    data = Path(value["data_dir"])
+    _activate_rule(data)
+    initial = cli.build_runtime(base, api_key="key", authorization_signing_key=b"a" * 32)
+    revision, _paused, _reason = initial.state.global_control()
+    assert initial.state.set_global_pause(paused=True, expected_revision=revision, reason="manual_global_pause")
+    original_control = initial.state.global_control()
+    cli._shutdown(initial)
+
+    commands = []
+    class HealthOnlyWorker(FakeWorker):
+        def request(self, command, _timeout):
+            commands.append(command.kind)
+            assert command.kind is WorkerKind.HEALTH, "old operation replayed a UI action"
+            return WorkerResult(request_id=command.request_id, kind=command.kind,
+                                status=cli.WorkerStatus.OK, worker_epoch=uuid4())
+    monkeypatch.setattr(cli, "QQVMWorkerProcess", HealthOnlyWorker)
+    _pack, bindings, _proofs = cli.validate_config(base, api_key="key")
+    seed = QQVMDriverBridge(worker=HealthOnlyWorker(None, ()), bindings=bindings,
+                           text_provider=lambda _command: "", sqlite_path=data / "qq-vm-bridge.sqlite3")
+    old_ids = []
+    for status, intent in ((SendStatus.UNCERTAIN, 1), (SendStatus.COMMITTED, 1), (SendStatus.PREPARED, 1)):
+        operation_id = str(uuid4())
+        old_ids.append(operation_id)
+        seed._db.execute(
+            "INSERT INTO qq_vm_ops VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (operation_id, "key-" + operation_id, str(uuid4()), "hub-1", "bind-1",
+             "segment-" + operation_id, 1, 1, "a" * 64, status.value, intent, None),
+        )
+    seed._cursor.bootstrap_last_inbound_once("hub-1", [{"direction": "inbound", "text": "fixture"}])
+    cursor_before = [tuple(row) for row in seed._cursor.connection.execute("SELECT * FROM cursor_state")]
+    seed.close()
+
+    class PausedRecoveryBridge(QQVMDriverBridge):
+        def __init__(self, **kwargs):
+            assert kwargs["sqlite_path"] == data / "qq-vm-bridge.sqlite3"
+            with sqlite3.connect(data / "runtime.sqlite3") as db:
+                assert db.execute("SELECT paused,reason FROM runtime_global_control").fetchone() == (1, "manual_global_pause")
+            super().__init__(**kwargs)
+    monkeypatch.setattr(cli, "QQVMDriverBridge", PausedRecoveryBridge)
+    app = cli.build_runtime(value, api_key="key", authorization_signing_key=b"a" * 32)
+    try:
+        assert app.state.global_control() == original_control
+        assert app.state.revisions("hub-1")[0] == 1
+        assert commands == [WorkerKind.HEALTH]
+        rows = app.driver._db.execute("SELECT * FROM qq_vm_ops ORDER BY operation_id").fetchall()
+        assert {row["operation_id"] for row in rows} == set(old_ids)
+        assert all(row["status"] == SendStatus.UNCERTAIN.value and row["commit_intent"] == 1 for row in rows)
+        for row in rows:
+            settled = asyncio.run(app.driver.commit_send(app.driver._operation(row)))
+            assert settled.status is SendStatus.UNCERTAIN
+        assert commands == [WorkerKind.HEALTH]
+        assert [tuple(row) for row in app.driver._cursor.connection.execute("SELECT * FROM cursor_state")] == cursor_before
+    finally:
+        cli._shutdown(app)
 
 
 def test_build_runtime_keeps_visual_selection_separate_from_reply_provider(tmp_path, monkeypatch):

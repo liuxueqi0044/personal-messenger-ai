@@ -15,7 +15,9 @@ from uuid import uuid4
 
 _METADATA_NAME = re.compile(
     r"(?:registered-session-scope(?:-[1-9][0-9]{0,3})?\.json|"
-    r"generation-manifest\.json|runtime-config\.json|previous-runtime-config\.json|rules\.sqlite3)"
+    r"generation-manifest\.json|runtime-config\.json|"
+    r"runtime-config\.session-(?:[2-9]|[1-9][0-9]{1,4})\.json|"
+    r"previous-runtime-config\.json|rules\.sqlite3)"
 )
 
 
