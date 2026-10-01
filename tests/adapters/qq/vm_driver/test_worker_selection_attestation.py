@@ -1165,6 +1165,300 @@ def test_prepare_post_write_readback_uses_fresh_state(monkeypatch, drift) -> Non
     assert harness.fake.active_phase is None
 
 
+def _move_geometry_during_first_content_read(harness):
+    """A row moves once between complete proofs, then stays at its new rect."""
+    moved = False
+    original_bubbles = harness.fake.list_bubbles
+    original_attest = harness.fake.certify_conversation_selected_visual
+    new_rect = ScreenRect(left=56, top=164, right=306, bottom=228)
+
+    def bubbles(*args):
+        nonlocal moved
+        rows = original_bubbles(*args)
+        moved = True
+        return rows
+
+    def attest(*args, **kwargs):
+        result = original_attest(*args, **kwargs)
+        return result.model_copy(update={"row_rect": new_rect}) if moved else result
+
+    harness.fake.list_bubbles = bubbles
+    harness.fake.certify_conversation_selected_visual = attest
+
+
+@pytest.mark.parametrize("use_handoff", [False, True])
+@pytest.mark.parametrize("second_draft", ["", "new operator draft"])
+def test_prepare_geometry_retry_discards_first_content_and_does_not_reresolve(
+    monkeypatch, use_handoff, second_draft, tmp_path,
+) -> None:
+    from messenger_ai.adapters.qq.vm_driver.diagnostics import WorkerDiagnosticSink
+    import json
+
+    harness = _session_harness(monkeypatch)
+    harness.worker._diagnostics = WorkerDiagnosticSink(tmp_path, "child")
+    prepare = _prepare_command(harness.binding.binding_id)
+    if use_handoff:
+        prepare = _with_handoff(prepare, _mint_refresh_handoff(harness, prepare))
+    _move_geometry_during_first_content_read(harness)
+    original_bubbles = harness.fake.list_bubbles
+    original_composer = harness.fake.read_composer
+    original_header = harness.certifier.try_certify_already_current
+    original_target = harness.worker._stable_target
+    original_consume = harness.worker._consume_selection_handoff
+    reads, proofs, target_proofs, handoffs = [], [], [], []
+
+    def bubbles(*args):
+        original_bubbles(*args)
+        number = len(reads) + 1
+        bubble = QQBubble(
+            conversation_internal_id=harness.fake.conversations[0].internal_id,
+            message_key=f"snapshot-{number}", direction=BubbleDirection.INBOUND,
+            text=f"private-message-{number}", observed_at=datetime.now(UTC),
+            tree_digest=harness.fake.digest,
+        )
+        reads.append((bubble, harness.fake.active_phase))
+        return [bubble]
+
+    def composer(*args):
+        if len(reads) == 2 and "write-composer" not in harness.fake.calls:
+            harness.fake.composer = second_draft
+        return original_composer(*args)
+
+    def header(*args):
+        proof = original_header(*args).model_copy()
+        proofs.append(proof)
+        return proof
+
+    def target(**kwargs):
+        target_proofs.append(kwargs["proof"])
+        return original_target(**kwargs)
+
+    def consume(*args):
+        handoffs.append(args)
+        return original_consume(*args)
+
+    harness.fake.list_bubbles = bubbles
+    harness.fake.read_composer = composer
+    harness.certifier.try_certify_already_current = header
+    harness.worker._stable_target = target
+    harness.worker._consume_selection_handoff = consume
+    result = harness.worker.execute(prepare)
+
+    assert len(reads) == 2
+    assert reads[0][1] != reads[1][1]  # the discarded read phase is closed
+    assert target_proofs[0] is proofs[1]
+    assert all(item is not proofs[0] for item in target_proofs)
+    assert len(handoffs) == int(use_handoff)
+    assert harness.fake.calls.count("find") == 1
+    assert harness.fake.calls.count("select") == int(not use_handoff)
+    assert harness.fake.calls.count("conversations") == 1
+    assert "invoke-send" not in harness.fake.calls
+    if second_draft:
+        assert result.status is WorkerStatus.FAILED_SAFE
+        assert result.error_code == "composer_not_empty"
+        assert harness.fake.composer == second_draft
+        assert "write-composer" not in harness.fake.calls
+        assert harness.worker._reservation is None
+        assert harness.visual.calls == 4
+    else:
+        assert result.status is WorkerStatus.OK
+        anchors = result.evidence["prepared_evidence"]["before_bubbles"]
+        assert [item["message_key"] for item in anchors] == ["snapshot-2"]
+        assert anchors[0]["text_hash"] == reads[1][0].text_hash
+        assert harness.fake.composer == prepare.text
+        assert harness.fake.calls.count("write-composer") == 1
+        assert harness.visual.calls == 6  # retry plus fresh post-write proof
+    logs = (tmp_path / "qq-worker-child.jsonl").read_text()
+    events = [json.loads(line) for line in logs.splitlines()]
+    diagnostics = [item["selection_attestation"] for item in events
+                   if "selection_attestation" in item]
+    assert diagnostics == [{
+        "comparison": "before_after", "changed_fields": ["row_rect"],
+        "before_rect": [56, 100, 306, 164], "after_rect": [56, 164, 306, 228],
+        "attempt": 1, "retrying": True,
+    }]
+    assert "private-message" not in logs and "operator draft" not in logs
+
+
+def test_prepare_second_geometry_drift_is_refused_with_bounded_diagnostic(monkeypatch):
+    harness = _session_harness(monkeypatch)
+    original = harness.fake.list_bubbles
+
+    def bubbles_then_move(*args):
+        result = original(*args)
+        harness.visual.mutations[harness.visual.next_call()] = {
+            "row_rect": ScreenRect(left=56, top=164, right=306, bottom=228),
+        }
+        return result
+
+    harness.fake.list_bubbles = bubbles_then_move
+    result = harness.worker.execute(_prepare_command(harness.binding.binding_id))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert result.evidence["selection_attestation"] == {
+        "comparison": "before_after", "changed_fields": ["row_rect"],
+        "before_rect": [56, 100, 306, 164], "after_rect": [56, 164, 306, 228],
+        "attempt": 2, "retrying": False,
+    }
+    assert harness.visual.calls == 4
+    assert harness.fake.calls.count("bubbles") == 2
+    assert "write-composer" not in harness.fake.calls
+    assert harness.worker._reservation is None
+
+
+@pytest.mark.parametrize("mutation", [
+    {"process_id": 202}, {"window_handle": 2002},
+    {"target_runtime_id_digest": "d" * 64}, {"profile_id": "other-profile"},
+    {"environment_fingerprint": "d" * 64}, {"client_version": "different"},
+    {"selector_pack_version": "different"},
+])
+def test_prepare_geometry_plus_scope_drift_never_retries(monkeypatch, mutation):
+    harness = _session_harness(monkeypatch)
+    harness.visual.mutations[2] = {
+        "row_rect": ScreenRect(left=56, top=164, right=306, bottom=228), **mutation,
+    }
+    result = harness.worker.execute(_prepare_command(harness.binding.binding_id))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert harness.visual.calls == 2
+    assert harness.fake.calls.count("bubbles") == 1
+    assert "write-composer" not in harness.fake.calls
+    assert harness.worker._reservation is None
+    assert result.evidence["selection_attestation"]["comparison"] == "expected_scope"
+    assert result.evidence["selection_attestation"]["changed_fields"] == list(mutation)
+    assert result.evidence["selection_attestation"]["retrying"] is False
+
+
+def test_prepare_geometry_drift_with_first_draft_never_retries(monkeypatch):
+    harness = _session_harness(monkeypatch)
+    _move_geometry_during_first_content_read(harness)
+    harness.fake.composer = "existing operator draft"
+    result = harness.worker.execute(_prepare_command(harness.binding.binding_id))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert harness.visual.calls == 2
+    assert harness.fake.calls.count("read-composer") == 1
+    assert "write-composer" not in harness.fake.calls
+    assert harness.fake.composer == "existing operator draft"
+
+
+@pytest.mark.parametrize("changed_call", [3, 4])
+def test_prepare_retry_identity_drift_has_second_attempt_diagnostic(monkeypatch, changed_call):
+    harness = _session_harness(monkeypatch)
+    _move_geometry_during_first_content_read(harness)
+    harness.visual.mutations[changed_call] = {"window_handle": 2002}
+    result = harness.worker.execute(_prepare_command(harness.binding.binding_id))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert harness.visual.calls == changed_call
+    assert result.evidence["selection_attestation"]["attempt"] == 2
+    assert result.evidence["selection_attestation"]["changed_fields"] == ["window_handle"]
+    assert result.evidence["selection_attestation"]["retrying"] is False
+    assert "write-composer" not in harness.fake.calls
+    assert harness.worker._reservation is None
+
+
+@pytest.mark.parametrize("clock_boundary", ["before_retry", "during_retry", "reserve"])
+def test_prepare_geometry_retry_uses_original_deadline_and_reserve(
+    monkeypatch, clock_boundary,
+):
+    harness = _session_harness(monkeypatch)
+    _move_geometry_during_first_content_read(harness)
+    clock = _FrozenClock(datetime.now(UTC))
+    _FakeDateTime.clock = clock
+    monkeypatch.setattr(worker_module, "datetime", _FakeDateTime)
+    prepare = _prepare_command(harness.binding.binding_id).model_copy(update={
+        "deadline": clock.value + timedelta(seconds=100),
+    })
+    original_read = harness.fake.read_composer
+    original_report = harness.worker._report_selection_attestation_drift
+    reads = 0
+
+    def read(*args):
+        nonlocal reads
+        reads += 1
+        value = original_read(*args)
+        if reads == 2:
+            clock.advance(100 if clock_boundary == "during_retry" else
+                          100 - harness.worker._prepare_write_reserve_seconds)
+        return value
+
+    def report(*args):
+        original_report(*args)
+        if clock_boundary == "before_retry":
+            clock.advance(100)
+
+    harness.fake.read_composer = read
+    harness.worker._report_selection_attestation_drift = report
+    result = harness.worker.execute(prepare)
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == (
+        "prepare_write_budget_exhausted" if clock_boundary == "reserve" else "deadline_expired"
+    )
+    assert reads == (1 if clock_boundary == "before_retry" else 2)
+    assert "write-composer" not in harness.fake.calls
+    assert harness.worker._reservation is None
+
+
+def test_prepare_post_write_geometry_drift_never_retries(monkeypatch):
+    harness = _session_harness(monkeypatch)
+    prepare = _prepare_command(harness.binding.binding_id)
+    original = harness.fake.read_composer
+
+    def read(*args):
+        value = original(*args)
+        if "write-composer" in harness.fake.calls:
+            harness.visual.mutations[harness.visual.next_call()] = {
+                "row_rect": ScreenRect(left=56, top=164, right=306, bottom=228),
+            }
+        return value
+
+    harness.fake.read_composer = read
+    result = harness.worker.execute(prepare)
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert harness.visual.calls == 4
+    assert harness.fake.calls.count("bubbles") == 1
+    assert harness.fake.calls.count("read-composer") == 2
+    assert harness.fake.composer == prepare.text
+    assert harness.worker._reservation == prepare.operation_id
+    assert result.evidence["cleanup_required"] is True
+    assert result.evidence["selection_attestation"]["retrying"] is False
+
+
+@pytest.mark.parametrize("kind", [WorkerKind.OBSERVE, WorkerKind.COMMIT, WorkerKind.VERIFY, WorkerKind.ABORT])
+def test_non_prepare_geometry_drift_never_retries(monkeypatch, kind):
+    harness = _session_harness(monkeypatch)
+    prepare = _prepare_command(harness.binding.binding_id)
+    if kind is not WorkerKind.OBSERVE:
+        assert harness.worker.execute(prepare).status is WorkerStatus.OK
+    command = WorkerCommand(
+        kind=kind, binding_id=harness.binding.binding_id,
+        operation_id=prepare.operation_id if kind is not WorkerKind.OBSERVE else None,
+        binding_revision=prepare.binding_revision,
+        conversation_revision=prepare.conversation_revision,
+    )
+    before = harness.visual.calls
+    harness.visual.mutations[before + 2] = {
+        "row_rect": ScreenRect(left=56, top=164, right=306, bottom=228),
+    }
+    harness.fake.calls.clear()
+    result = harness.worker.execute(command)
+
+    assert result.status in {WorkerStatus.FAILED_SAFE, WorkerStatus.UNCERTAIN}
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert harness.visual.calls - before == 2
+    assert "write-composer" not in harness.fake.calls
+    assert "invoke-send" not in harness.fake.calls
+    assert result.evidence["selection_attestation"]["retrying"] is False
+
+
 def test_prepare_partial_write_failure_is_not_claimed_clean(monkeypatch) -> None:
     harness = _session_harness(monkeypatch)
     prepare = _prepare_command(harness.binding.binding_id)

@@ -848,6 +848,101 @@ def test_prepare_session_proof_with_narrow_scope_keeps_all_full_revalidations(
     assert "invoke-send" not in fake.calls
 
 
+def test_prepare_narrow_fallback_does_not_retry_first_revalidation_geometry_drift(
+    monkeypatch,
+) -> None:
+    worker, fake, binding, _proof = _already_current_fixture(monkeypatch)
+    binding = binding.model_copy(update={"authorization_scope": "legacy_explicit_contacts"})
+    worker._bindings[binding.binding_id] = binding
+    fake.confirm_conversation_selected = lambda *_args: None
+    attest = fake.certify_conversation_selected_visual
+    header = worker._identity_certifier.try_certify_already_current
+    resolve = worker._resolve
+    calls = {"attest": 0, "header": 0, "resolve": 0}
+
+    def drifting_attestation(*args, **kwargs):
+        calls["attest"] += 1
+        value = attest(*args, **kwargs)
+        if calls["attest"] > 1:
+            value = value.model_copy(update={"row_rect": value.row_rect.model_copy(update={
+                "left": value.row_rect.left + 1, "right": value.row_rect.right + 1,
+            })})
+        return value
+
+    def count_header(*args):
+        calls["header"] += 1
+        return header(*args)
+
+    def count_resolve(*args, **kwargs):
+        calls["resolve"] += 1
+        return resolve(*args, **kwargs)
+
+    monkeypatch.setattr(fake, "certify_conversation_selected_visual", drifting_attestation)
+    monkeypatch.setattr(worker._identity_certifier, "try_certify_already_current", count_header)
+    monkeypatch.setattr(worker, "_resolve", count_resolve)
+
+    result = worker.execute(WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="fallback:0", text="must not be written",
+    ))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert calls == {"attest": 2, "header": 1, "resolve": 1}
+    assert fake.calls.count("select") == 1
+    assert fake.calls.count("bubbles") == 1
+    assert not {"read-composer", "write-composer", "invoke-send"} & set(fake.calls)
+    assert fake.composer == ""
+    assert worker._prepared == {}
+    assert worker._reservation is None
+    assert worker._trusted_operation_lease is None
+
+
+@pytest.mark.parametrize("composer_cleared", [False, True])
+def test_prepare_with_existing_reservation_does_not_retry_geometry_drift(
+    monkeypatch, composer_cleared: bool,
+) -> None:
+    worker, fake, binding, _proof = _already_current_fixture(monkeypatch)
+    command = WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="reserved:0", text="owned draft",
+    )
+    assert worker.execute(command).status is WorkerStatus.OK
+    prepared = worker._prepared[command.operation_id]
+    lease = worker._trusted_operation_lease
+    if composer_cleared:
+        fake.composer = ""
+    before_composer = fake.composer
+    fake.calls.clear()
+    attest = fake.certify_conversation_selected_visual
+    attestations = []
+
+    def drifting_attestation(*args, **kwargs):
+        value = attest(*args, **kwargs)
+        if attestations:
+            value = value.model_copy(update={"row_rect": value.row_rect.model_copy(update={
+                "left": value.row_rect.left + 1, "right": value.row_rect.right + 1,
+            })})
+        attestations.append(value)
+        return value
+
+    monkeypatch.setattr(fake, "certify_conversation_selected_visual", drifting_attestation)
+
+    result = worker.execute(command.model_copy(update={"request_id": uuid4()}))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert len(attestations) == 2
+    assert fake.calls.count("bubbles") == 1
+    assert fake.calls.count("read-composer") == 1
+    assert fake.calls.count("select") == 1
+    assert not {"write-composer", "invoke-send"} & set(fake.calls)
+    assert fake.composer == before_composer
+    assert worker._prepared[command.operation_id] is prepared
+    assert worker._reservation == command.operation_id
+    assert worker._trusted_operation_lease == lease
+
+
 def test_verify_requires_a_new_unique_outbound_bubble() -> None:
     worker, fake, binding_id = _worker()
     operation_id = uuid4()

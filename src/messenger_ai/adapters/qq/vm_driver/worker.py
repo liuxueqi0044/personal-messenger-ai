@@ -49,7 +49,7 @@ from .contracts import (
     verify_selection_handoff_auth,
 )
 from .sequence_alignment import SnapshotAlignmentError, unique_suffix_start
-from .diagnostics import WorkerDiagnosticSink, emit_console
+from .diagnostics import WorkerDiagnosticSink, bounded_selection_attestation, emit_console
 from .session_identity import QQSessionCandidateLocator, QQSessionIdentityCertifier
 from .transport import UIAUnavailable, WindowsUIAQQAccessibility
 from .visual_selection import (
@@ -73,6 +73,36 @@ class _PrepareReadSnapshot:
 
     before_bubbles: tuple[QQBubble, ...]
     composer_text: str
+
+
+_SELECTION_SCOPE_FIELDS = (
+    "schema_version", "profile_id", "client_version", "selector_pack_version",
+    "environment_fingerprint", "process_id", "window_handle",
+    "target_runtime_id_digest",
+)
+
+
+class _SelectionAttestationDrift(RuntimeError):
+    """A fixed public error with content-free field/geometry diagnostics."""
+
+    def __init__(self, *, changed_fields: list[str],
+                 after: SelectionVisualAttestation,
+                 before: SelectionVisualAttestation | None = None,
+                 attempt: int = 1, retrying: bool = False) -> None:
+        super().__init__("selection visual attestation drift")
+        self.diagnostic = {
+            "comparison": "before_after" if before is not None else "expected_scope",
+            "changed_fields": changed_fields,
+            "after_rect": [after.row_rect.left, after.row_rect.top,
+                           after.row_rect.right, after.row_rect.bottom],
+            "attempt": attempt,
+            "retrying": retrying,
+        }
+        if before is not None:
+            self.diagnostic["before_rect"] = [
+                before.row_rect.left, before.row_rect.top,
+                before.row_rect.right, before.row_rect.bottom,
+            ]
 
 
 def _start_without_console(process) -> None:
@@ -211,9 +241,12 @@ def _safe_failure(exc: BaseException, *, fallback: str) -> tuple[str, dict[str, 
     com_hresult: int | None = None
     project_frames: list[dict[str, object]] = []
     visual_selection_evidence: dict[str, object] = {}
+    selection_attestation: dict[str, object] = {}
     current: BaseException | None = exc
     while current is not None and len(chain) < 5:
         chain.append(type(current).__name__)
+        if isinstance(current, _SelectionAttestationDrift) and not selection_attestation:
+            selection_attestation = bounded_selection_attestation(current.diagnostic)
         candidate = getattr(current, "hresult", None)
         if not isinstance(candidate, int) and getattr(current, "args", ()):
             candidate = current.args[0]
@@ -240,6 +273,8 @@ def _safe_failure(exc: BaseException, *, fallback: str) -> tuple[str, dict[str, 
     if project_frames:
         evidence["project_frames"] = project_frames[-8:]
     evidence.update(visual_selection_evidence)
+    if selection_attestation:
+        evidence["selection_attestation"] = selection_attestation
     return error_code or fallback, evidence
 
 
@@ -561,6 +596,7 @@ class QQVMWorker:
             binding,
             current_reader=read_bubbles,
             certified_current_reader=read_prepare_snapshot,
+            allow_geometry_retry=True,
         )
         expected_target = self._stable_target(
             binding=binding, window=window, proof=proof
@@ -896,6 +932,7 @@ class QQVMWorker:
         command: WorkerCommand,
         window: QQWindow,
         conversation: QQConversation,
+        attempt: int = 1,
     ) -> SelectionVisualAttestation:
         self._ensure_command_live(command)
         profile = self._selection_visual_profile
@@ -929,19 +966,23 @@ class QQVMWorker:
             if str(exc) == "deadline_expired":
                 raise
             raise RuntimeError("selection visual attestation failed") from exc
-        if (
-            attestation.profile_id != profile.profile_id
-            or attestation.client_version != self._selectors.client_version
-            or attestation.selector_pack_version
-            != self._selectors.fixture_suite_version
-            or attestation.environment_fingerprint
-            != self._selectors.environment_fingerprint
-            or attestation.process_id != window.process_id
-            or attestation.window_handle != window.window_handle
-            or attestation.target_runtime_id_digest
-            != runtime_id_digest(conversation.internal_id)
-        ):
-            raise RuntimeError("selection visual attestation drift")
+        expected = {
+            "profile_id": profile.profile_id,
+            "client_version": self._selectors.client_version,
+            "selector_pack_version": self._selectors.fixture_suite_version,
+            "environment_fingerprint": self._selectors.environment_fingerprint,
+            "process_id": window.process_id,
+            "window_handle": window.window_handle,
+            "target_runtime_id_digest": runtime_id_digest(conversation.internal_id),
+        }
+        changed_fields = [name for name, value in expected.items()
+                          if getattr(attestation, name) != value]
+        if changed_fields:
+            error = _SelectionAttestationDrift(
+                changed_fields=changed_fields, after=attestation, attempt=attempt,
+            )
+            self._report_selection_attestation_drift(command, error)
+            raise error
         self._ensure_command_live(command)
         return attestation
 
@@ -957,42 +998,85 @@ class QQVMWorker:
             [QQWindow, QQConversation, CurrentDirectIdentity | None], object
         ]
         | None,
+        allow_geometry_retry: bool = False,
     ) -> tuple[CurrentDirectIdentity, object | None]:
         try_already_current = getattr(
             self._identity_certifier, "try_certify_already_current", None
         )
         if not callable(try_already_current):
             raise RuntimeError("current identity certifier unavailable")
-        with self._stage(command, "selection_before_read"):
-            before = self._attest_exact_selected_row(
-                command=command, window=window, conversation=conversation
+        attempt = 1
+        while True:
+            self._ensure_command_live(command)
+            with self._stage(command, "selection_before_read"):
+                before = self._attest_exact_selected_row(
+                    command=command, window=window, conversation=conversation, attempt=attempt,
+                )
+            with self._stage(command, "identity_and_content_read"), read_phase(window):
+                proof = try_already_current(window, conversation)
+                if proof is None:
+                    raise RuntimeError("selection visual header is unproven")
+                if proof.participant_signature != binding.participant_signature:
+                    raise RuntimeError("profile identity mismatch")
+                current = (
+                    current_reader(window, conversation, proof)
+                    if current_reader is not None
+                    else None
+                )
+            with self._stage(command, "selection_after_read"):
+                after = self._attest_exact_selected_row(
+                    command=command, window=window, conversation=conversation, attempt=attempt,
+                )
+            changed_fields = [
+                name for name in (*_SELECTION_SCOPE_FIELDS, "row_rect")
+                if getattr(before, name) != getattr(after, name)
+            ]
+            if not changed_fields:
+                self._ensure_command_live(command)
+                return proof, current
+            retrying = bool(
+                allow_geometry_retry
+                and attempt == 1
+                and changed_fields == ["row_rect"]
+                and command.kind is WorkerKind.PREPARE
+                and isinstance(current, _PrepareReadSnapshot)
+                and current.composer_text == ""
+                and self._reservation is None
+                and self._trusted_operation_lease is None
+                and command.operation_id not in self._prepared
             )
-        with self._stage(command, "identity_and_content_read"), read_phase(window):
-            proof = try_already_current(window, conversation)
-            if proof is None:
-                raise RuntimeError("selection visual header is unproven")
-            if proof.participant_signature != binding.participant_signature:
-                raise RuntimeError("profile identity mismatch")
-            current = (
-                current_reader(window, conversation, proof)
-                if current_reader is not None
-                else None
+            error = _SelectionAttestationDrift(
+                changed_fields=changed_fields, before=before, after=after,
+                attempt=attempt, retrying=retrying,
             )
-        with self._stage(command, "selection_after_read"):
-            after = self._attest_exact_selected_row(
-                command=command, window=window, conversation=conversation
-            )
-        if (
-            before.profile_id != after.profile_id
-            or before.process_id != after.process_id
-            or before.window_handle != after.window_handle
-            or before.target_runtime_id_digest
-            != after.target_runtime_id_digest
-            or before.row_rect != after.row_rect
-        ):
-            raise RuntimeError("selection visual attestation drift")
-        self._ensure_command_live(command)
-        return proof, current
+            self._report_selection_attestation_drift(command, error)
+            if not retrying:
+                raise error
+            # Both attestations passed independently; only their geometry
+            # differed. Discard all read values and start one fresh complete
+            # fence under the original deadline. Never re-resolve, consume a
+            # handoff again, reselect, or retain UIA controls across attempts.
+            del proof, current
+            attempt += 1
+
+    def _report_selection_attestation_drift(
+        self, command: WorkerCommand, error: _SelectionAttestationDrift,
+    ) -> None:
+        if self._run_id is None and self._diagnostics is None:
+            return
+        self._emit_stage({
+            "schema": "pmai-qq-worker-stage-event-v1",
+            "run_id": self._run_id,
+            "worker_epoch": str(self._epoch),
+            "request_id": str(command.request_id),
+            "kind": command.kind.value,
+            "binding_id": command.binding_id,
+            "operation_id": str(command.operation_id) if command.operation_id else None,
+            "stage": "selection_equivalence",
+            "event": "selection_attestation_drift",
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "selection_attestation": error.diagnostic,
+        })
 
     def _revalidate_expected_target(
         self,
@@ -1028,7 +1112,8 @@ class QQVMWorker:
                  | None = None,
                  certified_current_reader: Callable[[QQWindow, QQConversation,
                                                      CurrentDirectIdentity | None], object]
-                 | None = None):
+                 | None = None,
+                 allow_geometry_retry: bool = False):
         # This optional reader is used only by the complete before/header/after
         # fence. A legacy confirmation must never return its stronger snapshot.
         with self._stage(command, "target_window"):
@@ -1065,6 +1150,7 @@ class QQVMWorker:
                         conversation=conversation,
                         read_phase=read_phase,
                         current_reader=certified_current_reader or current_reader,
+                        allow_geometry_retry=allow_geometry_retry,
                     )
                 return window, conversation, proof, current
             if (
@@ -1095,6 +1181,7 @@ class QQVMWorker:
                     conversation=conversation, read_phase=read_phase,
                     current_reader=current_reader,
                     certified_current_reader=certified_current_reader,
+                    allow_geometry_retry=allow_geometry_retry,
                 )
             return window, conversation, proof, current
 
@@ -1191,6 +1278,7 @@ class QQVMWorker:
         window: QQWindow, conversation: QQConversation, read_phase,
         current_reader: Callable[[QQWindow, QQConversation, CurrentDirectIdentity | None], object] | None,
         certified_current_reader: Callable[[QQWindow, QQConversation, CurrentDirectIdentity | None], object] | None = None,
+        allow_geometry_retry: bool = False,
     ) -> tuple[CurrentDirectIdentity | None, object | None]:
         """Certify only a settled selection, using a fresh UIA phase per retry."""
         if binding.authorization_scope == "all_direct_including_temporary":
@@ -1201,6 +1289,7 @@ class QQVMWorker:
                 conversation=conversation,
                 read_phase=read_phase,
                 current_reader=certified_current_reader or current_reader,
+                allow_geometry_retry=allow_geometry_retry,
             )
             return proof, current
         now = datetime.now(UTC)
@@ -1658,6 +1747,9 @@ class QQVMWorkerProcess:
                 frames.append({"function": function, "file": filename, "line": line})
         if frames:
             diagnostics["project_frames"] = frames
+        attestation = bounded_selection_attestation(evidence.get("selection_attestation"))
+        if attestation:
+            diagnostics["selection_attestation"] = attestation
         return diagnostics
 
     def _record_request_started(self, command: WorkerCommand, started_at: datetime) -> None:
