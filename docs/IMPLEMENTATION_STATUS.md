@@ -22,6 +22,8 @@ Read-only guest diagnostics then isolated repeated full-window UIA enumeration a
 
 At commit `6ee2086`, the full Windows suite passed (1624 passed, 2 skipped), and frozen release `r20261001-12` was installed and independently verified. After one observation rejected a changing row list, four diagnostic enumerations showed identical row IDs, order and rectangles. A subsequent HEALTH and two independent OBSERVE requests passed: 26.8 s and 27.3 s, each reading 14 visible bubbles, with the canonical config unchanged and no messages sent. These limited samples establish a read-only baseline, not sustained reliability or delivery readiness. Guest wall-clock rate adjustment was also measured, so elapsed monotonic time and UTC duration are recorded separately.
 
+The first live session refresh exposed an existing `one-shot-intents` subdirectory that the initial-generation flat-directory check rejected. The refresh-specific compatibility fix preserves canonical UUID intent files without reading their contents; unknown directories, reparse points, hard links and nesting remain rejected. The Windows builder/publication tests passed (73 tests). Frozen `r20261001-13` was installed and independently verified, then published session revision 2 in the original generation. Before/after hashes matched for all existing business SQLite/WAL files and old intent files, as well as the original config and manifest; adoption was unchanged and the global pause remained set. The normal supervisor subsequently started with the new revision and reachable local Web UI while paused. This passes one controlled restart/session-publication recovery path; real delivery and broader W1/W2 acceptance remain outstanding.
+
 ## Implemented
 
 | Area | Status | Evidence boundary |
