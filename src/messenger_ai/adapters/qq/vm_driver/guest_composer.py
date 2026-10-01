@@ -125,7 +125,13 @@ def _focus_composer(control: Any, *, scope_guard: Callable[[], bool],
                     focus_guard: Callable[[Any], bool],
                     timeout_seconds: float = 2.0,
                     interval_seconds: float = 0.05) -> None:
-    """Allow asynchronous UIA focus to settle before any keyboard input."""
+    """Preserve verified focus or allow asynchronous UIA focus to settle."""
+    if not scope_guard():
+        raise GuestComposerError("composer_focus_drift")
+    # Electron can redirect a redundant SetFocus to a hidden renderer HWND.
+    # Keep an already verified editor focus within the certified QQ window.
+    if focus_guard(control):
+        return
     control.SetFocus()
     deadline = time.monotonic() + timeout_seconds
     while True:

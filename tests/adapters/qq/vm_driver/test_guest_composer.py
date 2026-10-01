@@ -227,3 +227,24 @@ def test_delayed_focus_also_precedes_clear(monkeypatch):
     clear_with_local_selection(control, expected_text="owned draft", scope_guard=lambda: True,
                                focus_guard=lambda _control: now[0] >= 0.1, clear_action=clear)
     assert control.text == ""
+
+
+@pytest.mark.parametrize("clearing", [False, True])
+def test_preserves_certified_existing_focus_without_redundant_setfocus(clearing):
+    control = Control("owned draft" if clearing else "")
+    control.focused = True
+
+    def erroneous_electron_setfocus():
+        raise AssertionError("SetFocus would activate a different renderer HWND")
+
+    control.SetFocus = erroneous_electron_setfocus
+    if clearing:
+        clear_with_local_selection(control, expected_text="owned draft", scope_guard=lambda: True,
+                                   focus_guard=lambda item: item.focused,
+                                   clear_action=lambda: setattr(control, "text", ""))
+        assert control.text == ""
+    else:
+        write_with_text_pattern(control, "hello", scope_guard=lambda: True,
+                                focus_guard=lambda item: item.focused,
+                                sender=lambda value: setattr(control, "text", value))
+        assert control.text == "hello"
