@@ -103,7 +103,14 @@ class ReplyPlan(StrictModel):
     risk_level: RiskLevel = RiskLevel.LOW
     policy_tags: tuple[str, ...] = ()
     must_rule_results: tuple[str, ...] = ()
-    prohibited_rule_results: tuple[str, ...] = ()
+    prohibited_rule_results: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "仅列出当前候选回复实际违反的禁止规则 ID 或具体违规描述，不得遗漏实际违规。"
+            "没有违规时必须返回空数组 []。"
+            "不得填写 PASS、检查通过、已遵守或未违反规则的说明；这不是完整的检查清单。"
+        ),
+    )
     assumptions: tuple[str, ...] = ()
     confidence: float = Field(
         ge=0,
