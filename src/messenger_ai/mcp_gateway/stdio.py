@@ -10,8 +10,9 @@ from .models import CallerIdentity, GatewayErrorCode
 
 
 def sdk_available() -> bool:
+    """Check the FastMCP API we use, not just the top-level SDK package."""
     try:
-        import mcp  # noqa: F401
+        from mcp.server.fastmcp import FastMCP  # noqa: F401
     except ImportError:
         return False
     return True
@@ -20,7 +21,8 @@ def sdk_available() -> bool:
 def require_sdk() -> None:
     if not sdk_available():
         raise RuntimeError(
-            f"{GatewayErrorCode.SDK_UNAVAILABLE.value}: install optional dependency 'mcp>=1.0' to run STDIO"
+            f"{GatewayErrorCode.SDK_UNAVAILABLE.value}: "
+            "install optional dependency 'mcp>=1.2,<2' to run STDIO"
         )
 
 

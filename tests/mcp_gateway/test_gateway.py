@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+import pytest
+
 from messenger_ai.mcp_gateway import SPECS, CallerIdentity, MCPGateway, ToolPermission
 from messenger_ai.mcp_gateway.gateway import HubUnavailableError, HubUncertainError
 from messenger_ai.mcp_gateway.models import GatewayErrorCode
@@ -220,6 +222,6 @@ def test_http_is_disabled_and_only_loopback_can_opt_in() -> None:
 
 def test_official_stdio_registration_builds_when_sdk_is_installed() -> None:
     if not sdk_available():
-        return
+        pytest.skip("The optional MCP 1.x FastMCP SDK is not available")
     server = build_fastmcp(MCPGateway(FakeHub()), lambda: caller("messenger.read"))
     assert type(server).__name__ == "FastMCP"
