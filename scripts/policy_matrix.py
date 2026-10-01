@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from messenger_ai.policy import (
     CapabilitySnapshot,
+    ConversationType,
     DraftSnapshot,
     LivePolicyState,
     PlannerAssessment,
@@ -53,6 +54,7 @@ def request_for(inbound: str, body: str = "知道啦") -> PolicyRequest:
         active_pacing_rule_version="pacing-v1",
         capability=capability,
         policy_state_version="state-v1",
+        conversation_type=ConversationType.DIRECT,
         contact_whitelisted=True,
         automation_enabled=True,
     )

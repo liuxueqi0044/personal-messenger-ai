@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from messenger_ai.adapters.qq.vm_driver import guest_composer
@@ -113,6 +115,7 @@ def test_clear_requires_exact_expected_text_and_verified_local_focus():
     assert control.text == ""
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Win64 SendInput ABI requires Windows")
 def test_win64_input_abi_includes_full_union():
     import ctypes
     assert ctypes.sizeof(guest_composer._INPUT) == 40
