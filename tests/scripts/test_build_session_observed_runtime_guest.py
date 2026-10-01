@@ -385,9 +385,59 @@ def test_isolated_recovery_generation_preserves_default_root(tmp_path, monkeypat
         "qq-session-conversation-3"
     ]
     assert retried == config
+    # A refresh rejected by the frozen manifest must not advance registrations.
+    preserved = {path: path.read_bytes() for path in generation_root.glob("*.json")}
+    preserved[output] = output.read_bytes()
+    original_bootstraps = {path: path.read_bytes() for path in bootstrap_root.glob("*.json")}
+    refreshed = _evidence("session-contact-1", "1").model_copy(update={
+        "process_id": 999,
+        "window_handle": 998,
+        "process_started_at_100ns": 997,
+    })
+    for index in (1, 2, 3):
+        proof = _evidence(f"session-contact-{index}", str(index)).model_copy(update={
+            "process_id": refreshed.process_id,
+            "window_handle": refreshed.window_handle,
+            "process_started_at_100ns": refreshed.process_started_at_100ns,
+        })
+        _write_bootstrap(bootstrap_root / f"qq-session-observed-bootstrap-{index}.json", proof,
+                         latest_text=f"baseline-{index}")
+    with pytest.raises(RuntimeError, match="isolated generation manifest changed"):
+        module.main(build_args)
+    assert all(path.read_bytes() == before for path, before in preserved.items())
+    for path, value in original_bootstraps.items():
+        path.write_bytes(value)
     (generation_root / "rules.sqlite3").write_bytes(b"truncated")
     with pytest.raises(RuntimeError, match="RulePack database integrity"):
         module.main(build_args)
+
+
+def test_candidate_rejection_rolls_back_new_generation(tmp_path, monkeypatch):
+    module = _load_module()
+    root = tmp_path / "runtime"
+    output = tmp_path / "runtime.json"
+    selector = tmp_path / "selector.json"
+    rules = tmp_path / "rules.sqlite3"
+    selector.write_text(json.dumps({"environment_fingerprint": "a" * 64,
+                                   "client_version": "9.9.20", "fixture_suite_version": "session-pack-v1"}))
+    _write_rules(rules)
+    for key, value in {"RUNTIME_ROOT": root, "BOOTSTRAP_ROOT": tmp_path, "OUTPUT": output,
+                       "SOURCE_RULES": rules, "SELECTOR_PACK": selector}.items():
+        monkeypatch.setattr(module, key, value)
+    _write_bootstrap(tmp_path / "qq-session-observed-bootstrap-1.json", _evidence("session-contact-1", "1"),
+                     latest_text="baseline-1")
+    generation_id = str(uuid4())
+    args = ["--isolated-recovery-generation", generation_id]
+    def reject(*args):
+        raise RuntimeError("candidate rejected")
+    monkeypatch.setattr(module, "_validate_frozen_candidate", reject)
+    with pytest.raises(RuntimeError, match="candidate rejected"):
+        module.main(args)
+    generation_root = root / "recovery-generations" / generation_id / module.ACCOUNT_ID
+    assert list(generation_root.iterdir()) == []
+    assert not output.exists()
+    monkeypatch.setattr(module, "_validate_frozen_candidate", lambda *args: None)
+    assert module.main(args) == 0
 
 
 def test_isolated_recovery_generation_requires_uuid():

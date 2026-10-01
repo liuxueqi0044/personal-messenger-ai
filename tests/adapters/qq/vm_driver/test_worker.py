@@ -1631,7 +1631,8 @@ def test_handoff_never_enters_the_worker_request_diagnostics() -> None:
     diagnostics = QQVMWorkerProcess._request_metadata(_with_handoff(command, handoff))
     serialized = json.dumps(diagnostics, sort_keys=True)
 
-    assert set(diagnostics) == {"request_id", "kind", "binding_id"}
+    assert set(diagnostics) == {"request_id", "kind", "binding_id", "operation_id",
+                                "binding_revision", "conversation_revision"}
     assert str(handoff.handoff_id) not in serialized
     assert str(handoff.predecessor_request_id) not in serialized
     assert str(handoff.predecessor_worker_epoch) not in serialized

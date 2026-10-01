@@ -20,6 +20,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from contextlib import closing
+from messenger_ai.runtime.config_publication import assert_publication_complete
 
 
 OUTPUT = Path(r"C:\PMAI\data\qq-session-runtime-status.json")
@@ -37,6 +38,7 @@ LOG_DIR = Path(r"C:\PMAI\data\logs")
 
 
 def _runtime_config_snapshot() -> tuple[dict[str, object], Path, str]:
+    assert_publication_complete(CONFIG)
     canonical_bytes = CONFIG.read_bytes()
     value = json.loads(canonical_bytes.decode("utf-8"))
     if not isinstance(value, dict):
@@ -458,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_generation_id=args.expected_generation_id,
         )
         data = Path(str(config["data_dir"]))
-    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
         report.update({"state": "stopped", "error_code": "RUNTIME_CONFIG_UNREADABLE",
                        "stopped_at": datetime.now(UTC).isoformat()})
         _publish_status(report, publish_tracker)
@@ -469,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
         str(runtime),
         "--config",
         str(runtime_config),
+        "--publication-config",
+        str(CONFIG),
         "--expected-config-sha256",
         config_sha256,
         "--run-id",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from messenger_ai.runtime.config_publication import assert_data_publication_complete, assert_publication_complete
 import asyncio
 import ctypes
 import getpass
@@ -674,6 +675,9 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
                    authorization_signing_key: bytes, run_id: str | None = None,
                    selection_refresh_retry_enabled: bool = True,
                    recover_persistent_state: bool = True):
+    # Also fence direct callers (e.g. maintenance tools loading a generation
+    # snapshot) against the canonical guest publication, before opening DBs.
+    assert_publication_complete(WORKER_STATUS_PATH.parent / "runtime-session-1.json")
     pack, bindings, session_evidence = validate_config(config, api_key=api_key)
     worker_timeout, prepare_write_reserve = _validated_worker_timing(config)
     generation = _validated_runtime_generation(config)
@@ -683,6 +687,7 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
     )
     bootstrap = config.get("bootstrap_last_inbound_once", [])
     data_dir = Path(config["data_dir"]).expanduser(); data_dir.mkdir(parents=True, exist_ok=True)
+    assert_data_publication_complete(data_dir)
     if generation is not None:
         # The bridge constructor performs its own durable recovery.  Establish
         # the global pause row before constructing it so *all* recovery work is
@@ -719,6 +724,7 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
         session_evidence=session_evidence,
         run_id=run_id,
         prepare_write_reserve_seconds=prepare_write_reserve,
+        diagnostics_dir=WORKER_STATUS_PATH.parent / "logs",
         **worker_kwargs,
     )
     app_box: dict[str, Any] = {}
@@ -1087,6 +1093,10 @@ def _worker_witness_payload(app, *, run_id: str, stopping: bool = False) -> dict
         "startup_health": startup,
         "last_request": last_request,
         "last_successful_observe": observed,
+        "first_failure": _bounded_worker_record(snapshot.get("first_failure")),
+        "last_failure": _bounded_worker_record(snapshot.get("last_failure")),
+        "last_successful_request": _bounded_worker_record(snapshot.get("last_successful_request")),
+        "diagnostic_write_errors": snapshot.get("diagnostic_write_errors", 0),
         "first_terminal_failure": terminal,
         "worker_generation": worker_generation,
         "historical_terminal_failures": historical_terminal_failures,
@@ -1311,6 +1321,7 @@ def _close_unassembled(provider: Any, worker: Any, bridge: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Personal Messenger AI V5 guest runtime")
     parser.add_argument("--config")
+    parser.add_argument("--publication-config", help="canonical configuration publication fence")
     parser.add_argument("--check", action="store_true", help="validate without worker, API client, or WebUI")
     parser.add_argument(
         "--assert-runtime-stopped",
@@ -1336,6 +1347,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not args.config:
             raise ValueError("--config is required")
+        if not args.check:
+            owner = QQRuntimeInstanceOwner()
+            owner.acquire()
+            assert_publication_complete(Path(args.config))
+            if args.publication_config:
+                assert_publication_complete(Path(args.publication_config))
         config = load_config(
             args.config,
             expected_sha256=args.expected_config_sha256,
@@ -1353,8 +1370,6 @@ def main(argv: list[str] | None = None) -> int:
         if not args.run_id:
             raise ValueError("--run-id is required for runtime startup")
         run_id = str(UUID(args.run_id))
-        owner = QQRuntimeInstanceOwner()
-        owner.acquire()
         app = build_runtime(
             config,
             api_key=key,

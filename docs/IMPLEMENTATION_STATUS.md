@@ -2,6 +2,18 @@
 
 This document separates implementation, offline verification, controlled-environment evidence and production readiness. A passing test does not silently promote a capability to a higher assurance level.
 
+The proposed refactoring baseline is [ARCHITECTURE-V1.md](ARCHITECTURE-V1.md), dated 2026-10-01. It describes the target architecture and migration gates; the design document itself does not upgrade any implementation or live-verification status below.
+
+## Architecture implementation, 2026-10-01
+
+The first W0 changes are implemented and offline-tested:
+
+- Runtime configuration builds now hold the same ownership mutex as the runner. Frozen manifest/config rejection happens before registration changes. Publication uses a write-ahead rollback record, startup fences, atomic file replacement, and interrupted-build recovery; existing business databases are not rolled back or reset.
+- Parent request events and child UI stages persist to bounded, content-free diagnostic files even without stdout. First/last failure and last successful request remain available across subsequent requests and worker replacement. These diagnostics do not replace the execution journal.
+- Windows UI children spawn with the installed `pythonw.exe`; the multiprocessing executable setting is restored after the spawn. This removes the detached `python.exe` console creation path; actual foreground behavior still needs guest verification.
+
+The full suite passed after the startup-fence additions (1508 passed, 2 skipped). Live installation and new driver acceptance are tracked separately; no new real delivery is claimed by these results. W1–W5 and the remainder of operational-entry consolidation are not marked complete.
+
 ## Implemented
 
 | Area | Status | Evidence boundary |

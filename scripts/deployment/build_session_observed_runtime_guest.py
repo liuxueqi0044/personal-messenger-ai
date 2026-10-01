@@ -20,6 +20,7 @@ from typing import Any
 from uuid import UUID
 
 from messenger_ai.adapters.qq.models import QQSessionObservedDirectIdentity
+from messenger_ai.runtime.config_publication import ConfigPublication, atomic_bytes
 
 OUTPUT = Path(r"C:\PMAI\data\runtime-session-1.json")
 ACCOUNT_ID = "qq-default-account"
@@ -37,7 +38,7 @@ ISOLATED_GENERATION_MANIFEST_SCHEMA = "pmai-isolated-runtime-generation-manifest
 
 
 class _RuntimeBuildFence:
-    """Hold the runtime ownership mutex while an isolated config is built."""
+    """Hold the runtime ownership mutex while configuration is published."""
 
     ERROR_ALREADY_EXISTS = 183
 
@@ -70,7 +71,7 @@ class _RuntimeBuildFence:
             raise OSError(ctypes.get_last_error(), "cannot create QQ runtime build fence")
         if ctypes.get_last_error() == self.ERROR_ALREADY_EXISTS:
             kernel32.CloseHandle(handle)
-            raise RuntimeError("QQ runtime must be stopped before isolated recovery build")
+            raise RuntimeError("QQ runtime must be stopped before configuration build")
         self._kernel32 = kernel32
         self._handle = int(handle)
 
@@ -227,16 +228,17 @@ def _fence_isolated_build(function):
     @functools.wraps(function)
     def wrapped(argv: list[str] | None = None) -> int:
         arguments = list(sys.argv[1:] if argv is None else argv)
-        if not any(
+        isolated = any(
             argument == "--isolated-recovery-generation"
             or argument.startswith("--isolated-recovery-generation=")
             for argument in arguments
-        ):
-            return function(argv)
+        )
         fence = _RuntimeBuildFence()
         fence.acquire()
         try:
-            _previous_runtime_is_paused()
+            ConfigPublication.recover(OUTPUT, runtime_root=RUNTIME_ROOT)
+            if isolated:
+                _previous_runtime_is_paused()
             return function(argv)
         finally:
             fence.close()
@@ -374,21 +376,11 @@ def _contact_registration(index: int) -> ContactRegistration:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp.json")
-    temporary.write_text(json.dumps(value, sort_keys=True, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_bytes(path, json.dumps(value, sort_keys=True, indent=2).encode("utf-8"))
 
 
 def _atomic_bytes(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_bytes(value)
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_bytes(path, value)
 
 
 def _validate_rules_database(path: Path, contact_ids: tuple[str, ...]) -> None:
@@ -1074,8 +1066,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if pending is not None:
             pending_registrations.append(pending)
+    staged_registrations = {path: value for path, value, _ in pending_registrations}
     for path, registration, migration in pending_registrations:
-        _atomic_json(path, registration)
         if migration is not None:
             session_identity_migrations.append(migration)
     # A crash/retry may rebuild the config after the registration was written
@@ -1087,9 +1079,11 @@ def main(argv: list[str] | None = None) -> int:
         for item, signature in zip(selected, signatures, strict=True)
     }
     for item in selected:
-        if not item.registration.is_file():
-            continue
-        registered = json.loads(item.registration.read_text(encoding="utf-8"))
+        registered = staged_registrations.get(item.registration)
+        if registered is None:
+            if not item.registration.is_file():
+                continue
+            registered = json.loads(item.registration.read_text(encoding="utf-8"))
         persisted_m = registered.get("session_identity_migration")
         if not isinstance(persisted_m, dict):
             continue
@@ -1126,6 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
             adoptions,
         )
         manifest_path = DATA_ROOT / "generation-manifest.json"
+        manifest_bytes = json.dumps(generation_manifest, sort_keys=True, indent=2).encode("utf-8")
         if manifest_path.is_file():
             try:
                 existing_manifest = json.loads(
@@ -1135,18 +1130,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("isolated generation manifest is invalid") from exc
             if existing_manifest != generation_manifest:
                 raise RuntimeError("isolated generation manifest changed")
-        else:
-            _atomic_json(manifest_path, generation_manifest)
+            manifest_bytes = manifest_path.read_bytes()
         generation_manifest_sha256 = hashlib.sha256(
-            manifest_path.read_bytes()
+            manifest_bytes
         ).hexdigest()
 
     target_rules = DATA_ROOT / "rules.sqlite3"
-    _install_rules_database(
-        SOURCE_RULES,
-        target_rules,
-        tuple(item.contact_id for item in selected),
-    )
+    contact_ids = tuple(item.contact_id for item in selected)
+    _validate_rules_database(target_rules if target_rules.exists() else SOURCE_RULES, contact_ids)
 
     config = {
         "schema": "pmai-v5-runtime-1",
@@ -1216,20 +1207,30 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("isolated generation runtime config is invalid") from exc
             if existing_config != config:
                 raise RuntimeError("isolated generation runtime config changed")
-        else:
-            _atomic_json(generation_config, config)
-        generation_config_sha256 = hashlib.sha256(
-            generation_config.read_bytes()
-        ).hexdigest()
-        _validate_frozen_candidate(generation_config, generation_config_sha256)
+
+    publication_paths = [path for path, _, _ in pending_registrations] + [target_rules]
+    if isolated_generation is not None:
         previous_config = DATA_ROOT / "previous-runtime-config.json"
-        if not previous_config.exists() and OUTPUT.is_file():
-            current_bytes = OUTPUT.read_bytes()
-            if current_bytes != generation_config.read_bytes():
-                _atomic_bytes(previous_config, current_bytes)
-        _atomic_bytes(OUTPUT, generation_config.read_bytes())
-    else:
-        _atomic_json(OUTPUT, config)
+        publication_paths += [manifest_path, generation_config, previous_config]
+    with ConfigPublication(OUTPUT, publication_paths):
+        _install_rules_database(SOURCE_RULES, target_rules, contact_ids)
+        for path, registration, _ in pending_registrations:
+            _atomic_json(path, registration)
+        if isolated_generation is not None:
+            if not manifest_path.exists():
+                _atomic_bytes(manifest_path, manifest_bytes)
+            if not generation_config.exists():
+                _atomic_json(generation_config, config)
+            candidate_bytes = generation_config.read_bytes()
+            _validate_frozen_candidate(generation_config, hashlib.sha256(candidate_bytes).hexdigest())
+            if not previous_config.exists() and OUTPUT.is_file():
+                current_bytes = OUTPUT.read_bytes()
+                if current_bytes != candidate_bytes:
+                    _atomic_bytes(previous_config, current_bytes)
+            _atomic_bytes(OUTPUT, candidate_bytes)
+        else:
+            _atomic_json(OUTPUT, config)
+            _validate_frozen_candidate(OUTPUT, hashlib.sha256(OUTPUT.read_bytes()).hexdigest())
     return 0
 
 

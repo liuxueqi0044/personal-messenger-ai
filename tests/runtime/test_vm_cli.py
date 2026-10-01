@@ -35,6 +35,26 @@ def test_load_config_binds_the_single_read_to_expected_digest(tmp_path) -> None:
         cli.load_config(path, expected_sha256=hashlib.sha256(payload).hexdigest())
 
 
+def test_main_refuses_interrupted_publication_before_secrets_or_worker(tmp_path, monkeypatch):
+    from messenger_ai.runtime.config_publication import ConfigPublication
+    path = tmp_path / "runtime.json"
+    path.write_text("{}")
+    ConfigPublication(path, []).__enter__()
+    def unexpected(*args, **kwargs):
+        raise AssertionError("configuration/secrets must not be read")
+    monkeypatch.setattr(cli, "load_config", unexpected)
+    assert cli.main(["--config", str(path), "--run-id", str(uuid4())]) == 2
+
+
+def test_direct_generation_build_refuses_data_publication_fence(tmp_path):
+    config = _config(tmp_path)
+    data_dir = Path(config["data_dir"])
+    data_dir.mkdir()
+    (data_dir / ".config-publication.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="publication incomplete"):
+        cli.build_runtime(config, api_key="test-key", authorization_signing_key=b"s" * 32)
+
+
 class FakeSecrets:
     key = b"deepseek-test-key"
     signing = b"s" * 32

@@ -5,14 +5,17 @@ import hashlib
 import json
 import math
 import multiprocessing as mp
+import multiprocessing.spawn as mp_spawn
 import re
 import secrets
+import sys
 import threading
 import time
 import traceback
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -44,6 +47,7 @@ from .contracts import (
     verify_selection_handoff_auth,
 )
 from .sequence_alignment import SnapshotAlignmentError, unique_suffix_start
+from .diagnostics import WorkerDiagnosticSink, emit_console
 from .session_identity import QQSessionCandidateLocator, QQSessionIdentityCertifier
 from .transport import UIAUnavailable, WindowsUIAQQAccessibility
 from .visual_selection import (
@@ -58,6 +62,26 @@ from .visual_selection import (
 )
 
 CurrentDirectIdentity = QQCertifiedDirectIdentity | QQSessionObservedDirectIdentity
+_SPAWN_EXECUTABLE_LOCK = threading.Lock()
+
+
+def _start_without_console(process) -> None:
+    """A detached python.exe spawns a new console by default on Windows."""
+    if sys.platform != "win32":
+        process.start()
+        return
+    executable = Path(sys.executable).with_name("pythonw.exe")
+    if not executable.is_file():
+        raise RuntimeError("windowless Python executable unavailable")
+    # multiprocessing has a global executable setting; restore it even when
+    # spawn fails, and serialize our own worker starts around that setting.
+    with _SPAWN_EXECUTABLE_LOCK:
+        previous = mp_spawn.get_executable()
+        try:
+            mp.set_executable(str(executable))
+            process.start()
+        finally:
+            mp.set_executable(previous)
 
 
 def _validated_prepare_write_reserve(value: object) -> float:
@@ -222,7 +246,8 @@ class QQVMWorker:
                  prepare_write_reserve_seconds: float = 5.0,
                  expected_window: tuple[int, int] | None = None,
                  window_validator: Callable[[QQWindow], None] | None = None,
-                 run_id: str | None = None) -> None:
+                 run_id: str | None = None,
+                 diagnostics_dir: Path | None = None) -> None:
         self._accessibility = accessibility
         self._selectors = selector_pack
         self._bindings = {item.binding_id: item for item in bindings}
@@ -252,6 +277,7 @@ class QQVMWorker:
         self._consumed_selection_handoffs: set[UUID] = set()
         self._trusted_operation_lease: tuple[UUID, str, int, int] | None = None
         self._run_id = run_id
+        self._diagnostics = WorkerDiagnosticSink(diagnostics_dir, "child") if diagnostics_dir else None
         if expected_window is not None and window_validator is None:
             raise ValueError("a scoped session window requires current-session validation")
         if any(item.authorization_scope == "all_direct_including_temporary" for item in bindings):
@@ -1179,7 +1205,7 @@ class QQVMWorker:
 
     @contextmanager
     def _stage(self, command: WorkerCommand, stage: str):
-        if self._run_id is None:
+        if self._run_id is None and self._diagnostics is None:
             yield
             return
         started_at = datetime.now(UTC)
@@ -1191,15 +1217,16 @@ class QQVMWorker:
             "request_id": str(command.request_id),
             "kind": command.kind.value,
             "binding_id": command.binding_id,
+            "operation_id": str(command.operation_id) if command.operation_id else None,
             "stage": stage,
         }
-        print(json.dumps({
+        self._emit_stage({
             **base, "event": "start", "recorded_at": started_at.isoformat(),
-        }, ensure_ascii=False), flush=True)
+        })
         try:
             yield
         except Exception as exc:
-            print(json.dumps({
+            self._emit_stage({
                 **base,
                 "event": "error",
                 "recorded_at": datetime.now(UTC).isoformat(),
@@ -1207,17 +1234,22 @@ class QQVMWorker:
                     (time.perf_counter() - started_clock) * 1000
                 )),
                 "exception_type": type(exc).__name__,
-            }, ensure_ascii=False), flush=True)
+            })
             raise
         else:
-            print(json.dumps({
+            self._emit_stage({
                 **base,
                 "event": "end",
                 "recorded_at": datetime.now(UTC).isoformat(),
                 "elapsed_ms": max(0, int(
                     (time.perf_counter() - started_clock) * 1000
                 )),
-            }, ensure_ascii=False), flush=True)
+            })
+
+    def _emit_stage(self, event: dict[str, object]) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.emit(event)
+        emit_console(event)
 
     def _target_window(self) -> QQWindow:
         windows = self._accessibility.find_main_windows(self._selectors.selector("main_window"))
@@ -1297,11 +1329,14 @@ class QQVMWorkerProcess:
                  run_id: str | None = None,
                  visual_selection: VisualSelectionConfig | None = None,
                  visual_api_key: str | None = None,
-                 prepare_write_reserve_seconds: float = 5.0) -> None:
+                 prepare_write_reserve_seconds: float = 5.0,
+                 diagnostics_dir: Path | None = None) -> None:
         self._selector_pack, self._bindings = selector_pack, bindings
         self._session_evidence = session_evidence
         self._visual_selection = visual_selection
         self._visual_api_key = visual_api_key
+        self._diagnostics_dir = diagnostics_dir
+        self._diagnostics = WorkerDiagnosticSink(diagnostics_dir, "parent") if diagnostics_dir else None
         self._prepare_write_reserve_seconds = _validated_prepare_write_reserve(
             prepare_write_reserve_seconds
         )
@@ -1319,6 +1354,7 @@ class QQVMWorkerProcess:
                 visual_api_key,
                 self._selection_handoff_signing_key,
                 self._prepare_write_reserve_seconds,
+                diagnostics_dir,
             ),
             daemon=True,
         )
@@ -1336,11 +1372,14 @@ class QQVMWorkerProcess:
             "startup_health": None,
             "last_request": None,
             "last_successful_observe": None,
+            "first_failure": None,
+            "last_failure": None,
+            "last_successful_request": None,
             "first_terminal_failure": None,
         }
 
     def start(self) -> None:
-        self._process.start()
+        _start_without_console(self._process)
         self._started = True
         with self._status_lock:
             self._refresh_process_locked()
@@ -1348,7 +1387,7 @@ class QQVMWorkerProcess:
     def spawn_successor(self) -> QQVMWorkerProcess:
         """Construct an unstarted process with the same certified UI scope."""
 
-        return type(self)(
+        successor = type(self)(
             self._selector_pack,
             self._bindings,
             session_evidence=self._session_evidence,
@@ -1356,7 +1395,13 @@ class QQVMWorkerProcess:
             visual_selection=self._visual_selection,
             visual_api_key=self._visual_api_key,
             prepare_write_reserve_seconds=self._prepare_write_reserve_seconds,
+            diagnostics_dir=getattr(self, "_diagnostics_dir", None),
         )
+        if hasattr(self, "_status") and hasattr(successor, "_status"):
+            with self._status_lock:
+                for key in ("first_failure", "last_failure", "last_successful_request"):
+                    successor._status[key] = copy.deepcopy(self._status[key])
+        return successor
 
     def mint_selection_handoff(self, **kwargs) -> SelectionHandoff:
         """Issue a capability authenticated for this exact child process."""
@@ -1484,7 +1529,10 @@ class QQVMWorkerProcess:
                     elapsed_ms=None,
                     exception_types=(),
                 )
-            return copy.deepcopy(self._status)
+            result = copy.deepcopy(self._status)
+            sink = getattr(self, "_diagnostics", None)
+            result["diagnostic_write_errors"] = sink.errors if sink else 0
+            return result
 
     def _ensure_status_state(self) -> None:
         """Support narrow tests that construct this façade with ``__new__``."""
@@ -1503,6 +1551,9 @@ class QQVMWorkerProcess:
             "startup_health": None,
             "last_request": None,
             "last_successful_observe": None,
+            "first_failure": None,
+            "last_failure": None,
+            "last_successful_request": None,
             "first_terminal_failure": None,
         }
 
@@ -1517,6 +1568,9 @@ class QQVMWorkerProcess:
             "request_id": str(command.request_id),
             "kind": command.kind.value,
             "binding_id": command.binding_id,
+            "operation_id": str(command.operation_id) if command.operation_id else None,
+            "binding_revision": command.binding_revision,
+            "conversation_revision": command.conversation_revision,
         }
 
     @staticmethod
@@ -1562,6 +1616,7 @@ class QQVMWorkerProcess:
                 "status": "in_progress",
                 "error_code": None,
             }
+            self._emit_request_locked(self._status["last_request"], event="start")
 
     def _record_request_result(self, command: WorkerCommand, result: WorkerResult,
                                started_at: datetime, elapsed_ms: int) -> None:
@@ -1578,6 +1633,14 @@ class QQVMWorkerProcess:
                 **self._safe_result_diagnostics(result.evidence),
             }
             self._status["last_request"] = record
+            failed = result.status is not WorkerStatus.OK
+            if failed:
+                if self._status["first_failure"] is None:
+                    self._status["first_failure"] = copy.deepcopy(record)
+                self._status["last_failure"] = copy.deepcopy(record)
+            else:
+                self._status["last_successful_request"] = copy.deepcopy(record)
+            self._emit_request_locked(record, event="end", failed=failed)
             if command.kind is WorkerKind.HEALTH:
                 self._status["startup_health"] = copy.deepcopy(record)
             if command.kind is WorkerKind.OBSERVE and result.status is WorkerStatus.OK:
@@ -1609,6 +1672,11 @@ class QQVMWorkerProcess:
                 "status": "exception",
                 "error_code": error_code,
             }
+            record = self._status["last_request"]
+            if self._status["first_failure"] is None:
+                self._status["first_failure"] = copy.deepcopy(record)
+            self._status["last_failure"] = copy.deepcopy(record)
+            self._emit_request_locked(record, event="error", failed=True)
             self._freeze_terminal_locked(
                 command=command,
                 error_code=error_code,
@@ -1635,12 +1703,27 @@ class QQVMWorkerProcess:
             "exception_types": list(exception_types),
         }
         self._status["first_terminal_failure"] = record
-        print(json.dumps({
+        event = {
             "schema": "pmai-qq-worker-terminal-event-v1",
             "run_id": self._run_id,
             "recorded_at": completed_at.isoformat(),
             **record,
-        }, ensure_ascii=False), flush=True)
+        }
+        sink = getattr(self, "_diagnostics", None)
+        if sink is not None:
+            sink.emit(event, freeze_failure=True)
+        emit_console(event)
+
+    def _emit_request_locked(self, record: dict[str, object], *, event: str, failed: bool = False) -> None:
+        sink = getattr(self, "_diagnostics", None)
+        if sink is not None:
+            sink.emit({
+                "schema": "pmai-qq-worker-request-event-v1",
+                "run_id": self._run_id,
+                "worker_process_id": self._status["worker_process_id"],
+                "event": event,
+                **record,
+            }, freeze_failure=failed)
 
     def stop(self, timeout_seconds: float = 5) -> None:
         with self._request_lock:
@@ -1684,6 +1767,7 @@ def _construct_runtime_worker(
     visual_api_key: str | None = None,
     selection_handoff_signing_key: bytes | None = None,
     prepare_write_reserve_seconds: float = 5.0,
+    diagnostics_dir: Path | None = None,
 ) -> QQVMWorker:
     accessibility = WindowsUIAQQAccessibility()
     selection_visual_profile = (
@@ -1726,7 +1810,7 @@ def _construct_runtime_worker(
                       prepare_write_reserve_seconds=prepare_write_reserve_seconds,
                       expected_window=certifier.window_scope if certifier else None,
                       window_validator=certifier.validate_window if certifier else None,
-                      run_id=run_id)
+                      run_id=run_id, diagnostics_dir=diagnostics_dir)
 
 
 def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentityBinding, ...],
@@ -1735,7 +1819,8 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
            visual_selection: VisualSelectionConfig | None = None,
            visual_api_key: str | None = None,
            selection_handoff_signing_key: bytes | None = None,
-           prepare_write_reserve_seconds: float = 5.0) -> None:
+           prepare_write_reserve_seconds: float = 5.0,
+           diagnostics_dir: Path | None = None) -> None:
     try:
         worker = _construct_runtime_worker(
             selector_pack,
@@ -1746,6 +1831,7 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
             visual_api_key,
             selection_handoff_signing_key,
             prepare_write_reserve_seconds,
+            diagnostics_dir,
         )
     except Exception as exc:
         # Stay alive long enough to answer the parent's mandatory HEALTH
