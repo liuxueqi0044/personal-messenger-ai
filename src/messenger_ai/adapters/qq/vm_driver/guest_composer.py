@@ -176,6 +176,8 @@ def clear_with_local_selection(control: Any, *, clear_action: Callable[[], None]
     _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
     if read_composer_text(control) != expected_text:
         raise GuestComposerError("composer_clear_precondition_failed")
+    if not scope_guard() or not focus_guard(control):
+        raise GuestComposerError("composer_focus_or_scope_drift")
     clear_action()
     if not _wait_for_exact_text(control, "", scope_guard=scope_guard,
                                 focus_guard=focus_guard):

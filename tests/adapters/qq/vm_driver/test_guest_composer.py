@@ -248,3 +248,24 @@ def test_preserves_certified_existing_focus_without_redundant_setfocus(clearing)
                                 focus_guard=lambda item: item.focused,
                                 sender=lambda value: setattr(control, "text", value))
         assert control.text == "hello"
+
+
+@pytest.mark.parametrize("drift", ["scope", "focus"])
+def test_clear_rechecks_authority_after_final_readback(monkeypatch, drift):
+    control = Control("owned draft")
+    control.focused = True
+    reads = []
+    actions = []
+
+    def read(_control):
+        reads.append(1)
+        return "owned draft"
+
+    monkeypatch.setattr(guest_composer, "read_composer_text", read)
+    with pytest.raises(GuestComposerError, match="composer_focus_or_scope_drift"):
+        clear_with_local_selection(
+            control, expected_text="owned draft", clear_action=lambda: actions.append("delete"),
+            scope_guard=lambda: drift != "scope" or len(reads) < 2,
+            focus_guard=lambda _: drift != "focus" or len(reads) < 2,
+        )
+    assert actions == [] and control.text == "owned draft"
