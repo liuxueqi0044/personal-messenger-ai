@@ -214,7 +214,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--release-id", required=True)
     parser.add_argument(
-        "--contact-index", type=int, action="append", required=True
+        "--contact-index", type=int, action="append", required=True,
+        help=(
+            "exact selected contacts in isolated mode; otherwise contacts to "
+            "refresh under the existing compatibility/discovery rules"
+        ),
     )
     parser.add_argument(
         "--migrate-header-digest-index", type=int, action="append", default=[]

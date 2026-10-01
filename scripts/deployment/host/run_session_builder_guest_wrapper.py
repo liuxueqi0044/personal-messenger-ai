@@ -87,11 +87,16 @@ def main() -> int:
         builder = load_builder(script)
         report["previous_config_sha256"] = _sha256(RUNTIME_CONFIG)
         builder_args: list[str] = []
-        if 2 in indices:
-            builder_args.append("--include-contact-2")
-        for index in indices:
-            if index > 2:
-                builder_args.extend(("--additional-contact-index", str(index)))
+        if args.isolated_recovery_generation is not None:
+            for index in indices:
+                builder_args.extend(("--contact-index", str(index)))
+        else:
+            # Nonisolated contact-index retains its existing refresh meaning.
+            if 2 in indices:
+                builder_args.append("--include-contact-2")
+            for index in indices:
+                if index > 2:
+                    builder_args.extend(("--additional-contact-index", str(index)))
         for index in indices:
             builder_args.extend(("--refresh-session-index", str(index)))
         for index in header_upgrades:

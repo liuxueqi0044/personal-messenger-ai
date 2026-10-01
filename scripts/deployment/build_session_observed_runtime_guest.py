@@ -143,8 +143,8 @@ def _has_reparse_component(path: Path) -> bool:
     return path.is_symlink() or bool(attributes & 0x400)
 
 
-def _prepare_isolated_generation_root(path: Path) -> None:
-    """Create and verify one private, flat generation directory before writes."""
+def _validate_isolated_generation_root(path: Path) -> None:
+    """Check existing paths without creating a generation during argument validation."""
 
     existing_chain = tuple(
         component
@@ -154,10 +154,8 @@ def _prepare_isolated_generation_root(path: Path) -> None:
     for component in existing_chain:
         if _has_reparse_component(component):
             raise RuntimeError("isolated generation path cannot use a reparse point")
-    path.mkdir(parents=True, exist_ok=True)
-    for component in reversed((path, *path.parents)):
-        if (component.exists() or component.is_symlink()) and _has_reparse_component(component):
-            raise RuntimeError("isolated generation path cannot use a reparse point")
+    if not path.exists():
+        return
     for entry in path.iterdir():
         if _has_reparse_component(entry):
             raise RuntimeError("isolated generation contents cannot use a reparse point")
@@ -169,6 +167,32 @@ def _prepare_isolated_generation_root(path: Path) -> None:
             raise RuntimeError("isolated generation files must not be hard linked")
         if entry.is_dir():
             raise RuntimeError("isolated generation data root must remain flat")
+
+
+def _prepare_isolated_generation_root(path: Path) -> None:
+    """Create and verify one private, flat generation directory before writes."""
+
+    _validate_isolated_generation_root(path)
+    path.mkdir(parents=True, exist_ok=True)
+    _validate_isolated_generation_root(path)
+
+
+def _validate_explicit_generation_selection(path: Path, indices: set[int]) -> None:
+    """Reject a changed explicit retry scope before any registration writes."""
+
+    manifest_path = path / "generation-manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        contacts = manifest["contacts"]
+        if not isinstance(contacts, list):
+            raise ValueError("invalid manifest contacts")
+        binding_ids = [item["binding_id"] for item in contacts]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("isolated generation manifest is invalid") from exc
+    if binding_ids != [f"session-contact-{index}" for index in sorted(indices)]:
+        raise RuntimeError("isolated generation contact selection changed")
 
 
 def _validate_frozen_candidate(config_path: Path, expected_sha256: str) -> None:
@@ -871,6 +895,15 @@ def _parse_visual_labels(values: list[str]) -> dict[int, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--contact-index",
+        type=int,
+        action="append",
+        help=(
+            "select exactly these contacts for an isolated recovery generation; "
+            "repeat for multiple contacts, with no implicit or registered contacts"
+        ),
+    )
+    parser.add_argument(
         "--include-contact-2",
         action="store_true",
         help="include explicitly bootstrapped session-contact-2",
@@ -926,24 +959,35 @@ def main(argv: list[str] | None = None) -> int:
         try:
             isolated_generation = str(UUID(args.isolated_recovery_generation))
             isolated_root = _isolated_generation_root(isolated_generation)
-            _prepare_isolated_generation_root(isolated_root)
-            _use_data_root(isolated_root)
         except ValueError as exc:
             parser.error(str(exc))
+    explicit = set(args.contact_index or ())
     additional = set(args.additional_contact_index)
     adopt = set(args.adopt_latest_inbound_index)
     refresh = set(args.refresh_session_index)
     header_upgrade = set(args.migrate_header_digest_index)
-    for index in additional | adopt | refresh | header_upgrade:
+    for index in explicit | additional | adopt | refresh | header_upgrade:
         if not 1 <= index <= MAX_CONTACT_INDEX:
             parser.error(f"contact index must be between 1 and {MAX_CONTACT_INDEX}")
+    if explicit and isolated_generation is None:
+        parser.error("contact-index requires an isolated recovery generation")
+    if explicit and (args.include_contact_2 or additional):
+        parser.error("contact-index cannot be combined with compatibility contact options")
     if isolated_generation is None and adopt - additional:
         parser.error("latest inbound adoption requires the same explicit additional contact index")
     if additional & {1, 2}:
         parser.error("contact 1/2 use the existing compatibility options")
-    selected_indices = {1} | additional | _existing_registration_indices() | _existing_runtime_indices()
-    if args.include_contact_2:
-        selected_indices.add(2)
+    if isolated_generation is not None:
+        # Retarget in memory for legacy discovery, but do not create the
+        # generation directory until every argument scope has been validated.
+        _validate_isolated_generation_root(isolated_root)
+        _use_data_root(isolated_root)
+    if explicit:
+        selected_indices = explicit
+    else:
+        selected_indices = {1} | additional | _existing_registration_indices() | _existing_runtime_indices()
+        if args.include_contact_2:
+            selected_indices.add(2)
     if isolated_generation is not None and adopt - selected_indices:
         parser.error("latest inbound adoption must reference a selected contact index")
     if refresh - selected_indices:
@@ -959,6 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     if visual_labels and set(visual_labels) != selected_indices:
         parser.error("visual labels must be provided for every selected contact")
+    if isolated_generation is not None:
+        if explicit:
+            _validate_explicit_generation_selection(isolated_root, selected_indices)
+        _prepare_isolated_generation_root(isolated_root)
 
     loaded = [_load_successful_bootstrap(item) for item in selected]
     evidences = [value[0] for value in loaded]

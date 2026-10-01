@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory)][ValidateSet('Validate','Bootstrap','BuildAndStart','BuildIsolated','BuildIsolatedAndStart','Pause','Resume','GracefulStop')][string]$Phase,
     [ValidatePattern('^session-contact-[1-9][0-9]{0,3}$')][string]$BindingId = 'session-contact-1',
+    [ValidateNotNullOrEmpty()][ValidateRange(1, 9999)][int[]]$ContactIndex = @(),
     [switch]$IncludeContact2,
     [ValidateRange(1, 9999)][int[]]$AdditionalContactIndex = @(),
     [ValidateRange(1, 9999)][int[]]$AdoptLatestInboundIndex = @(),
@@ -93,13 +94,17 @@ function Invoke-Python([string]$Stage, [string]$Script, [string[]]$Arguments) {
 $status=[ordered]@{schema='pmai-guest-local-release-launch-v1'; state='running'; succeeded=$false; release_root=$release; phase=$Phase; binding_id=$BindingId; include_contact_2=[bool]$IncludeContact2; additional_contact_indices=@($AdditionalContactIndex); adopt_latest_inbound_indices=@($AdoptLatestInboundIndex); isolated_recovery_generation=$IsolatedRecoveryGeneration; visual_selection_requested=($VisualLabel.Count -gt 0); stage='initialize'; error_code=$null; python_exit_code=$null}
 try {
     Save-Status $status
+    $contactIndices = @($ContactIndex | Sort-Object -Unique)
     $additionalIndices = @($AdditionalContactIndex | Sort-Object -Unique)
     $adoptIndices = @($AdoptLatestInboundIndex | Sort-Object -Unique)
     if (@($additionalIndices | Where-Object { $_ -in @(1, 2) }).Count -gt 0) { throw 'ADDITIONAL_CONTACT_INDEX_1_OR_2_INVALID' }
     $buildPhases = @('BuildAndStart','BuildIsolated','BuildIsolatedAndStart')
     $isolatedPhases = @('BuildIsolated','BuildIsolatedAndStart')
+    if ($contactIndices.Count -gt 0 -and $Phase -notin $isolatedPhases) { throw 'CONTACT_INDEX_REQUIRES_ISOLATED_PHASE' }
+    if ($contactIndices.Count -gt 0 -and ($IncludeContact2 -or $additionalIndices.Count -gt 0)) { throw 'CONTACT_INDEX_CONFLICTS_WITH_COMPATIBILITY_OPTIONS' }
+    if ($contactIndices.Count -gt 0 -and @($adoptIndices | Where-Object { $_ -notin $contactIndices }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_SELECTED_CONTACT_INDEX' }
     if ($Phase -eq 'BuildAndStart' -and @($adoptIndices | Where-Object { $_ -notin $additionalIndices }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_ADDITIONAL_CONTACT_INDEX' }
-    if ($Phase -in $isolatedPhases -and @($adoptIndices | Where-Object { $_ -notin (@(1,2) + $additionalIndices) }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_SELECTED_CONTACT_INDEX' }
+    if ($Phase -in $isolatedPhases -and $contactIndices.Count -eq 0 -and @($adoptIndices | Where-Object { $_ -notin (@(1,2) + $additionalIndices) }).Count -gt 0) { throw 'ADOPT_LATEST_INBOUND_REQUIRES_SELECTED_CONTACT_INDEX' }
     if (($additionalIndices.Count -gt 0 -or $adoptIndices.Count -gt 0) -and $Phase -notin $buildPhases) { throw 'ADDITIONAL_CONTACT_OPTIONS_REQUIRE_BUILD_PHASE' }
     if ($Phase -in $isolatedPhases -and -not $IsolatedRecoveryGeneration) { throw 'ISOLATED_RECOVERY_GENERATION_REQUIRED' }
     if ($Phase -notin $isolatedPhases -and $IsolatedRecoveryGeneration) { throw 'ISOLATED_RECOVERY_GENERATION_REQUIRES_ISOLATED_PHASE' }
@@ -141,6 +146,7 @@ try {
         }
         Invoke-Python 'assert_runtime_stopped' 'run_vm_runtime.py' @('--assert-runtime-stopped')
         $builderArguments = @()
+        foreach ($index in $contactIndices) { $builderArguments += @('--contact-index', [string]$index) }
         if ($IncludeContact2) { $builderArguments += '--include-contact-2' }
         foreach ($index in $additionalIndices) { $builderArguments += @('--additional-contact-index', [string]$index) }
         foreach ($index in $adoptIndices) { $builderArguments += @('--adopt-latest-inbound-index', [string]$index) }
