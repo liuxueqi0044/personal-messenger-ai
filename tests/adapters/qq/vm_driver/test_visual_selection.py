@@ -676,7 +676,7 @@ FAST_PROFILE = QQ_VM_ROW_PALETTE_PROFILE.model_copy(
 
 
 def _row(internal_id: str, top: int) -> _ConversationRowRef:
-    return _ConversationRowRef(internal_id=internal_id, item=object(), rect=_row_rect(top))
+    return _ConversationRowRef(internal_id=internal_id, rect=_row_rect(top))
 
 
 def _conversation_for(internal_id: str) -> QQConversation:
@@ -907,7 +907,6 @@ def test_geometry_change_is_rejected_before_any_sample() -> None:
         _row("runtime:control-a", 100),
         _ConversationRowRef(
             internal_id=target,
-            item=object(),
             rect=ScreenRect(left=56, top=200, right=296, bottom=264),
         ),
         _row("runtime:control-b", 300),
@@ -994,13 +993,13 @@ def test_neutral_hover_point_clamps_to_the_visible_guest_desktop() -> None:
 def test_neutral_hover_point_skips_candidates_near_any_conversation_row() -> None:
     rows = [
         _ConversationRowRef(
-            "runtime:target", object(), ScreenRect(left=0, top=0, right=250, bottom=64)
+            "runtime:target", ScreenRect(left=0, top=0, right=250, bottom=64)
         ),
         _ConversationRowRef(
-            "runtime:control-a", object(), ScreenRect(left=150, top=0, right=400, bottom=64)
+            "runtime:control-a", ScreenRect(left=150, top=0, right=400, bottom=64)
         ),
         _ConversationRowRef(
-            "runtime:control-b", object(), ScreenRect(left=0, top=150, right=250, bottom=214)
+            "runtime:control-b", ScreenRect(left=0, top=150, right=250, bottom=214)
         ),
     ]
     access, _moves = _fake_access(
@@ -1027,7 +1026,7 @@ def test_neutral_hover_point_skips_candidates_near_any_conversation_row() -> Non
 def test_neutral_hover_point_fails_closed_when_every_candidate_is_blocked() -> None:
     rows = [
         _ConversationRowRef(
-            "runtime:target", object(), ScreenRect(left=0, top=0, right=398, bottom=198)
+            "runtime:target", ScreenRect(left=0, top=0, right=398, bottom=198)
         )
     ]
     access, _moves = _fake_access(
@@ -1322,40 +1321,59 @@ def test_v2_transport_rejects_hover_ambiguity_and_unknown_background(colors, rea
 def _transient_enumerator(*, error_code=-2147220991, always_fail=False, active_phase=None):
     access = object.__new__(WindowsUIAQQAccessibility)
     roots = []
+    phases = []
     def fresh_root(_window):
         root = object()
         roots.append(root)
         return root
     def select_rows(root, _selector):
+        assert access._active_phase.root is root
+        assert access._active_phase.active
+        assert all(not phase.active for phase in phases)
+        phases.append(access._active_phase)
         if always_fail or len(roots) == 1:
             yield "discarded-partial-row"
             error = RuntimeError("provider element unavailable")
             error.hresult = error_code
             raise error
         yield "fresh-row"
-    access._window = fresh_root
+    access._window_uncached = fresh_root
     access._select = select_rows
     access._property = lambda _item, _name, _default: False
     access._conversation_id = lambda item: "runtime:" + item
     access._row_screen_rect = lambda _item: _row_rect(100)
     access._active_phase = active_phase
-    return access, roots
+    return access, roots, phases
 
 
 def test_row_enumeration_discards_partial_snapshot_when_element_disappears():
-    access, roots = _transient_enumerator()
+    access, roots, phases = _transient_enumerator()
     rows = access._visible_conversation_rows(window(), selector())
     assert len(roots) == 2 and roots[0] is not roots[1]
     assert [row.internal_id for row in rows] == ["runtime:fresh-row"]
+    assert len(phases) == 2 and phases[0] is not phases[1]
+    assert all(not phase.active for phase in phases)
+    assert access._active_phase is None
 
 
 @pytest.mark.parametrize("settings,attempts", [
     ({"always_fail":True}, 2),
     ({"error_code":-2147467259}, 1),
-    ({"active_phase":object()}, 1),
 ])
-def test_row_enumeration_retry_is_bounded_and_does_not_reuse_active_phase(settings, attempts):
-    access, roots = _transient_enumerator(**settings)
+def test_row_enumeration_retry_is_bounded_and_closes_failed_phases(settings, attempts):
+    access, roots, phases = _transient_enumerator(**settings)
     with pytest.raises(RuntimeError, match="provider element unavailable"):
         access._visible_conversation_rows(window(), selector())
     assert len(roots) == attempts
+    assert len(phases) == attempts
+    assert all(not phase.active for phase in phases)
+    assert access._active_phase is None
+
+
+def test_row_enumeration_never_reuses_or_replaces_a_callers_phase():
+    original_phase = object()
+    access, roots, phases = _transient_enumerator(active_phase=original_phase)
+    with pytest.raises(RuntimeError, match="requires a fresh UIA read phase"):
+        access._visible_conversation_rows(window(), selector())
+    assert roots == [] and phases == []
+    assert access._active_phase is original_phase

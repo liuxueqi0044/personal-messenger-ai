@@ -921,10 +921,11 @@ class QQVMWorker:
         )
         if not callable(try_already_current):
             raise RuntimeError("current identity certifier unavailable")
-        before = self._attest_exact_selected_row(
-            command=command, window=window, conversation=conversation
-        )
-        with read_phase(window):
+        with self._stage(command, "selection_before_read"):
+            before = self._attest_exact_selected_row(
+                command=command, window=window, conversation=conversation
+            )
+        with self._stage(command, "identity_and_content_read"), read_phase(window):
             proof = try_already_current(window, conversation)
             if proof is None:
                 raise RuntimeError("selection visual header is unproven")
@@ -935,9 +936,10 @@ class QQVMWorker:
                 if current_reader is not None
                 else None
             )
-        after = self._attest_exact_selected_row(
-            command=command, window=window, conversation=conversation
-        )
+        with self._stage(command, "selection_after_read"):
+            after = self._attest_exact_selected_row(
+                command=command, window=window, conversation=conversation
+            )
         if (
             before.profile_id != after.profile_id
             or before.process_id != after.process_id

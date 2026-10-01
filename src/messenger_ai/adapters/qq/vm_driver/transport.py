@@ -88,7 +88,6 @@ class _ConversationRowRef(NamedTuple):
     """One enumerated conversation row bound to its runtime locator and rect."""
 
     internal_id: str
-    item: Any
     rect: ScreenRect
 
 
@@ -621,27 +620,38 @@ class WindowsUIAQQAccessibility:
     def _visible_conversation_rows(
         self, window: QQWindow, selector: QQSelector
     ) -> list[_ConversationRowRef]:
-        """Re-enumerate every visible conversation row with its runtime locator."""
+        """Return value-only rows from one fresh, short-lived UIA read phase."""
 
         if selector.name != "conversation_item":
             raise UIAUnavailable("conversation selection selector is not certified")
-        for attempt in range(2):
-            # QQ may destroy a transient UIA element during enumeration. Never
-            # skip that element or return partial rows: discard the entire read
-            # and rebuild once from the exact HWND. No action is retried here.
+        if getattr(self, "_active_phase", None) is not None:
+            raise RuntimeError("conversation row enumeration requires a fresh UIA read phase")
+
+        def read_snapshot() -> list[_ConversationRowRef]:
             refs: list[_ConversationRowRef] = []
-            try:
+            # Cache duplicate COM reads only within this enumeration. Close
+            # the phase before hover movement, pixel capture or the next
+            # stability sample, and never return its live controls. Keeping
+            # loop locals in this frame also releases a failed row before a
+            # retry builds its fresh root.
+            with self.read_phase(window):
                 for item in self._select(self._window(window), selector):
                     if bool(self._property(item, "IsOffscreen", True)):
                         continue
                     internal_id = self._conversation_id(item)
                     if not internal_id:
                         continue
-                    refs.append(_ConversationRowRef(internal_id, item, self._row_screen_rect(item)))
-                return refs
+                    refs.append(_ConversationRowRef(internal_id, self._row_screen_rect(item)))
+            return refs
+
+        for attempt in range(2):
+            # QQ may destroy a transient UIA element during enumeration. Never
+            # skip that element or return partial rows: discard the entire read
+            # and rebuild once from the exact HWND. No action is retried here.
+            try:
+                return read_snapshot()
             except Exception as exc:
-                if (attempt != 0 or getattr(self, "_active_phase", None) is not None
-                        or getattr(exc, "hresult", None) != -2147220991):
+                if attempt != 0 or getattr(exc, "hresult", None) != -2147220991:
                     raise
                 # UIA_E_ELEMENTNOTAVAILABLE (0x80040201) only. Other provider
                 # failures remain visible rather than being treated as drift.
