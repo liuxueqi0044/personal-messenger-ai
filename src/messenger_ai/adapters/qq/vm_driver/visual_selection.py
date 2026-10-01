@@ -669,7 +669,7 @@ QQ_VM_CLIENT_VERSION = "9.9.33.51802"
 QQ_VM_ROW_SELECTOR_PACK_VERSION = (
     "q1-session:29e8d4b74eda5b5d97748b28f37bc094a2a4d4e5741f4bc29c93db0e64dbd771"
 )
-QQ_VM_ROW_PALETTE_PROFILE_ID = "qq-9.9.33.51802-row-250x64-inset10-v1"
+QQ_VM_ROW_PALETTE_PROFILE_ID = "qq-9.9.33.51802-row-250x64-strips-v2"
 QQ_VM_ROW_WIDTH = 250
 QQ_VM_ROW_HEIGHT = 64
 QQ_VM_ROW_BORDER_INSET = 10
@@ -738,6 +738,7 @@ class ConversationRowPaletteProfile(DomainModel):
     row_width: int = Field(ge=32, le=1024)
     row_height: int = Field(ge=16, le=256)
     border_inset: int = Field(ge=1, le=64)
+    sampling_mask: Literal["border-band-v1", "horizontal-strips-v2"] = "border-band-v1"
     channel_tolerance: int = Field(default=2, ge=0, le=4)
     ratio_tolerance: float = Field(default=0.02, gt=0, le=0.05)
     unique_tolerance: int = Field(default=1, ge=0, le=2)
@@ -754,6 +755,8 @@ class ConversationRowPaletteProfile(DomainModel):
 
     @model_validator(mode="after")
     def _coherent(self) -> ConversationRowPaletteProfile:
+        if self.sampling_mask == "horizontal-strips-v2" and (self.row_width, self.row_height) != (250, 64):
+            raise ValueError("horizontal strips are calibrated only for 250x64 rows")
         if 2 * self.border_inset >= min(self.row_width, self.row_height):
             raise ValueError("border inset leaves no interior in the calibrated row")
         if self.max_samples < self.stable_samples:
@@ -779,8 +782,8 @@ class ConversationRowPaletteProfile(DomainModel):
         return classify_row_border(sample, self)
 
 
-QQ_VM_ROW_PALETTE_PROFILE = ConversationRowPaletteProfile(
-    profile_id=QQ_VM_ROW_PALETTE_PROFILE_ID,
+QQ_VM_LEGACY_ROW_PALETTE_PROFILE = ConversationRowPaletteProfile(
+    profile_id="qq-9.9.33.51802-row-250x64-inset10-v1",
     client_version=QQ_VM_CLIENT_VERSION,
     selector_pack_version=QQ_VM_ROW_SELECTOR_PACK_VERSION,
     environment_fingerprint=QQ_VM_ROW_ENVIRONMENT_FINGERPRINT,
@@ -801,6 +804,22 @@ QQ_VM_ROW_PALETTE_PROFILE = ConversationRowPaletteProfile(
     hover=RowPaletteState(dominant_rgb=(235, 235, 235), ratio=0.779592, unique_count=8),
     unselected=RowPaletteState(dominant_rgb=(245, 245, 245), ratio=1.0, unique_count=1),
 )
+
+
+# The full border's distinct-colour count varies with rounded-corner
+# antialiasing (12 versus 14 in the same QQ/environment). Fixed, content-free
+# strips avoid those corners instead of widening the palette tolerance.
+# Field calibration: x=[16,234), y=[4,8) and [56,60), 1744 uniform pixels.
+# Both strips must agree; hover remains a separate rejected state.
+QQ_VM_ROW_PALETTE_PROFILE = ConversationRowPaletteProfile.model_validate({
+    **QQ_VM_LEGACY_ROW_PALETTE_PROFILE.model_dump(),
+    "profile_id": QQ_VM_ROW_PALETTE_PROFILE_ID,
+    "sampling_mask": "horizontal-strips-v2",
+    "ratio_tolerance": 0.001,
+    "unique_tolerance": 0,
+    "selected": {"dominant_rgb": (225, 225, 225), "ratio": 1.0, "unique_count": 1},
+    "hover": {"dominant_rgb": (235, 235, 235), "ratio": 1.0, "unique_count": 1},
+})
 
 
 class RowBorderSample(DomainModel):
@@ -829,8 +848,9 @@ def summarize_border_pixels(
     width: int,
     height: int,
     inset: int,
+    sampling_mask: Literal["border-band-v1", "horizontal-strips-v2"] = "border-band-v1",
 ) -> RowBorderSample:
-    """Summarize only the border band of one raw top-down BGRA row frame."""
+    """Summarize one versioned, content-free mask of a top-down BGRA row."""
 
     if width <= 0 or height <= 0:
         raise ValueError("row frame geometry must be positive")
@@ -838,13 +858,20 @@ def summarize_border_pixels(
         raise ValueError("border inset leaves no interior in the row frame")
     if len(bgra) != width * height * 4:
         raise ValueError("BGRA frame length does not match geometry")
+    if sampling_mask not in {"border-band-v1", "horizontal-strips-v2"}:
+        raise ValueError("unknown row sampling mask")
+    if sampling_mask == "horizontal-strips-v2" and (width, height) != (250, 64):
+        raise ValueError("horizontal strips are calibrated only for 250x64 rows")
     counts: dict[tuple[int, int, int], int] = {}
     total = 0
     for y in range(height):
         inside_rows = inset <= y < height - inset
         line = y * width * 4
         for x in range(width):
-            if inside_rows and inset <= x < width - inset:
+            if sampling_mask == "horizontal-strips-v2":
+                if not (16 <= x < 234 and (4 <= y < 8 or 56 <= y < 60)):
+                    continue
+            elif inside_rows and inset <= x < width - inset:
                 continue
             offset = line + x * 4
             colour = (bgra[offset + 2], bgra[offset + 1], bgra[offset])
@@ -868,6 +895,11 @@ def classify_row_border(
     """Map one border sample onto a calibrated palette state, fail-closed."""
 
     matches: list[str] = []
+    if profile.sampling_mask == "horizontal-strips-v2" and (
+        sample.pixel_count != 1744 or sample.dominant_count != 1744
+        or sample.ratio != 1.0 or sample.unique_count != 1
+    ):
+        return "unknown"
     for name in ("selected", "hover", "unselected"):
         expected: RowPaletteState = getattr(profile, name)
         if (

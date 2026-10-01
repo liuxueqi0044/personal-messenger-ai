@@ -10,9 +10,11 @@ The first W0 changes are implemented and offline-tested:
 
 - Runtime configuration builds now hold the same ownership mutex as the runner. Frozen manifest/config rejection happens before registration changes. Publication uses a write-ahead rollback record, startup fences, atomic file replacement, and interrupted-build recovery; existing business databases are not rolled back or reset.
 - Parent request events and child UI stages persist to bounded, content-free diagnostic files even without stdout. First/last failure and last successful request remain available across subsequent requests and worker replacement. These diagnostics do not replace the execution journal.
-- Windows UI children spawn with the installed `pythonw.exe`; the multiprocessing executable setting is restored after the spawn. This removes the detached `python.exe` console creation path; actual foreground behavior still needs guest verification.
+- Windows UI children spawn with the installed `pythonw.exe`; the multiprocessing executable setting is restored after the spawn. A bounded guest probe passed HEALTH with foreground unchanged. Its subsequent failed OBSERVE retained first/last failure and the source call chain with zero diagnostic-write errors.
 
 The full suite passed after the startup-fence additions (1508 passed, 2 skipped). Live installation and new driver acceptance are tracked separately; no new real delivery is claimed by these results. W1–W5 and the remainder of operational-entry consolidation are not marked complete.
+
+A subsequent live probe isolated the selection failure: the selected row's background and dominant ratio matched, but rounded-corner antialiasing changed its distinct-colour count from 12 to 14. The versioned `horizontal-strips-v2` profile samples two fixed background strips away from text and corners. It requires all 1744 pixels to agree and retains the exact runtime target, unique selected row, two control rows, repeated samples and independent header checks. Twenty visible rows in two guest samples and two unselected-row hover probes reproduced the three distinct uniform backgrounds. The QQ adapter tests passed (625 tests); end-to-end guest observation with this change is a separate gate.
 
 ## Implemented
 

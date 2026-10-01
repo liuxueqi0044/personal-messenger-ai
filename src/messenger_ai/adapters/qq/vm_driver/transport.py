@@ -649,6 +649,7 @@ class WindowsUIAQQAccessibility:
                 width=rect.width,
                 height=rect.height,
                 inset=profile.border_inset,
+                sampling_mask=profile.sampling_mask,
             )
         except UIAUnavailable:
             raise

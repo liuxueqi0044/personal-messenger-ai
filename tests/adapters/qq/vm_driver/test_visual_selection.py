@@ -19,8 +19,9 @@ from messenger_ai.adapters.qq.vm_driver.transport import (
     _encode_bgra_png,
 )
 from messenger_ai.adapters.qq.vm_driver.visual_selection import (
+    QQ_VM_ROW_PALETTE_PROFILE as STRIP_PROFILE,
     QQ_VM_ROW_ENVIRONMENT_FINGERPRINT,
-    QQ_VM_ROW_PALETTE_PROFILE,
+    QQ_VM_LEGACY_ROW_PALETTE_PROFILE as QQ_VM_ROW_PALETTE_PROFILE,
     ConversationSelectionActuator,
     ConversationSelectionStatus,
     ConversationRowPaletteProfile,
@@ -606,6 +607,8 @@ def test_naive_deadline_is_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 ROW_WIDTH, ROW_HEIGHT, ROW_INSET = 250, 64, 10
+# Retain all v1 regression cases. The deployed v2 mask has separate raw-pixel
+# and full transport cases below, including the real antialiasing failure.
 SELECTED_RGB = (225, 225, 225)
 HOVER_RGB = (235, 235, 235)
 UNSELECTED_RGB = (245, 245, 245)
@@ -1228,3 +1231,89 @@ def test_attestation_never_carries_png_or_row_content() -> None:
         "selected",
         "unselected",
     }
+
+
+def _strip_frame(rgb, *, corner_variants=14, bottom_rgb=None):
+    """Spatial row fixture: two clear background strips and noisy excluded pixels."""
+    pixels = bytearray(ROW_WIDTH * ROW_HEIGHT * 4)
+    for y in range(ROW_HEIGHT):
+        for x in range(ROW_WIDTH):
+            # Changing corner antialiasing and content must not affect selection.
+            value = (x * 17 + y * 31) % corner_variants
+            color = (value, value + 1, value + 2)
+            if 16 <= x < 234 and (4 <= y < 8 or 56 <= y < 60):
+                color = bottom_rgb if y >= 56 and bottom_rgb is not None else rgb
+            offset = (y * ROW_WIDTH + x) * 4
+            pixels[offset:offset + 4] = bytes((*reversed(color), 255))
+    return bytes(pixels)
+
+
+def _strip_summary(frame):
+    return summarize_border_pixels(frame, width=250, height=64, inset=10,
+                                   sampling_mask=STRIP_PROFILE.sampling_mask)
+
+
+@pytest.mark.parametrize("variants", [12, 14, 128])
+@pytest.mark.parametrize("rgb,state", [(SELECTED_RGB, "selected"), (HOVER_RGB, "hover"),
+                                       (UNSELECTED_RGB, "unselected")])
+def test_v2_strip_mask_ignores_corner_antialiasing_and_content(variants, rgb, state):
+    sample = _strip_summary(_strip_frame(rgb, corner_variants=variants))
+    assert (sample.pixel_count, sample.dominant_count, sample.unique_count) == (1744, 1744, 1)
+    assert sample.ratio == 1
+    assert classify_row_border(sample, STRIP_PROFILE) == state
+
+
+@pytest.mark.parametrize("bottom", [HOVER_RGB, UNSELECTED_RGB, (100, 100, 100)])
+def test_v2_disagreeing_top_and_bottom_strips_fail_closed(bottom):
+    sample = _strip_summary(_strip_frame(SELECTED_RGB, bottom_rgb=bottom))
+    assert classify_row_border(sample, STRIP_PROFILE) == "unknown"
+
+
+def test_v2_single_contaminated_sample_pixel_fails_closed():
+    pixels = bytearray(_strip_frame(SELECTED_RGB))
+    offset = (4 * ROW_WIDTH + 16) * 4
+    pixels[offset:offset + 4] = bytes((224, 224, 224, 255))
+    assert classify_row_border(_strip_summary(pixels), STRIP_PROFILE) == "unknown"
+
+
+def test_v2_wrong_mask_size_and_legacy_samples_cannot_certify():
+    with pytest.raises(ValueError, match="250x64"):
+        summarize_border_pixels(bytes(249 * 64 * 4), width=249, height=64, inset=10,
+                                sampling_mask=STRIP_PROFILE.sampling_mask)
+    with pytest.raises(ValidationError, match="250x64"):
+        ConversationRowPaletteProfile.model_validate({**STRIP_PROFILE.model_dump(), "row_width":249})
+    legacy = summarize_border_pixels(SELECTED_FRAME, width=250, height=64, inset=10)
+    assert classify_row_border(legacy, STRIP_PROFILE) == "unknown"
+    assert STRIP_PROFILE.profile_id != QQ_VM_ROW_PALETTE_PROFILE.profile_id
+
+
+def test_v2_real_transport_requires_two_stable_samples_with_exact_target():
+    target = "runtime:target"
+    rows = [_row("runtime:a", 100), _row(target, 200), _row("runtime:b", 300)]
+    plans = [dict(zip((100, 200, 300), (_strip_frame(UNSELECTED_RGB),
+                                     _strip_frame(SELECTED_RGB, corner_variants=n),
+                                     _strip_frame(UNSELECTED_RGB)))) for n in (12, 14)]
+    access, moves = _fake_access(rows=rows, capture=_SequencedCapture(3, plans))
+    profile = STRIP_PROFILE.model_copy(update={"hover_settle_seconds":0, "poll_interval_seconds":0})
+    attestation = _certify(access, target, profile)
+    assert attestation.profile_id == STRIP_PROFILE.profile_id
+    assert attestation.selected.pixel_count == 1744
+    assert attestation.stable_sample_count == 2
+    assert attestation.unselected_control_count == 2
+    assert len(moves) == 2
+
+
+@pytest.mark.parametrize("colors,reason", [
+    ((UNSELECTED_RGB, HOVER_RGB, UNSELECTED_RGB), "hover"),
+    ((SELECTED_RGB, SELECTED_RGB, UNSELECTED_RGB), "more than one"),
+    ((SELECTED_RGB, UNSELECTED_RGB, UNSELECTED_RGB), "different conversation"),
+    ((UNSELECTED_RGB, (220, 220, 220), UNSELECTED_RGB), "unrecognized"),
+])
+def test_v2_transport_rejects_hover_ambiguity_and_unknown_background(colors, reason):
+    target = "runtime:target"
+    rows = [_row("runtime:a", 100), _row(target, 200), _row("runtime:b", 300)]
+    access, _ = _fake_access(rows=rows, capture=_capture_by_row(
+        {y:_strip_frame(color) for y,color in zip((100,200,300), colors)}))
+    profile = STRIP_PROFILE.model_copy(update={"hover_settle_seconds":0, "poll_interval_seconds":0})
+    with pytest.raises(UIAUnavailable, match=reason):
+        _certify(access, target, profile)
