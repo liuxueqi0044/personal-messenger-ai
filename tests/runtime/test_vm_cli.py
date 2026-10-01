@@ -1270,3 +1270,84 @@ def test_check_blocks_missing_key_capability_or_active_rule(tmp_path, monkeypatc
     path = tmp_path / f"{change}.json"; _write_config(path, cfg)
     assert cli.main(["--config", str(path), "--check"]) == 2
     assert not FakeWorker.instances
+
+
+@pytest.mark.parametrize("app_has_aclose", [True, False])
+def test_main_fallback_shutdown_retains_the_serving_event_loop(
+    tmp_path, monkeypatch, capsys, app_has_aclose
+):
+    loop = None
+    closed_on = None
+    closed_count = 0
+    owner = types.SimpleNamespace(acquire=lambda: None, close=lambda: None)
+    app = types.SimpleNamespace()
+
+    async def serve(_app, **_kwargs):
+        nonlocal loop
+        loop = asyncio.get_running_loop()
+        raise RuntimeError("synthetic_serve_setup_failure")
+
+    async def close():
+        nonlocal closed_on, closed_count
+        closed_count += 1
+        closed_on = asyncio.get_running_loop()
+        loop.call_soon(lambda: None)
+        assert closed_on is loop
+        await asyncio.sleep(0)
+
+    if app_has_aclose:
+        app.aclose = close
+    else:
+        app.planner_provider = types.SimpleNamespace(aclose=close)
+    monkeypatch.setattr(cli, "QQRuntimeInstanceOwner", lambda: owner)
+    monkeypatch.setattr(cli, "load_config", lambda *_args, **_kwargs: {"secret_vault": str(tmp_path)})
+    monkeypatch.setattr(cli, "WindowsDPAPISecretStore", FakeSecrets)
+    monkeypatch.setattr(cli, "build_runtime", lambda *_args, **_kwargs: app)
+    monkeypatch.setattr(cli, "_serve", serve)
+    assert cli.main(["--config", "synthetic.json", "--run-id", str(uuid4())]) == 2
+    assert "synthetic_serve_setup_failure" in capsys.readouterr().out
+    assert closed_count == 1 and closed_on is loop and loop.is_closed()
+
+
+def test_main_normal_serve_closes_once_before_the_execution_loop_ends(
+    tmp_path, monkeypatch
+):
+    started = asyncio.Event()
+    owner_closed = []
+    owner = types.SimpleNamespace(acquire=lambda: None, close=lambda: owner_closed.append(True))
+
+    class App:
+        _planning_tasks = set()
+        state = hub = pacing = rules = driver = object()
+        loop = None
+        closed_count = 0
+
+        async def run_forever(self, *, stop_event):
+            self.loop = asyncio.get_running_loop()
+            started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            self.closed_count += 1
+            assert asyncio.get_running_loop() is self.loop
+            self.loop.call_soon(lambda: None)
+            await asyncio.sleep(0)
+
+    class Server:
+        async def serve(self):
+            await started.wait()
+
+    app = App()
+    monkeypatch.setitem(__import__("sys").modules, "uvicorn", types.SimpleNamespace(
+        Config=lambda *a, **k: object(), Server=lambda *a, **k: Server()
+    ))
+    monkeypatch.setattr(cli, "RuntimeWebUIProjection", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "LiveHubFacade", lambda projection: object())
+    monkeypatch.setattr(cli, "create_app", lambda facade: object())
+    monkeypatch.setattr(cli, "QQRuntimeInstanceOwner", lambda: owner)
+    monkeypatch.setattr(cli, "load_config", lambda *_args, **_kwargs: {"secret_vault": str(tmp_path)})
+    monkeypatch.setattr(cli, "WindowsDPAPISecretStore", FakeSecrets)
+    monkeypatch.setattr(cli, "build_runtime", lambda *_args, **_kwargs: app)
+    assert cli.main(["--config", "synthetic.json", "--run-id", str(uuid4())]) == 0
+    assert app.closed_count == 1 and app.loop.is_closed()
+    assert app._closed is True and owner_closed == [True]

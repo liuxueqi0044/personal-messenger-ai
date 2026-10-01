@@ -1252,14 +1252,15 @@ async def _serve(app, *, host: str, port: int, run_id: str | None = None,
         setattr(app, "_closed", True)
 
 
-def _shutdown(app: Any) -> None:
+def _shutdown(app: Any, *, runner: asyncio.Runner | None = None) -> None:
+    """Close on the execution loop when supplied; preserve standalone callers."""
     if getattr(app, "_closed", False):
         return
     close_app = getattr(app, "aclose", None)
     if callable(close_app):
         result = close_app()
         if asyncio.iscoroutine(result):
-            asyncio.run(result)
+            (runner.run if runner is not None else asyncio.run)(result)
         setattr(app, "_closed", True)
         return
     bridge = getattr(app, "driver", None)
@@ -1275,7 +1276,7 @@ def _shutdown(app: Any) -> None:
     if callable(close_provider):
         result = close_provider()
         if asyncio.iscoroutine(result):
-            asyncio.run(result)
+            (runner.run if runner is not None else asyncio.run)(result)
     cursor = getattr(bridge, "_cursor", None)
     if cursor is not None and callable(getattr(cursor, "close", None)):
         cursor.close()
@@ -1360,10 +1361,12 @@ def main(argv: list[str] | None = None) -> int:
             authorization_signing_key=secrets.get_or_create_hmac_key("runtime.authorization.signing"),
             run_id=run_id,
         )
-        try:
-            asyncio.run(_serve(app, host=args.web_host, port=args.web_port, run_id=run_id)); return 0
-        finally:
-            _shutdown(app)
+        with asyncio.Runner() as runner:
+            try:
+                runner.run(_serve(app, host=args.web_host, port=args.web_port, run_id=run_id))
+                return 0
+            finally:
+                _shutdown(app, runner=runner)
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"blocked: {exc}"); return 2
     finally:

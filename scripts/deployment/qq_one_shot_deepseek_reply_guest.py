@@ -274,6 +274,27 @@ def execute(
     report_path: Path,
     max_wait_seconds: float,
 ) -> dict[str, object]:
+    # Keep async transports on their owning loop through failure cleanup too.
+    with asyncio.Runner() as runner:
+        return _execute_with_runner(
+            config_path=config_path,
+            binding_id=binding_id,
+            attempt_id=attempt_id,
+            report_path=report_path,
+            max_wait_seconds=max_wait_seconds,
+            runner=runner,
+        )
+
+
+def _execute_with_runner(
+    *,
+    config_path: Path,
+    binding_id: str,
+    attempt_id: str,
+    report_path: Path,
+    max_wait_seconds: float,
+    runner: asyncio.Runner,
+) -> dict[str, object]:
     canonical_attempt = str(UUID(attempt_id))
     if _BINDING_ID.fullmatch(binding_id) is None:
         raise RuntimeError("ONE_SHOT_BINDING_ID_INVALID")
@@ -358,7 +379,7 @@ def execute(
                 attempt_id=UUID(canonical_attempt),
                 conversation_id=binding.hub_conversation_id,
             ):
-                result = asyncio.run(
+                result = runner.run(
                     run_one_shot_reply(
                         app=app,
                         ledger=ledger,
@@ -404,8 +425,21 @@ def execute(
         if app is not None:
             active_worker = getattr(getattr(app, "driver", None), "_worker", None)
             try:
-                _shutdown(app)
-            except Exception:  # noqa: BLE001 - action state becomes uncertain
+                _shutdown(app, runner=runner)
+            except Exception as exc:  # noqa: BLE001 - action state becomes uncertain
+                # Keep the report schema stable; retain the original bounded
+                # outcome in a separate diagnostic, never raw exception text.
+                try:
+                    print(json.dumps({
+                        "schema": "pmai-one-shot-shutdown-failure-v1",
+                        "attempt_id": canonical_attempt,
+                        "result_status": report["status"],
+                        "result_error_code": report.get("error_code"),
+                        "exception_type": type(exc).__name__,
+                    }, sort_keys=True), flush=True)
+                except (OSError, ValueError):
+                    # Unavailable stdout must not suppress the durable report.
+                    pass
                 report["status"] = "uncertain"
                 report["succeeded"] = False
                 report["action_attempted"] = None if run_started else False
@@ -416,7 +450,10 @@ def execute(
         report["active_worker_retired"] = retired
         if exit_code is not None:
             report["active_worker_exit_code"] = exit_code
-        if result is not None and result.state == "verified":
+        if (
+            result is not None and result.state == "verified"
+            and report["status"] == "verified"
+        ):
             if retired:
                 report["succeeded"] = True
             else:

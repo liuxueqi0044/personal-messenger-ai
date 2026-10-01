@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -7,6 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
+
+import pytest
 
 from messenger_ai.adapters.qq.models import QQIdentityBinding
 from messenger_ai.runtime.one_shot import OneShotReplyResult
@@ -136,7 +139,7 @@ def _arrange(monkeypatch, tmp_path: Path, *, retires: bool = True):
         return app
 
     monkeypatch.setattr(MODULE, "build_runtime", build_runtime)
-    monkeypatch.setattr(MODULE, "_shutdown", lambda _app: None)
+    monkeypatch.setattr(MODULE, "_shutdown", lambda _app, **_kwargs: None)
     return owner, app, build_calls
 
 
@@ -284,3 +287,175 @@ def test_attempt_replay_is_blocked_before_runtime_build(monkeypatch, tmp_path: P
     second = _execute(tmp_path)
     assert second["status"] == "failed"
     assert second["error_code"] == "ONE_SHOT_ATTEMPT_REPLAY"
+
+
+class LoopBoundClient:
+    """Model async transport cleanup without network or a provider SDK."""
+
+    def __init__(self):
+        self.loop = None
+        self.close_loop = None
+        self.close_calls = 0
+
+    async def request(self):
+        self.loop = asyncio.get_running_loop()
+        await asyncio.sleep(0)
+
+    async def aclose(self):
+        self.close_calls += 1
+        self.close_loop = asyncio.get_running_loop()
+        # Native asyncio reproduces transport cleanup scheduling on its owner.
+        self.loop.call_soon(lambda: None)
+        assert self.close_loop is self.loop
+        await asyncio.sleep(0)
+
+
+def test_segment_limit_result_survives_same_loop_client_shutdown(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts.run_vm_runtime import _shutdown
+
+    owner, app, build_calls = _arrange(monkeypatch, tmp_path)
+    client = LoopBoundClient()
+    app.aclose = client.aclose
+    monkeypatch.setattr(MODULE, "_shutdown", _shutdown)
+    calls = []
+
+    async def run(**_kwargs):
+        calls.append("run")
+        await client.request()
+        return OneShotReplyResult(
+            attempt_id=UUID(ATTEMPT), binding_id=BINDING,
+            state="failed", provider_called=True, action_attempted=False,
+            error_code="one_shot_segment_limit",
+        )
+
+    monkeypatch.setattr(MODULE, "run_one_shot_reply", run)
+    report = _execute(tmp_path)
+    assert report["status"] == "failed"
+    assert report["error_code"] == "one_shot_segment_limit"
+    assert report["provider_called"] is True
+    assert report["send_action_attempted"] is False
+    assert report["succeeded"] is False
+    assert report["active_worker_retired"] is True
+    assert "operation_id" not in report and "pacing_plan_id" not in report
+    assert client.close_calls == 1
+    assert client.close_loop is client.loop and client.loop.is_closed()
+    assert owner.closed
+    assert json.loads((tmp_path / "report.json").read_text()) == report
+    # Cleanup is not permission to replay the attempt or call the provider again.
+    assert _execute(tmp_path)["error_code"] == "ONE_SHOT_ATTEMPT_REPLAY"
+    assert calls == ["run"] and len(build_calls) == 1
+
+
+def test_run_exception_still_closes_async_client_on_its_owner_loop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts.run_vm_runtime import _shutdown
+
+    owner, app, _ = _arrange(monkeypatch, tmp_path)
+    client = LoopBoundClient()
+    app.aclose = client.aclose
+    monkeypatch.setattr(MODULE, "_shutdown", _shutdown)
+
+    async def run(**_kwargs):
+        await client.request()
+        raise RuntimeError("one_shot_synthetic_failure")
+
+    monkeypatch.setattr(MODULE, "run_one_shot_reply", run)
+    report = _execute(tmp_path)
+    assert report["status"] == "uncertain"
+    assert report["error_code"] == "one_shot_synthetic_failure"
+    assert report["send_action_attempted"] is None
+    assert report["succeeded"] is False
+    assert client.close_calls == 1
+    assert client.close_loop is client.loop and client.loop.is_closed()
+    assert owner.closed
+
+
+@pytest.mark.parametrize("result_state", ["verified", "failed"])
+def test_real_shutdown_failure_stays_uncertain_and_retains_safe_original_outcome(
+    monkeypatch, tmp_path: Path, capsys, result_state
+) -> None:
+    from scripts.run_vm_runtime import _shutdown
+
+    owner, app, _ = _arrange(monkeypatch, tmp_path)
+    client = LoopBoundClient()
+
+    async def aclose():
+        await client.aclose()
+        raise RuntimeError("sensitive shutdown text must not leak")
+
+    app.aclose = aclose
+    monkeypatch.setattr(MODULE, "_shutdown", _shutdown)
+
+    async def run(**_kwargs):
+        await client.request()
+        return OneShotReplyResult(
+            attempt_id=UUID(ATTEMPT), binding_id=BINDING, state=result_state,
+            provider_called=True, action_attempted=result_state == "verified",
+            source_key_hashes=("a" * 64,),
+            pacing_plan_id=PLAN if result_state == "verified" else None,
+            operation_id=OPERATION if result_state == "verified" else None,
+            send_status="verified" if result_state == "verified" else None,
+            handoff=_handoff() if result_state == "verified" else None,
+            error_code=None if result_state == "verified" else "one_shot_segment_limit",
+        )
+
+    monkeypatch.setattr(MODULE, "run_one_shot_reply", run)
+    report = _execute(tmp_path)
+    assert report["status"] == "uncertain"
+    assert report["error_code"] == "ONE_SHOT_RUNTIME_SHUTDOWN_FAILED"
+    assert report["succeeded"] is False
+    assert report["action_attempted"] is None
+    assert report["send_action_attempted"] is None
+    assert report["active_worker_retired"] is True
+    if result_state == "verified":
+        assert report["operation_id"] == str(OPERATION)
+    else:
+        assert "operation_id" not in report and "pacing_plan_id" not in report
+    assert client.close_calls == 1
+    assert owner.closed
+    output = capsys.readouterr().out
+    assert "sensitive shutdown text" not in output + json.dumps(report)
+    assert json.loads(output) == {
+        "schema": "pmai-one-shot-shutdown-failure-v1",
+        "attempt_id": ATTEMPT,
+        "result_status": result_state,
+        "result_error_code": None if result_state == "verified" else "one_shot_segment_limit",
+        "exception_type": "RuntimeError",
+    }
+    # The existing host's strict allowlist still accepts the unchanged report.
+    from test_run_one_shot_deepseek_reply_host import MODULE as host
+    projected = host._validate_guest_report(report, binding_id=BINDING, attempt_id=ATTEMPT)
+    assert projected["status"] == "uncertain" and projected["succeeded"] is False
+
+
+def test_shutdown_diagnostic_write_failure_does_not_mask_durable_uncertainty(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts.run_vm_runtime import _shutdown
+
+    owner, app, _ = _arrange(monkeypatch, tmp_path)
+
+    async def close():
+        raise RuntimeError("synthetic shutdown failure")
+
+    def unavailable_stdout(*_args, **_kwargs):
+        raise BrokenPipeError("synthetic closed output")
+
+    async def run(**_kwargs):
+        return OneShotReplyResult(
+            attempt_id=UUID(ATTEMPT), binding_id=BINDING, state="failed",
+            provider_called=True, action_attempted=False, error_code="one_shot_segment_limit",
+        )
+
+    app.aclose = close
+    monkeypatch.setattr(MODULE, "_shutdown", _shutdown)
+    monkeypatch.setattr(MODULE, "print", unavailable_stdout, raising=False)
+    monkeypatch.setattr(MODULE, "run_one_shot_reply", run)
+    report = _execute(tmp_path)
+    assert report["status"] == "uncertain" and report["succeeded"] is False
+    assert report["error_code"] == "ONE_SHOT_RUNTIME_SHUTDOWN_FAILED"
+    assert json.loads((tmp_path / "report.json").read_text()) == report
+    assert owner.closed
