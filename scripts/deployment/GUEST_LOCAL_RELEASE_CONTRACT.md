@@ -4,6 +4,15 @@ A release is a directory copied once from host staging to `C:\PMAI\app\releases\
 
 The release contains one verified wheel plus the explicit guest entry scripts: session bootstrap, selector pack, focus helper, runtime-config builder, runtime supervisor, and `run_vm_runtime.py`. The installed wheel is imported from the guest venv; the runner scripts execute only from the local release directory, never from mounted media.
 
+Build from a clean checkout by passing the existing, locally verified selector pack explicitly:
+
+```powershell
+uv build --wheel --out-dir work/dist
+./scripts/deployment/Build-GuestLocalRelease.ps1 -WheelPath ./work/dist/personal_messenger_ai-0.1.0-py3-none-any.whl -ReleaseId candidate-1 -StagingRoot ./work/releases -SelectorPackPath C:/PMAI-staging/selector-pack-session-1.json
+```
+
+`-SelectorPackPath` accepts a file outside the checkout, so private selector data does not need to be committed. Omitting it preserves the legacy sibling `qq-vm/deploy-media/qq-runtime-session-final-cc8a7201` location. The selected file is copied into the release and included in its integrity manifest; an absent selector pack fails the build.
+
 `Install-GuestLocalRelease.ps1` validates the guest and the installed package first. It copies and verifies the release, and only when installed `messenger_ai/*.py` differs from the release wheel, updates it with that local wheel using `--no-index --no-deps` and verifies again. It never starts QQ, calls a model, or sends a message. A later wheel update creates a new release id and manifest; it must not overwrite an existing release.
 
 `Start-GuestLocalRuntime.ps1` remains the only full-runtime operational entry point. `Validate` checks the local release and its installed package. `Bootstrap -BindingId session-contact-1|session-contact-2` writes the corresponding numbered report and defaults to contact 1. `BuildAndStart` ignores an existing contact-2 report unless explicitly given `-IncludeContact2`. It uses the durable local account contract: `C:\PMAI\data\runtime\qq-default-account` and local registry identifiers, never process-derived directories or IDs. A changed QQ session blocks for an explicit rebind and preserves existing durable data.

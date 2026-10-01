@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$WheelPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$ReleaseId,
-    [string]$StagingRoot
+    [string]$StagingRoot,
+    [string]$SelectorPackPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,6 +12,11 @@ if ([string]::IsNullOrWhiteSpace($StagingRoot)) {
     $StagingRoot = Join-Path $projectRoot 'outputs\guest-local-releases'
 }
 $wheel = (Resolve-Path -LiteralPath $WheelPath -ErrorAction Stop).Path
+if ([string]::IsNullOrWhiteSpace($SelectorPackPath)) {
+    $SelectorPackPath = Join-Path (Split-Path $projectRoot -Parent) 'qq-vm\deploy-media\qq-runtime-session-final-cc8a7201\selector-pack-session-1.json'
+}
+$selectorPack = (Resolve-Path -LiteralPath $SelectorPackPath -ErrorAction Stop).Path
+if (-not (Test-Path -LiteralPath $selectorPack -PathType Leaf)) { throw "Selector pack must be a file: $selectorPack" }
 if (-not (Test-Path -LiteralPath $StagingRoot)) { New-Item -ItemType Directory -Path $StagingRoot -Force | Out-Null }
 $release = Join-Path (Resolve-Path -LiteralPath $StagingRoot -ErrorAction Stop).Path $ReleaseId
 if (Test-Path -LiteralPath $release) { throw "Release staging directory already exists: $release" }
@@ -33,7 +39,7 @@ $sources = [ordered]@{
     'guest_focus_helper.py' = (Join-Path $PSScriptRoot 'guest_focus_helper.py')
     'activate_default_rulepack_guest.py' = (Join-Path $PSScriptRoot 'activate_default_rulepack_guest.py')
     'qq_window_metadata_guest.py' = (Join-Path $PSScriptRoot 'qq_window_metadata_guest.py')
-    'selector-pack-session-1.json' = (Join-Path (Split-Path $projectRoot -Parent) 'qq-vm\deploy-media\qq-runtime-session-final-cc8a7201\selector-pack-session-1.json')
+    'selector-pack-session-1.json' = $selectorPack
     'Install-GuestLocalRelease.ps1' = (Join-Path $PSScriptRoot 'Install-GuestLocalRelease.ps1')
     'Start-GuestLocalRuntime.ps1' = (Join-Path $PSScriptRoot 'Start-GuestLocalRuntime.ps1')
     'Test-GuestLocalRelease.ps1' = (Join-Path $PSScriptRoot 'Test-GuestLocalRelease.ps1')
