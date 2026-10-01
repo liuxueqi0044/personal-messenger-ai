@@ -20,6 +20,8 @@ The first W1 session-lifecycle step is implemented. An explicit `--refresh-curre
 
 Read-only guest diagnostics then isolated repeated full-window UIA enumeration as the main observation cost. Each row enumeration now has an independent short-lived read phase, caching duplicate property reads only within that enumeration and returning only IDs and rectangles. Hover and pixel sampling retain no live controls, and each later stability sample obtains a fresh root. One complete enumeration may be rebuilt on `UIA_E_ELEMENTNOTAVAILABLE`; other failures, repeated invalidation, changed targets and expired deadlines remain failures. Stage logs distinguish selection before/after content reading. This optimization does not reduce identity checks or extend request deadlines; its live latency must be measured separately.
 
+At commit `6ee2086`, the full Windows suite passed (1624 passed, 2 skipped), and frozen release `r20261001-12` was installed and independently verified. After one observation rejected a changing row list, four diagnostic enumerations showed identical row IDs, order and rectangles. A subsequent HEALTH and two independent OBSERVE requests passed: 26.8 s and 27.3 s, each reading 14 visible bubbles, with the canonical config unchanged and no messages sent. These limited samples establish a read-only baseline, not sustained reliability or delivery readiness. Guest wall-clock rate adjustment was also measured, so elapsed monotonic time and UTC duration are recorded separately.
+
 ## Implemented
 
 | Area | Status | Evidence boundary |

@@ -301,6 +301,99 @@ def test_refresh_busy_runtime_fence_prevents_any_writes(generation, monkeypatch)
     assert _all_bytes(case.root) == before
 
 
+@pytest.mark.parametrize("payload", [b"", b'{"interrupted":', b'{ "old_intent": true }\r\n'])
+def test_refresh_preserves_existing_one_shot_intent_bytes_without_reading(generation, monkeypatch, payload) -> None:
+    case = generation
+    directory = case.data_root / "one-shot-intents"
+    directory.mkdir()
+    intent = directory / f"{uuid4()}.json"
+    intent.write_bytes(payload)
+    before_stat = intent.stat()
+    databases = {name: (case.data_root / name).read_bytes() for name in DATABASES}
+    read_bytes, read_text = Path.read_bytes, Path.read_text
+
+    def forbid_intent_bytes(path):
+        assert path != intent, "refresh must not read old intent content"
+        return read_bytes(path)
+
+    def forbid_intent_text(path, *args, **kwargs):
+        assert path != intent, "refresh must not parse old intent content"
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "read_bytes", forbid_intent_bytes)
+        scoped.setattr(Path, "read_text", forbid_intent_text)
+        assert case.module.main(_refresh_args(case)) == 0
+
+    assert intent.read_bytes() == payload
+    assert intent.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert list(directory.iterdir()) == [intent]
+    assert _config(case)["session_binding"]["revision"] == 2
+    assert {name: (case.data_root / name).read_bytes() for name in DATABASES} == databases
+
+
+@pytest.mark.parametrize("failure", ["unknown_directory", "nested_directory", "unexpected_filename", "hardlink"])
+def test_refresh_rejects_unsafe_intent_directory_without_writes(generation, failure) -> None:
+    case = generation
+    directory = case.data_root / "one-shot-intents"
+    directory.mkdir()
+    if failure == "unknown_directory":
+        (case.data_root / "other-intents").mkdir()
+    elif failure == "nested_directory":
+        (directory / f"{uuid4()}.json").mkdir()
+    elif failure == "unexpected_filename":
+        (directory / "attempt.json.tmp").write_bytes(b"preserve")
+    elif failure == "hardlink":
+        source = case.root / "linked-intent.json"
+        source.write_bytes(b"preserve")
+        (directory / f"{uuid4()}.json").hardlink_to(source)
+    before = _all_bytes(case.root)
+    with pytest.raises(RuntimeError, match="flat|regular files|filename|hard linked"):
+        case.module.main(_refresh_args(case))
+    assert _all_bytes(case.root) == before
+
+
+@pytest.mark.parametrize("location", ["directory", "entry"])
+def test_refresh_rejects_intent_directory_reparse_points(generation, location) -> None:
+    case = generation
+    directory = case.data_root / "one-shot-intents"
+    target = case.root / "junction-target"
+    target.mkdir()
+    (target / f"{uuid4()}.json").write_bytes(b"preserve")
+    if location == "entry":
+        directory.mkdir()
+        link = directory / f"{uuid4()}.json"
+    else:
+        link = directory
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        assert created.returncode == 0, created.stderr
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    before = _all_bytes(case.root)
+    try:
+        with pytest.raises(RuntimeError, match="reparse point"):
+            case.module.main(_refresh_args(case))
+        assert _all_bytes(case.root) == before
+    finally:
+        # Remove only this fixture's link, never recurse into its target.
+        link.rmdir() if os.name == "nt" else link.unlink()
+
+
+def test_new_generation_still_rejects_one_shot_intent_subdirectory(generation) -> None:
+    case = generation
+    generation_id = str(uuid4())
+    new_root = case.module._isolated_generation_root(generation_id)
+    (new_root / "one-shot-intents").mkdir(parents=True)
+    before = _all_bytes(case.root)
+    with pytest.raises(RuntimeError, match="remain flat"):
+        case.module.main(["--isolated-recovery-generation", generation_id])
+    assert _all_bytes(case.root) == before
+
+
 def test_frozen_candidate_rejection_rolls_back_every_metadata_write(generation, monkeypatch) -> None:
     case = generation
     before = _all_bytes(case.root)

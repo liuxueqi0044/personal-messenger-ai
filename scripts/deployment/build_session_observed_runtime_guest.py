@@ -17,6 +17,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 from uuid import UUID
 
@@ -149,7 +150,30 @@ def _has_reparse_component(path: Path) -> bool:
     return path.is_symlink() or bool(attributes & 0x400)
 
 
-def _validate_isolated_generation_root(path: Path) -> None:
+def _validate_one_shot_intents(path: Path) -> None:
+    """Inspect names and filesystem metadata only; never consume old intents."""
+    for entry in path.iterdir():
+        if _has_reparse_component(entry):
+            raise RuntimeError("one-shot intent entries cannot use a reparse point")
+        try:
+            metadata = os.stat(entry, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("one-shot intent entry is unavailable") from exc
+        if not S_ISREG(metadata.st_mode):
+            raise RuntimeError("one-shot intent directory permits regular files only")
+        if int(getattr(metadata, "st_nlink", 1)) != 1:
+            raise RuntimeError("one-shot intent files must not be hard linked")
+        try:
+            canonical_name = f"{UUID(entry.stem)}.json"
+        except ValueError as exc:
+            raise RuntimeError("one-shot intent filename is invalid") from exc
+        if entry.name != canonical_name:
+            raise RuntimeError("one-shot intent filename is invalid")
+
+
+def _validate_isolated_generation_root(
+    path: Path, *, allow_one_shot_intents: bool = False,
+) -> None:
     """Check existing paths without creating a generation during argument validation."""
 
     existing_chain = tuple(
@@ -172,6 +196,9 @@ def _validate_isolated_generation_root(path: Path) -> None:
         if entry.is_file() and int(getattr(stat, "st_nlink", 1)) != 1:
             raise RuntimeError("isolated generation files must not be hard linked")
         if entry.is_dir():
+            if allow_one_shot_intents and entry.name == "one-shot-intents":
+                _validate_one_shot_intents(entry)
+                continue
             raise RuntimeError("isolated generation data root must remain flat")
 
 
@@ -910,7 +937,7 @@ def _refresh_current_session(*, expected_generation: str, expected_sha256: str) 
     if not isinstance(generation, dict) or generation.get("generation_id") != expected_generation:
         raise RuntimeError("current generation does not match requested session refresh")
     data_root = _current_runtime_data_root()
-    _validate_isolated_generation_root(data_root)
+    _validate_isolated_generation_root(data_root, allow_one_shot_intents=True)
     # A session refresh must never become a fresh install of missing business data.
     databases = (
         "runtime.sqlite3", "hub.sqlite3", "memory.sqlite3", "pacing.sqlite3",
