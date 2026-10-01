@@ -133,6 +133,9 @@ class _FakeAccessibility:
         self.calls.append("bubbles")
         return list(self.bubbles)
 
+    def message_tail_is_latest(self, window, selector):
+        return True
+
     def _window(self, window):
         return object()
 
@@ -1005,3 +1008,31 @@ def test_visual_drift_between_prepare_and_commit_never_sends(monkeypatch) -> Non
     assert result.error_code == "selection_visual_attestation_drift"
     assert "invoke-send" not in harness.fake.calls
     assert "select" not in harness.fake.calls
+
+
+def test_observe_tail_scroll_recertifies_without_reusing_consumed_handoff(monkeypatch):
+    harness = _session_harness(monkeypatch)
+    command = _observe_command(harness.binding.binding_id)
+    command = _with_handoff(command, _mint_refresh_handoff(harness, command))
+    latest = False
+    actions = []
+    harness.fake.message_tail_is_latest = lambda *_: latest
+
+    def scroll(*args, before_action):
+        nonlocal latest
+        before_action()
+        actions.append("scroll")
+        latest = True
+
+    harness.fake.scroll_message_tail_to_latest = scroll
+    result = harness.worker.execute(command)
+    assert result.status is WorkerStatus.OK
+    assert actions == ["scroll"]
+    assert harness.visual.calls == 4
+    assert harness.certifier.try_calls == 2
+    assert harness.fake.calls.count("bubbles") == 1
+    # The first capability is still spent, and cannot authorize another request.
+    replay = harness.worker.execute(command)
+    assert replay.status is WorkerStatus.FAILED_SAFE
+    assert replay.error_code == "selection_handoff_invalid"
+    assert actions == ["scroll"]

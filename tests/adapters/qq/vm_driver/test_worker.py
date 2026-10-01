@@ -2063,3 +2063,86 @@ def test_process_terminates_and_fails_uncertain_on_mismatched_child_response(
     assert terminal["error_code"] == "worker_response_mismatch"
     assert terminal["request_id"] == str(command.request_id)
     assert "must-not-appear" not in json.dumps(snapshot, sort_keys=True)
+
+
+def test_observe_reads_only_after_one_latest_tail_scroll_and_fresh_resolution():
+    worker, fake, binding = _worker()
+    latest = False
+    trace = []
+    fake.message_tail_is_latest = lambda *_: latest
+    original_resolve = worker._resolve
+    original_bubbles = fake.list_bubbles
+
+    def resolve(*args, **kwargs):
+        trace.append("resolve")
+        return original_resolve(*args, **kwargs)
+
+    def bubbles(*args):
+        assert latest
+        trace.append("bubbles")
+        return original_bubbles(*args)
+
+    def scroll(*args, before_action):
+        nonlocal latest
+        before_action()
+        trace.append("scroll")
+        latest = True
+
+    worker._resolve = resolve
+    fake.list_bubbles = bubbles
+    fake.scroll_message_tail_to_latest = scroll
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.OK
+    assert trace == ["resolve", "scroll", "resolve", "bubbles"]
+
+
+@pytest.mark.parametrize("mode,code", [
+    ("missing", "message_tail_unproven"),
+    ("unknown", "message_tail_unproven"),
+    ("no_action", "message_tail_scroll_unavailable"),
+])
+def test_observe_unproven_tail_is_failed_safe_without_bubbles(mode, code):
+    worker, fake, binding = _worker()
+    fake.message_tail_is_latest = None if mode == "missing" else lambda *_: (None if mode == "unknown" else False)
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE and result.error_code == code
+    assert "bubbles" not in fake.calls and "bubbles" not in result.evidence
+
+
+def test_observe_tail_settle_is_bounded_without_repeating_scroll(monkeypatch):
+    worker, fake, binding = _worker()
+    fake.message_tail_is_latest = lambda *_: False
+    calls = []
+    fake.scroll_message_tail_to_latest = lambda *args, **kwargs: calls.append("scroll")
+    ticks = iter([0.0, 3.0])
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(ticks))
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "message_tail_not_latest"
+    assert calls == ["scroll"] and "bubbles" not in fake.calls
+
+
+def test_observe_tail_drift_after_read_never_publishes_snapshot():
+    worker, fake, binding = _worker()
+    states = iter([True, False])
+    fake.message_tail_is_latest = lambda *_: next(states)
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "message_tail_changed"
+    assert "bubbles" not in result.evidence
+
+
+def test_observe_scroll_keeps_identity_validation_fail_closed():
+    worker, fake, binding = _worker()
+    fake.message_tail_is_latest = lambda *_: False
+
+    def scroll(*args, before_action):
+        before_action()
+        fake.conversations[0] = fake.conversations[0].model_copy(
+            update={"participant_signature": "different-counterparty"}
+        )
+
+    fake.scroll_message_tail_to_latest = scroll
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert "bubbles" not in result.evidence and "bubbles" not in fake.calls

@@ -127,6 +127,9 @@ class FakeQQAccessibility:
         self.calls.append("bubbles")
         return list(self.bubbles)
 
+    def message_tail_is_latest(self, window, selector):
+        return True
+
 
 def _adapter(
     *, accessibility: FakeQQAccessibility | None = None

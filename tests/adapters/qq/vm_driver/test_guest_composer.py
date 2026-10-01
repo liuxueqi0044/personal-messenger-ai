@@ -156,3 +156,74 @@ def test_readback_poll_rechecks_scope_before_every_read(monkeypatch):
             focus_guard=lambda _: True, timeout_seconds=2.0,
         )
     assert len(reads) == 1
+
+
+def _virtual_focus_clock(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(guest_composer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(guest_composer.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    return now
+
+
+def test_delayed_uia_focus_is_confirmed_before_first_input(monkeypatch):
+    now = _virtual_focus_clock(monkeypatch)
+    control = Control()
+    sent = []
+    def sender(value):
+        assert now[0] >= 0.1
+        sent.append(value)
+        control.text += value
+    write_with_text_pattern(control, "hello", scope_guard=lambda: True,
+                            focus_guard=lambda _control: now[0] >= 0.1, sender=sender)
+    assert sent == ["hello"] and control.text == "hello"
+
+
+def test_focus_never_arriving_times_out_without_keyboard_input(monkeypatch):
+    now = _virtual_focus_clock(monkeypatch)
+    sent = []
+    control = Control()
+    with pytest.raises(GuestComposerError, match="composer_focus_drift"):
+        write_with_text_pattern(control, "hello", scope_guard=lambda: True,
+                                focus_guard=lambda _control: False, sender=sent.append)
+    assert 2.0 <= now[0] < 2.1
+    assert sent == [] and control.text == ""
+
+
+def test_focus_wait_stops_immediately_when_qq_scope_is_lost(monkeypatch):
+    now = _virtual_focus_clock(monkeypatch)
+    sent = []
+    with pytest.raises(GuestComposerError, match="composer_focus_drift"):
+        write_with_text_pattern(Control(), "hello", scope_guard=lambda: now[0] < 0.1,
+                                focus_guard=lambda _control: False, sender=sent.append)
+    assert now[0] == pytest.approx(0.1) and sent == []
+
+
+@pytest.mark.parametrize("clearing", [False, True])
+def test_draft_changed_during_focus_settle_is_preserved(monkeypatch, clearing):
+    now = _virtual_focus_clock(monkeypatch)
+    control = Control("original" if clearing else "")
+    inputs = []
+    def focused(_control):
+        if now[0] < 0.1:
+            return False
+        control.text = "user draft"
+        return True
+    with pytest.raises(GuestComposerError, match="composer_clear_precondition_failed" if clearing else "composer_not_empty"):
+        if clearing:
+            clear_with_local_selection(control, expected_text="original", scope_guard=lambda: True,
+                                       focus_guard=focused, clear_action=lambda: inputs.append("delete"))
+        else:
+            write_with_text_pattern(control, "hello", scope_guard=lambda: True,
+                                    focus_guard=focused, sender=inputs.append)
+    assert inputs == [] and control.text == "user draft"
+
+
+def test_delayed_focus_also_precedes_clear(monkeypatch):
+    now = _virtual_focus_clock(monkeypatch)
+    control = Control("owned draft")
+    def clear():
+        assert now[0] >= 0.1
+        control.text = ""
+    clear_with_local_selection(control, expected_text="owned draft", scope_guard=lambda: True,
+                               focus_guard=lambda _control: now[0] >= 0.1, clear_action=clear)
+    assert control.text == ""

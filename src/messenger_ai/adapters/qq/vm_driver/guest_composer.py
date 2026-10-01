@@ -121,6 +121,23 @@ def _wait_for_exact_text(control: Any, expected: str, *,
         time.sleep(interval_seconds)
 
 
+def _focus_composer(control: Any, *, scope_guard: Callable[[], bool],
+                    focus_guard: Callable[[Any], bool],
+                    timeout_seconds: float = 2.0,
+                    interval_seconds: float = 0.05) -> None:
+    """Allow asynchronous UIA focus to settle before any keyboard input."""
+    control.SetFocus()
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if not scope_guard():
+            raise GuestComposerError("composer_focus_drift")
+        if focus_guard(control):
+            return
+        if time.monotonic() >= deadline:
+            raise GuestComposerError("composer_focus_drift")
+        time.sleep(interval_seconds)
+
+
 def write_with_text_pattern(control: Any, text: str, *,
                             scope_guard: Callable[[], bool],
                             focus_guard: Callable[[Any], bool],
@@ -130,9 +147,10 @@ def write_with_text_pattern(control: Any, text: str, *,
         raise GuestComposerError("composer_scope_rejected")
     if read_composer_text(control) != "":
         raise GuestComposerError("composer_not_empty")
-    control.SetFocus()
-    if not scope_guard() or not focus_guard(control):
-        raise GuestComposerError("composer_focus_drift")
+    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
+    # A user draft may have appeared while the provider committed focus.
+    if read_composer_text(control) != "":
+        raise GuestComposerError("composer_not_empty")
     for start in range(0, len(text), batch_units):
         if not scope_guard() or not focus_guard(control):
             raise GuestComposerError("composer_focus_or_scope_drift")
@@ -149,9 +167,9 @@ def clear_with_local_selection(control: Any, *, clear_action: Callable[[], None]
                                focus_guard: Callable[[Any], bool]) -> None:
     if not scope_guard() or read_composer_text(control) != expected_text:
         raise GuestComposerError("composer_clear_precondition_failed")
-    control.SetFocus()
-    if not scope_guard() or not focus_guard(control):
-        raise GuestComposerError("composer_focus_drift")
+    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
+    if read_composer_text(control) != expected_text:
+        raise GuestComposerError("composer_clear_precondition_failed")
     clear_action()
     if not _wait_for_exact_text(control, "", scope_guard=scope_guard,
                                 focus_guard=focus_guard):

@@ -438,15 +438,60 @@ class QQVMWorker:
 
     def _observe(self, command: WorkerCommand) -> WorkerResult:
         binding = self._bindings[command.binding_id or ""]
-        def read_bubbles(window, _conversation, _proof):
-            with self._stage(command, "bubbles"):
-                return self._accessibility.list_bubbles(
-                    window, self._selectors.selector("bubbles")
-                )
+        selector = self._selectors.selector("bubbles")
+        tail_is_latest = getattr(self._accessibility, "message_tail_is_latest", None)
 
-        window, conversation, _proof, bubbles = self._resolve(
+        def read_bubbles(window, _conversation, _proof):
+            with self._stage(command, "message_tail"):
+                if not callable(tail_is_latest):
+                    raise UIAUnavailable("message_tail_unproven")
+                latest = tail_is_latest(window, selector)
+                if latest is not True:
+                    if latest is not False:
+                        raise UIAUnavailable("message_tail_unproven")
+                    return None
+            with self._stage(command, "bubbles"):
+                return self._accessibility.list_bubbles(window, selector)
+
+        window, conversation, proof, bubbles = self._resolve(
             command, binding, current_reader=read_bubbles
         )
+        if bubbles is None:
+            scroll = getattr(self._accessibility, "scroll_message_tail_to_latest", None)
+            if not callable(scroll):
+                raise UIAUnavailable("message_tail_scroll_unavailable")
+            expected = self._stable_target(binding=binding, window=window, proof=proof)
+            self._ensure_command_live(command)
+            with self._stage(command, "message_tail_scroll"):
+                scroll(
+                    window, selector,
+                    before_action=lambda: self._ensure_command_live(command),
+                )
+            # Never repeat the mutation. Each settling read independently
+            # certifies the same target using the existing identity checks.
+            # A selection handoff was already consumed by the first resolve;
+            # use full ordinary certification rather than replay its authority.
+            refreshed = command.model_copy(update={"selection_handoff": None})
+            limit = time.monotonic() + 2.0
+            while True:
+                self._ensure_command_live(command)
+                window, conversation, proof, bubbles = self._resolve(
+                    refreshed, binding, current_reader=read_bubbles
+                )
+                if self._stable_target(binding=binding, window=window, proof=proof) != expected:
+                    raise RuntimeError("binding proof drift after selection")
+                self._ensure_command_live(command)
+                if bubbles is not None:
+                    break
+                remaining = limit - time.monotonic()
+                if remaining <= 0:
+                    raise UIAUnavailable("message_tail_not_latest")
+                time.sleep(min(0.05, remaining))
+        # This is outside the certified read phase: discard any memoized UIA
+        # properties before deciding that the just-read snapshot is current.
+        if tail_is_latest(window, selector) is not True:
+            raise UIAUnavailable("message_tail_changed")
+        self._ensure_command_live(command)
         # The durable, conversation-scoped cursor is assigned by the main process.
         rows = [item.model_dump(mode="json") for item in bubbles]
         complete = all(item.direction.value != "unknown" for item in bubbles)

@@ -18,7 +18,7 @@ import struct
 import subprocess
 import time
 import zlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from ctypes import wintypes
 from datetime import UTC, datetime
@@ -1076,6 +1076,77 @@ class WindowsUIAQQAccessibility:
             message_key=item.message_key, direction=item.direction, text=item.text,
             observed_at=datetime.now(UTC), tree_digest=digest)
             for item in decode_message_region(regions[0])]
+
+    def _message_scroll_pattern(self, window: QQWindow, selector: QQSelector) -> Any:
+        """Resolve only the configured, unique message region in the certified HWND."""
+
+        if selector.name != "bubbles":
+            raise UIAUnavailable("message_tail_region_unproven")
+        regions = self._select(self._window(window), selector)
+        if len(regions) != 1:
+            raise UIAUnavailable("message_tail_region_unproven")
+        region = regions[0]
+        if (
+            "ml-root" not in str(self._property(region, "ClassName", "")).split()
+            or self._property(region, "ProcessId", None) != window.process_id
+            or self._property(region, "IsOffscreen", True) is not False
+        ):
+            raise UIAUnavailable("message_tail_region_unproven")
+        pattern = self._pattern(region, "GetScrollPattern", 10004)
+        if pattern is None:
+            raise UIAUnavailable("message_tail_unproven")
+        return pattern
+
+    def message_tail_is_latest(self, window: QQWindow, selector: QQSelector) -> bool:
+        """Require valid ScrollPattern evidence; unknown is never a latest-tail proof."""
+
+        try:
+            pattern = self._message_scroll_pattern(window, selector)
+            scrollable = pattern.VerticallyScrollable
+            percent = pattern.VerticalScrollPercent
+            view_size = pattern.VerticalViewSize
+            if (
+                not isinstance(scrollable, bool)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in (percent, view_size)
+                )
+                or not 0 < view_size <= 100
+                or (scrollable and not 0 <= percent <= 100)
+                or (not scrollable and (percent != -1 or view_size != 100))
+            ):
+                raise UIAUnavailable("message_tail_unproven")
+            return not scrollable or percent == 100
+        except UIAUnavailable:
+            raise
+        except Exception as exc:
+            raise UIAUnavailable("message_tail_unproven") from exc
+
+    def scroll_message_tail_to_latest(
+        self, window: QQWindow, selector: QQSelector, *, before_action: Callable[[], None]
+    ) -> None:
+        """One semantic scroll, outside any cached phase; no keyboard/coordinate fallback."""
+
+        if getattr(self, "_active_phase", None) is not None:
+            raise UIAUnavailable("message_tail_scroll_during_read_phase")
+        if not self._guest_scope(window):
+            raise UIAUnavailable("message_tail_target_not_foreground")
+        # Re-read the exact region before the action, including malformed-state
+        # rejection. A concurrent arrival at the tail makes this a no-op.
+        if self.message_tail_is_latest(window, selector):
+            return
+        pattern = self._message_scroll_pattern(window, selector)
+        action = getattr(pattern, "SetScrollPercent", None)
+        if not callable(action):
+            raise UIAUnavailable("message_tail_scroll_unavailable")
+        before_action()
+        if not self._guest_scope(window):
+            raise UIAUnavailable("message_tail_target_not_foreground")
+        try:
+            action(-1.0, 100.0)  # Leave horizontal position unchanged.
+        except Exception as exc:
+            raise UIAUnavailable("message_tail_scroll_failed") from exc
 
     def _window(self, window: QQWindow) -> Any:
         phase = getattr(self, "_active_phase", None)
