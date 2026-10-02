@@ -5,6 +5,7 @@ new operation may adopt it, once, after the original authorization checks.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -16,9 +17,11 @@ from messenger_ai.runtime.contracts import ObservationBatch
 from messenger_ai.runtime.staged_preparation import (
     DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket,
     StagedPreparationError, validate_ticket,
+    matching_prepare_failure, preparation_failure,
 )
 from .bridge import QQVMDriverBridge, _TERMINAL, _receipt_fingerprint
 from .contracts import PreparedVerificationEvidence, WorkerCommand, WorkerKind, WorkerStatus
+from .hybrid_process import HybridProcessError
 
 
 class QQHybridDriverBridge(QQVMDriverBridge):
@@ -63,6 +66,10 @@ class QQHybridDriverBridge(QQVMDriverBridge):
           authorization_expires_at TEXT,
           created_at TEXT NOT NULL,
           UNIQUE(nonce)
+        );
+        CREATE TABLE IF NOT EXISTS qq_v2_prepare_failure_diagnostics(
+          reservation_id TEXT PRIMARY KEY, nonce TEXT NOT NULL,
+          first_prepare_failure_json TEXT, first_cleanup_failure_json TEXT
         );
         """)
         if "authorization_expires_at" not in {row["name"] for row in self._db.execute("PRAGMA table_info(qq_v2_draft_reservations)")}:
@@ -150,9 +157,47 @@ class QQHybridDriverBridge(QQVMDriverBridge):
     def retain_cleanup_hold(self, owner, *, reason):
         # A hold never adopts/replays an operation or guesses at the composer.
         self._row(owner)
+        self._diagnose_failure(owner, StagedPreparationError(reason), stage="cleanup_hold", cleanup=True,
+                               ticket_known=isinstance(owner, PreparedDraftTicket))
         self._db.execute("""UPDATE qq_v2_draft_reservations
             SET status='cleanup_required',error_code=? WHERE reservation_id=? AND nonce=?""",
             (reason, str(owner.reservation_id), str(owner.nonce)))
+
+    def record_prepare_failure(self, owner, diagnostic):
+        """First-write telemetry for an existing exact owner; never create one."""
+        self._record_failure(owner, diagnostic, cleanup=False)
+
+    def _record_failure(self, owner, diagnostic, *, cleanup):
+        try:
+            _, request = self._row(owner)
+            diagnostic = matching_prepare_failure(diagnostic, request)
+            if diagnostic is None:
+                return
+            raw = diagnostic.model_dump_json()
+            if len(raw.encode("utf-8")) > 4096:
+                return
+            column = "first_cleanup_failure_json" if cleanup else "first_prepare_failure_json"
+            self._db.execute(f"""INSERT INTO qq_v2_prepare_failure_diagnostics(reservation_id,nonce,{column})
+                VALUES(?,?,?) ON CONFLICT(reservation_id) DO UPDATE SET
+                {column}=COALESCE(qq_v2_prepare_failure_diagnostics.{column},excluded.{column})
+                WHERE qq_v2_prepare_failure_diagnostics.nonce=excluded.nonce""",
+                (str(owner.reservation_id), str(owner.nonce), raw))
+        except BaseException:
+            pass  # Diagnostic failure never substitutes a safety/cleanup result.
+
+    def _diagnose_failure(self, owner, exc, *, stage, ticket_known=False, cleanup=False):
+        try:
+            diagnostic = (matching_prepare_failure(exc.prepare_failure, owner)
+                          if isinstance(exc, HybridProcessError) and not cleanup else None)
+            if diagnostic is None:
+                code = exc.code if isinstance(exc, (StagedPreparationError, HybridProcessError)) else (
+                    "prepare_cancelled" if isinstance(exc, asyncio.CancelledError) else
+                    "prepare_timeout" if isinstance(exc, TimeoutError) else "prepare_failure_unknown")
+                diagnostic = preparation_failure(owner, code=code, stage=stage, now=self._clock(),
+                    tick=self._monotonic_ns(), ticket_known=ticket_known)
+            self._record_failure(owner, diagnostic, cleanup=cleanup)
+        except BaseException:
+            pass
 
     async def prepare_draft(self, request, *, cancel_event=None):
         DraftPreparationRequest.model_validate(request.model_dump())
@@ -173,11 +218,17 @@ class QQHybridDriverBridge(QQVMDriverBridge):
             except Exception:
                 raise StagedPreparationError("hybrid_reservation_replayed") from None
             try:
+                stage, ticket_known = "bridge_worker", False
                 prepared = await self._worker.prepare_draft(request,
                     expected_sequence_digest=digest, cancel_event=cancel_event)
+                stage = "bridge_ticket"
                 ticket = prepared.ticket
+                ticket_known = isinstance(ticket, PreparedDraftTicket)
+                stage = "bridge_proof"
                 proof = PreparedVerificationEvidence.model_validate(prepared.prepared_evidence.model_dump())
+                stage = "bridge_ticket"
                 validate_ticket(ticket, request, now=self._clock(), tick=self._monotonic_ns())
+                stage = "bridge_proof"
                 if (ticket.expected_sequence_digest != digest
                         or proof.owner_binding_id != request.binding_id
                         or proof.target_identity.binding_id != request.binding_id
@@ -191,6 +242,7 @@ class QQHybridDriverBridge(QQVMDriverBridge):
                     raise StagedPreparationError("hybrid_prepared_proof_mismatch")
                 # Save even if control changed during the call, so exact owned
                 # cleanup has its ticket. No permission is acquired here.
+                stage = "bridge_persist"
                 self._db.execute("""UPDATE qq_v2_draft_reservations SET
                     ticket_json=?,evidence_json=? WHERE reservation_id=? AND nonce=?""",
                     (ticket.model_dump_json(), proof.model_dump_json(), str(request.reservation_id), str(request.nonce)))
@@ -199,11 +251,14 @@ class QQHybridDriverBridge(QQVMDriverBridge):
                     (str(request.reservation_id), str(request.nonce))).rowcount
                 if changed != 1:
                     raise StagedPreparationError("hybrid_reservation_held")
+                stage = "bridge_scope"
                 self._current(request, cancel_event=cancel_event)
+                stage = "bridge_cursor"
                 if self._cursor_expectation(request) != digest:
                     raise StagedPreparationError("hybrid_cursor_changed")
                 return ticket
-            except BaseException:
+            except BaseException as exc:
+                self._diagnose_failure(request, exc, stage=stage, ticket_known=ticket_known)
                 self._db.execute("""UPDATE qq_v2_draft_reservations SET status='cleanup_required',
                     error_code='hybrid_prepare_unsettled' WHERE reservation_id=?""",
                     (str(request.reservation_id),))
@@ -295,7 +350,9 @@ class QQHybridDriverBridge(QQVMDriverBridge):
                 if (not isinstance(result, DraftCleanupResult) or result.status != "cleaned"
                         or result.reservation_id != owner.reservation_id or result.nonce != owner.nonce):
                     raise StagedPreparationError("hybrid_owned_cleanup_unproven")
-            except BaseException:
+            except BaseException as exc:
+                self._diagnose_failure(owner, exc, stage="cleanup_abort", cleanup=True,
+                                       ticket_known=bool(row["ticket_json"]))
                 self.retain_cleanup_hold(owner, reason="hybrid_owned_cleanup_unproven")
                 raise
             self._db.execute("UPDATE qq_v2_draft_reservations SET status='cleaned',error_code=NULL WHERE reservation_id=?",

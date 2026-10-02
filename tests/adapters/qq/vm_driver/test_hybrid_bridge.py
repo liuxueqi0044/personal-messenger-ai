@@ -10,6 +10,7 @@ import pytest
 
 from messenger_ai.adapters.qq.models import QQIdentityBinding
 from messenger_ai.adapters.qq.vm_driver.hybrid_bridge import QQHybridDriverBridge
+from messenger_ai.adapters.qq.vm_driver.hybrid_process import HybridProcessError
 from messenger_ai.adapters.qq.vm_driver.contracts import (
     PreparedTargetIdentity, PreparedVerificationEvidence, WorkerResult, WorkerStatus,
 )
@@ -17,6 +18,7 @@ from messenger_ai.domain import AuthorizedSendCommand, AuthorizationType, SendSt
 from messenger_ai.runtime.staged_preparation import (
     DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket,
     StagedPreparationError, source_keys_digest,
+    StagedPreparationController, StagedCleanupRequired, preparation_failure,
 )
 
 NOW = datetime(2026, 10, 2, tzinfo=UTC)
@@ -131,6 +133,89 @@ def _new_inbound(bridge, key, text):
 async def _adopt(bridge, ticket, request, operation_id=None):
     return await bridge.adopt_prepared(ticket, _command(request), operation_id=operation_id or uuid4(),
         segment_ref=f"{request.pacing_plan_id}:0", binding_revision=2, conversation_revision=3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper_metadata", [False, True])
+async def test_first_native_prepare_failure_survives_controller_cleanup_failure_and_restart(tmp_path, helper_metadata):
+    worker, request = FakeWorker(), _request()
+    bridge = _bridge(tmp_path, worker)
+    code = "hybrid_ui_action_failed" if helper_metadata else "target_drift"
+    first = preparation_failure(request, code=code, stage="identity" if helper_metadata else "write", now=NOW+timedelta(seconds=3),
+        tick=TICK+4_000_000_000, input_attempted=not helper_metadata, ticket_known=False,
+        helper_code="PROFILE_WINDOW_AMBIGUOUS" if helper_metadata else None,
+        helper_stage="profile" if helper_metadata else None)
+    async def fail(*args, **kwargs):
+        worker.calls.append("prepare")
+        raise HybridProcessError(code, cleanup_required=True, prepare_failure=first)
+    worker.prepare_draft, worker.fail_cleanup = fail, True
+    controller = StagedPreparationController(bridge, clock=lambda: NOW, monotonic_ns=lambda: TICK)
+    with pytest.raises(HybridProcessError, match=code):
+        await controller.prepare(request)
+    with pytest.raises(StagedCleanupRequired, match="staged_cleanup_unproven"):
+        await controller.abort(request)
+    row = bridge._db.execute("SELECT * FROM qq_v2_prepare_failure_diagnostics").fetchone()
+    assert json.loads(row["first_prepare_failure_json"]) == first.model_dump(mode="json")
+    assert json.loads(row["first_cleanup_failure_json"])["code"] == "hybrid_owned_cleanup_unproven"
+    owned, _ = bridge._row(request)
+    assert owned["status"] == "cleanup_required" and owned["error_code"] == "staged_cleanup_unproven"
+    assert owned["ticket_json"] is None and owned["evidence_json"] is None and owned["operation_id"] is None
+    assert worker.calls == ["prepare", "abort"] and bridge._db.execute("SELECT COUNT(*) FROM qq_vm_ops").fetchone()[0] == 0
+    second = preparation_failure(request, code="hybrid_process_worker_failed", stage="bridge_worker", now=NOW, tick=TICK)
+    bridge.record_prepare_failure(request, second)
+    raw_first, raw_cleanup = row["first_prepare_failure_json"], row["first_cleanup_failure_json"]
+    assert request.body not in raw_first and request.body_hash not in raw_first
+    assert request.source_message_keys[0] not in raw_first
+    bridge.close()
+    restored = _bridge(tmp_path, FakeWorker())
+    row = restored._db.execute("SELECT * FROM qq_v2_prepare_failure_diagnostics").fetchone()
+    assert (row["first_prepare_failure_json"], row["first_cleanup_failure_json"]) == (raw_first, raw_cleanup)
+    assert restored.has_cleanup_obligation(request.account_id)
+    restored.close()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_write_failure_and_unknown_exception_preserve_owned_quarantine(tmp_path):
+    worker, request = FakeWorker(), _request()
+    bridge = _bridge(tmp_path, worker)
+    original_db = bridge._db
+    class FailDiagnosticDB:
+        def __getattr__(self, name):
+            return getattr(original_db, name)
+        def execute(self, sql, *args):
+            if "qq_v2_prepare_failure_diagnostics" in sql:
+                raise OSError("private diagnostic write details")
+            return original_db.execute(sql, *args)
+    class PrivateError(Exception):
+        @property
+        def code(self):
+            pytest.fail("must not inspect an unknown exception")
+        def __str__(self):
+            pytest.fail("must not format an unknown exception")
+    async def fail(*args, **kwargs):
+        raise PrivateError("private body/key/HMAC")
+    worker.prepare_draft, bridge._db = fail, FailDiagnosticDB()
+    with pytest.raises(PrivateError):
+        await bridge.prepare_draft(request)
+    assert bridge._row(request)[0]["status"] == "cleanup_required"
+    assert original_db.execute("SELECT COUNT(*) FROM qq_v2_prepare_failure_diagnostics").fetchone()[0] == 0
+    bridge._db = original_db
+    bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_cannot_create_unknown_owner_or_accept_foreign_request_metadata(tmp_path):
+    bridge = _bridge(tmp_path, FakeWorker())
+    request = _request()
+    value = preparation_failure(request, code="target_drift", stage="write", now=NOW, tick=TICK)
+    bridge.record_prepare_failure(request, value)
+    assert bridge._db.execute("SELECT COUNT(*) FROM qq_v2_prepare_failure_diagnostics").fetchone()[0] == 0
+    await bridge.prepare_draft(request)
+    bridge.record_prepare_failure(request, value.model_copy(update={"nonce": uuid4()}))
+    bridge.record_prepare_failure(request, value.model_copy(update={"code": "private_body"}))
+    assert bridge._db.execute("SELECT COUNT(*) FROM qq_v2_prepare_failure_diagnostics").fetchone()[0] == 0
+    assert bridge._row(request)[0]["status"] == "prepared"
+    bridge.close()
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import nullcontext
 from datetime import UTC, datetime
 import hashlib
 import hmac
@@ -33,18 +34,35 @@ from messenger_ai.runtime.qq_hybrid_config import parse_hybrid_settings
 from messenger_ai.runtime.qq_hybrid_navigation import QQHybridNavigationService
 from messenger_ai.runtime.qq_hybrid_rounds import QQHybridRoundFactory
 from messenger_ai.runtime.qq_hybrid_scope import QQHybridRuntimeScope
+from messenger_ai.runtime.qq_observation_recovery import QQHybridObservationRecovery
 
 
 class NavigatingHybridDriver(QQHybridDriverBridge):
     navigation = None
     app_lookup = None
     navigation_resources = ()
+    observation_recovery = None
+
+    def observation_recovery_context(self, conversation_id, **revisions):
+        if self.observation_recovery is None:
+            return nullcontext()
+        return self.observation_recovery.context(conversation_id, **revisions)
 
     async def observe_conversation(self, conversation_id, *, binding_revision, conversation_revision):
         binding = self._bindings[conversation_id]
         if self.has_cleanup_obligation(binding.account_id) or not self._cursor.has_snapshot(conversation_id):
             return await super().observe_conversation(conversation_id,
                 binding_revision=binding_revision, conversation_revision=conversation_revision)
+        app = self.app_lookup()
+        br, cr, blocked, _gr, gp = app.state.one_shot_observation_execution_state(conversation_id)
+        if (blocked or gp or app._pause_requested.is_set()
+                or (br, cr) != (binding_revision, conversation_revision)):
+            row = app.state.connection.execute(
+                "SELECT pause_reason FROM runtime_conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+            return ObservationBatch(account_id=binding.account_id, contact_id=binding.contact_id,
+                conversation_id=conversation_id, binding_revision=binding_revision,
+                conversation_revision=conversation_revision, complete=False, messages=(),
+                gap_reason=row["pause_reason"] or "driver_quarantine:observation_scope_changed")
         result = await self.navigation.navigate(binding.binding_id,
             pending_input_key=f"observe:{conversation_id}:{conversation_revision}",
             cancel_event=self.app_lookup()._pause_requested)
@@ -184,6 +202,7 @@ async def build_runtime_v2(config, raw_settings, *, api_key, authorization_signi
             initial_pause_reason="hybrid_migration", navigation_preflight=navigation.due_preflight(),
             staged_preparation=bridge)
         app_box["app"] = app
+        bridge.observation_recovery = QQHybridObservationRecovery(app=app, bridge=bridge, navigation=navigation)
         validate_existing_memory(app, all_bindings)
         health = await bridge.probe_health_async()
         if health.status is not WorkerStatus.OK:

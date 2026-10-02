@@ -61,6 +61,26 @@ class NavigationEpisodeStart:
     error_code: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationRecoveryReceipt:
+    """Consumed recovery quota and historical scope, never UI authority."""
+
+    claim_id: str
+    owner_id: str
+    account_id: str
+    conversation_id: str
+    binding_id: str
+    binding_revision: int
+    conversation_revision: int
+    global_revision: int
+    pause_reason: str
+    failure_episode_id: str
+    claimed_at: datetime
+
+
+_OBSERVATION_RECOVERY_REASON = "ui_automation_unavailable:identity_profile_capture_failed"
+
+
 class NavigationTaskStore:
     """Compatible additional tables in the runtime SQLite database.
 
@@ -94,6 +114,16 @@ class NavigationTaskStore:
           );
           CREATE INDEX IF NOT EXISTS runtime_nav_episode_scope
             ON runtime_nav_episodes(account_id,binding_id,started_at);
+          CREATE TABLE IF NOT EXISTS runtime_nav_observation_recoveries(
+            claim_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+            account_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            binding_id TEXT NOT NULL, binding_revision INTEGER NOT NULL,
+            conversation_revision INTEGER NOT NULL, global_revision INTEGER NOT NULL,
+            pause_reason TEXT NOT NULL, failure_episode_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL, finished_at TEXT,
+            status TEXT NOT NULL CHECK(status IN ('consumed','succeeded','failed')),
+            UNIQUE(account_id,conversation_id,binding_id,binding_revision,pause_reason)
+          );
         """)
 
     def close(self) -> None:
@@ -155,6 +185,121 @@ class NavigationTaskStore:
         if row is None:
             raise KeyError(episode_id)
         return self._episode(row)
+
+    def claim_observation_recovery(self, target: ContactTarget, *, conversation_revision: int,
+                                   global_revision: int, pause_reason: str,
+                                   now: datetime) -> ObservationRecoveryReceipt | None:
+        """Consume one binding-revision recovery before any UI call.
+
+        Conversation/control changes cannot mint a second chance. A crash or
+        failed recovery leaves the quota consumed permanently; live runtime
+        admission and UI/cleanup obligations belong to the caller.
+        """
+        if pause_reason != _OBSERVATION_RECOVERY_REASON:
+            return None
+        if (type(conversation_revision) is not int or conversation_revision < 0
+                or type(global_revision) is not int or global_revision < 0):
+            raise ValueError("observation recovery revisions must be nonnegative integers")
+        now = _time(now)
+        pending_key = f"observe:{target.conversation_id}:{conversation_revision}"
+        scope = (target.account_id, target.conversation_id, target.binding_id,
+                 target.binding_revision, pause_reason)
+        with self._transaction():
+            if self.connection.execute(
+                "SELECT 1 FROM runtime_nav_observation_recoveries WHERE account_id=? "
+                "AND conversation_id=? AND binding_id=? AND binding_revision=? AND pause_reason=?", scope,
+            ).fetchone() is not None:
+                return None
+            failure = self.connection.execute(
+                "SELECT e.episode_id,e.finished_at,t.target_json,t.retry_at FROM runtime_nav_episodes e "
+                "JOIN runtime_nav_tasks t ON t.task_id=e.task_id "
+                "WHERE t.account_id=? AND t.conversation_id=? AND t.binding_id=? AND t.binding_revision=? "
+                "AND t.pending_input_key=? AND e.account_id=? AND e.binding_id=? "
+                "AND e.error_code='identity_profile_capture_failed' AND e.status!='candidate_opened' "
+                "AND e.finished_at IS NOT NULL AND e.finished_at!='' "
+                "ORDER BY e.started_at ASC,e.episode_id ASC LIMIT 1",
+                (target.account_id, target.conversation_id, target.binding_id, target.binding_revision,
+                 pending_key, target.account_id, target.binding_id),
+            ).fetchone()
+            if failure is None:
+                return None
+            try:
+                if (ContactTarget.model_validate_json(failure["target_json"]) != target
+                        or _time(_parse(failure["finished_at"])) > now):
+                    return None
+                # Mirror begin_episode's existing fixed safe policy without
+                # reserving an episode or rewriting old task/episode journals.
+                # A cooling/rate-limited navigation must not burn this quota.
+                retry_at = _parse(failure["retry_at"])
+                if retry_at is not None and _time(retry_at) > now:
+                    return None
+                running = self.connection.execute(
+                    "SELECT deadline_at FROM runtime_nav_episodes WHERE account_id=? AND binding_id=? "
+                    "AND status='running'", (target.account_id, target.binding_id),
+                ).fetchall()
+                for episode in running:
+                    deadline = _time(_parse(episode["deadline_at"]))
+                    # begin_episode would mark an expired running reservation
+                    # abandoned and apply the same 10s cooldown from deadline.
+                    if deadline + timedelta(seconds=10) > now:
+                        return None
+                latest = self.connection.execute(
+                    "SELECT finished_at FROM runtime_nav_episodes WHERE account_id=? AND binding_id=? "
+                    "AND finished_at IS NOT NULL AND status!='candidate_opened' "
+                    "ORDER BY finished_at DESC LIMIT 1", (target.account_id, target.binding_id),
+                ).fetchone()
+                if latest and _time(_parse(latest["finished_at"])) + timedelta(seconds=10) > now:
+                    return None
+            except (ValueError, TypeError, AttributeError):
+                return None
+            recent = self.connection.execute(
+                "SELECT COUNT(*) FROM runtime_nav_episodes WHERE account_id=? AND binding_id=? "
+                "AND started_at>? AND status!='candidate_opened'",
+                (target.account_id, target.binding_id, (now - timedelta(seconds=300)).isoformat()),
+            ).fetchone()[0]
+            if recent >= 3:
+                return None
+            receipt = ObservationRecoveryReceipt(
+                claim_id=str(uuid4()), owner_id=self.owner_id,
+                account_id=target.account_id, conversation_id=target.conversation_id,
+                binding_id=target.binding_id, binding_revision=target.binding_revision,
+                conversation_revision=conversation_revision, global_revision=global_revision,
+                pause_reason=pause_reason, failure_episode_id=failure["episode_id"], claimed_at=now,
+            )
+            self.connection.execute(
+                "INSERT INTO runtime_nav_observation_recoveries(claim_id,owner_id,account_id,conversation_id,"
+                "binding_id,binding_revision,conversation_revision,global_revision,pause_reason,failure_episode_id,"
+                "claimed_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,'consumed')",
+                (receipt.claim_id, receipt.owner_id, receipt.account_id, receipt.conversation_id,
+                 receipt.binding_id, receipt.binding_revision, receipt.conversation_revision, receipt.global_revision,
+                 receipt.pause_reason, receipt.failure_episode_id, receipt.claimed_at.isoformat()),
+            )
+        return receipt
+
+    def finish_observation_recovery(self, receipt: ObservationRecoveryReceipt, *,
+                                    succeeded: bool, now: datetime) -> bool:
+        """Settle only this store owner's exact consumed receipt, with no refund."""
+        if type(receipt) is not ObservationRecoveryReceipt or receipt.owner_id != self.owner_id:
+            return False
+        if type(succeeded) is not bool:
+            raise ValueError("observation recovery settlement requires a boolean")
+        now = _time(now)
+        claimed_at = _time(receipt.claimed_at)
+        if now < claimed_at:
+            return False
+        with self._transaction():
+            changed = self.connection.execute(
+                "UPDATE runtime_nav_observation_recoveries SET status=?,finished_at=? "
+                "WHERE claim_id=? AND owner_id=? AND account_id=? AND conversation_id=? "
+                "AND binding_id=? AND binding_revision=? AND conversation_revision=? AND global_revision=? "
+                "AND pause_reason=? AND failure_episode_id=? AND claimed_at=? "
+                "AND status='consumed' AND finished_at IS NULL",
+                ("succeeded" if succeeded else "failed", now.isoformat(), receipt.claim_id, self.owner_id,
+                 receipt.account_id, receipt.conversation_id, receipt.binding_id, receipt.binding_revision,
+                 receipt.conversation_revision, receipt.global_revision, receipt.pause_reason,
+                 receipt.failure_episode_id, claimed_at.isoformat()),
+            ).rowcount
+        return changed == 1
 
     def ensure_task(self, target: ContactTarget, pending_input_key: str, *,
                     now: datetime, task_id: str | None = None) -> NavigationTask:

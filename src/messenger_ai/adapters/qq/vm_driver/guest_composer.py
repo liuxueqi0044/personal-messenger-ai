@@ -123,9 +123,20 @@ def _wait_for_exact_text(control: Any, expected: str, *,
 
 def _focus_composer(control: Any, *, scope_guard: Callable[[], bool],
                     focus_guard: Callable[[Any], bool],
+                    focused_scope_guard: Callable[[], bool] | None = None,
                     timeout_seconds: float = 2.0,
                     interval_seconds: float = 0.05) -> None:
     """Preserve verified focus or allow asynchronous UIA focus to settle."""
+    # Opt-in owned V2 callers already proved entry and will prove the actual
+    # input boundary independently. An existing focus requires no UI action;
+    # retain cheap live scope/cancellation checks on both sides of this read.
+    if focused_scope_guard is not None:
+        if not focused_scope_guard():
+            raise GuestComposerError("composer_focus_drift")
+        if focus_guard(control):
+            if not focused_scope_guard():
+                raise GuestComposerError("composer_focus_drift")
+            return
     if not scope_guard():
         raise GuestComposerError("composer_focus_drift")
     # Electron can redirect a redundant SetFocus to a hidden renderer HWND.
@@ -148,21 +159,34 @@ def write_with_text_pattern(control: Any, text: str, *,
                             scope_guard: Callable[[], bool],
                             focus_guard: Callable[[Any], bool],
                             sender: Callable[[str], None] = _send_unicode,
-                            batch_units: int = 32) -> None:
+                            batch_units: int = 32,
+                            focused_scope_guard: Callable[[], bool] | None = None,
+                            defer_last_batch_postcheck: bool = False,
+                            before_input: Callable[[], None] | None = None) -> None:
     if not scope_guard():
         raise GuestComposerError("composer_scope_rejected")
     if read_composer_text(control) != "":
         raise GuestComposerError("composer_not_empty")
-    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
+    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard,
+                    focused_scope_guard=focused_scope_guard)
     # A user draft may have appeared while the provider committed focus.
     if read_composer_text(control) != "":
         raise GuestComposerError("composer_not_empty")
     for start in range(0, len(text), batch_units):
         if not scope_guard() or not focus_guard(control):
             raise GuestComposerError("composer_focus_or_scope_drift")
+        if before_input is not None:
+            try:
+                before_input()
+            except BaseException:
+                pass  # Optional local diagnostics never change input/error semantics.
         sender(text[start:start + batch_units])
-        if not scope_guard() or not focus_guard(control):
-            raise GuestComposerError("composer_focus_or_scope_drift")
+        # The last post-action proof can be the immediately following wait's
+        # first complete scope/focus proof. Only loop/clock bookkeeping occurs
+        # between them; intermediate batches keep their separate post-check.
+        if not defer_last_batch_postcheck or start + batch_units < len(text):
+            if not scope_guard() or not focus_guard(control):
+                raise GuestComposerError("composer_focus_or_scope_drift")
     if not _wait_for_exact_text(control, text, scope_guard=scope_guard,
                                 focus_guard=focus_guard):
         raise GuestComposerError("composer_readback_mismatch")
@@ -170,7 +194,9 @@ def write_with_text_pattern(control: Any, text: str, *,
 
 def write_with_value_pattern(control: Any, text: str, *,
                              scope_guard: Callable[[], bool],
-                             focus_guard: Callable[[Any], bool]) -> None:
+                             focus_guard: Callable[[Any], bool],
+                             focused_scope_guard: Callable[[], bool] | None = None,
+                             before_input: Callable[[], None] | None = None) -> None:
     """Set one empty, focused editor and verify its exact value without Send."""
     if not scope_guard():
         raise GuestComposerError("composer_scope_rejected")
@@ -179,7 +205,8 @@ def write_with_value_pattern(control: Any, text: str, *,
         raise GuestComposerError("composer_value_not_writable")
     if read_composer_text(control) != "":
         raise GuestComposerError("composer_not_empty")
-    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
+    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard,
+                    focused_scope_guard=focused_scope_guard)
     if read_composer_text(control) != "":
         raise GuestComposerError("composer_not_empty")
     # A property read/focus transition can yield to the provider. Check the
@@ -188,6 +215,11 @@ def write_with_value_pattern(control: Any, text: str, *,
         raise GuestComposerError("composer_value_not_writable")
     if not scope_guard() or not focus_guard(control):
         raise GuestComposerError("composer_focus_or_scope_drift")
+    if before_input is not None:
+        try:
+            before_input()
+        except BaseException:
+            pass
     pattern.SetValue(text)
     if not _wait_for_exact_text(control, text, scope_guard=scope_guard,
                                 focus_guard=focus_guard):
@@ -196,10 +228,12 @@ def write_with_value_pattern(control: Any, text: str, *,
 
 def clear_with_local_selection(control: Any, *, clear_action: Callable[[], None],
                                expected_text: str, scope_guard: Callable[[], bool],
-                               focus_guard: Callable[[Any], bool]) -> None:
+                               focus_guard: Callable[[Any], bool],
+                               focused_scope_guard: Callable[[], bool] | None = None) -> None:
     if not scope_guard() or read_composer_text(control) != expected_text:
         raise GuestComposerError("composer_clear_precondition_failed")
-    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard)
+    _focus_composer(control, scope_guard=scope_guard, focus_guard=focus_guard,
+                    focused_scope_guard=focused_scope_guard)
     if read_composer_text(control) != expected_text:
         raise GuestComposerError("composer_clear_precondition_failed")
     if not scope_guard() or not focus_guard(control):

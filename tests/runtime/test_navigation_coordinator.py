@@ -452,7 +452,8 @@ async def test_model_and_desktop_budgets_leave_pending_input_and_no_send_operati
     assert result.outcome.model_requests == 1
     assert instance.store.get_task(result.task_id).pending_input_key == "pending-key"
     names = {row[0] for row in instance.store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert names == {"runtime_nav_tasks", "runtime_nav_episodes"}
+    assert names == {"runtime_nav_tasks", "runtime_nav_episodes", "runtime_nav_observation_recoveries"}
+    assert instance.store.connection.execute("SELECT count(*) FROM runtime_nav_observation_recoveries").fetchone()[0] == 0
     action_limited = coordinator(Navigator(["wait"]), budget=NavigationBudget(max_desktop_actions=1))
     result = await action_limited.navigate(target(), pending_input_key="pending-key")
     assert result.outcome.error_code == "navigation_action_budget_exhausted"

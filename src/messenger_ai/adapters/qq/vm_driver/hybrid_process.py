@@ -27,6 +27,7 @@ from messenger_ai.adapters.qq.navigation.contracts import NavigationModel, _awar
 from messenger_ai.adapters.qq.navigation.supervised_profile import _WindowsProfileJob
 from messenger_ai.runtime.staged_preparation import (
     DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket, validate_ticket,
+    PreparationFailureDiagnostic, matching_prepare_failure,
 )
 from .contracts import PreparedVerificationEvidence, WorkerCommand, WorkerKind, WorkerResult
 from .hybrid_worker import HybridWorkerConfig, HybridWorkerError
@@ -37,9 +38,10 @@ _REAP_SECONDS = 0.5
 
 
 class HybridProcessError(RuntimeError):
-    def __init__(self, code: str, *, cleanup_required: bool = False):
+    def __init__(self, code: str, *, cleanup_required: bool = False, prepare_failure=None):
         super().__init__(code)
         self.code, self.cleanup_required = code, cleanup_required
+        self.prepare_failure = prepare_failure
 
 
 class _BusinessFailure(HybridProcessError):
@@ -98,9 +100,12 @@ class _Reply(NavigationModel):
     cleanup: DraftCleanupResult | None = None
     error_code: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,95}$")
     cleanup_required: bool = Field(default=False, strict=True)
+    prepare_failure: PreparationFailureDiagnostic | None = None
 
     @model_validator(mode="after")
     def _outcome(self):
+        if self.prepare_failure is not None and (self.action != "prepare_draft" or self.error_code is None):
+            raise ValueError("prepare failure diagnostics require a failed preparation")
         if sum(value is not None for value in (self.result, self.prepared, self.cleanup, self.error_code)) != 1:
             raise ValueError("hybrid reply requires one outcome")
         if self.error_code is None:
@@ -128,6 +133,13 @@ class _ChildRevocation:
 
     def set(self):
         self.event.set()
+
+
+def _last_prepare_failure(worker, request):
+    try:
+        return matching_prepare_failure(getattr(worker, "last_prepare_failure", None), request)
+    except BaseException:
+        return None
 
 
 def _hybrid_main(config_raw, epoch, deadline_at, stop_at, permitted, revoked,
@@ -178,10 +190,14 @@ def _hybrid_main(config_raw, epoch, deadline_at, stop_at, permitted, revoked,
             except HybridWorkerError as exc:
                 code = exc.code if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", exc.code) else "hybrid_process_worker_failed"
                 reply = _Reply(request_id=call.request_id, worker_epoch=epoch, action=call.action,
-                               error_code=code, cleanup_required=bool(exc.cleanup_required))
+                               error_code=code, cleanup_required=bool(exc.cleanup_required),
+                               prepare_failure=matching_prepare_failure(exc.prepare_failure, call.request)
+                               if call.action == "prepare_draft" else None)
             except Exception:
                 reply = _Reply(request_id=call.request_id, worker_epoch=epoch, action=call.action,
-                               error_code="hybrid_process_worker_failed", cleanup_required=call.action != "execute")
+                               error_code="hybrid_process_worker_failed", cleanup_required=call.action != "execute",
+                               prepare_failure=_last_prepare_failure(worker, call.request)
+                               if call.action == "prepare_draft" else None)
             live(call)  # Late results never become a usable acknowledgement.
             raw = reply.model_dump_json().encode("utf-8")
             if len(raw) > _MAILBOX_LIMIT:
@@ -453,7 +469,9 @@ class HybridWorkerProcess:
                             if (reply.request_id != call.request_id or reply.worker_epoch != self._epoch or reply.action != call.action):
                                 raise HybridProcessError("hybrid_process_response_mismatch")
                             if reply.error_code:
-                                raise _BusinessFailure(reply.error_code, cleanup_required=reply.cleanup_required or self.mutation_may_have_occurred)
+                                raise _BusinessFailure(reply.error_code, cleanup_required=reply.cleanup_required or self.mutation_may_have_occurred,
+                                    prepare_failure=matching_prepare_failure(reply.prepare_failure, call.request)
+                                    if call.action == "prepare_draft" else None)
                             if reply.result is not None:
                                 result, command = reply.result, call.command
                                 if (result.worker_epoch != self._epoch or any(getattr(result, field) != getattr(command, field)

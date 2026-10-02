@@ -1,14 +1,36 @@
 # QQ 个人聊天助手 V2 混合视觉导航架构
 
-设计日期：2026-10-01；初始代码审查基线：`6cd99c5419b77bf49e5b8dd2c80484a701e41f79`。模块和接线说明已按 2026-10-02 的实现同步，初始基线不是当前工作树的发布版本。
+设计日期：2026-10-01；初始代码审查基线：`6cd99c5419b77bf49e5b8dd2c80484a701e41f79`。模块、接线及验收说明已按 2026-10-03 的实现同步，初始基线不是当前工作树的发布版本。
 
 本文确定 V2 的实现边界：**由视觉模型提出联系人寻找、列表重排和必要导航恢复的有限动作，由程序负责区域许可、当前身份核验、消息读取、联系人隔离、回复调度、输入、提交与结果记录。** 保留现有 Python Runtime 和 QQ 虚拟机，新增独立导航与当前聊天执行路径，不合并另一套 Agent 产品，也不搬迁全部业务数据库。
 
-**状态（2026-10-02）：独立 V2 runner、生产装配、supervisor 显式启用、导航/N2 核验、staged prepare/adopt 和新进程 VERIFY 已有实现。当前会话和一次不同起点的生产装配只读探针已通过；一次实际冷准备的 PREPARE/ABORT 失败，测试草稿后来已人工清除并完成精确记录结算。实际 V2 发送为零，自动草稿恢复及 G1–G4 未通过。** 正常 Runtime 保持停止和暂停。原失败 `4619dcc2`（PREPARE 21.938 s `hybrid_ui_action_failed`、ABORT 2.946 s `cleanup_required / needs_manual_cleanup`）仍是失败样本。QQ 菜单全选/剪切人工清除后，`1d649d31` 只读确认空 composer；`432b145a` 用两次独立 fresh empty 读取和原 scope/RID/selected/config 核对、私有 fsync evidence 与 full-row CAS，仅结算该 reservation 为 `cleaned / manual_cleanup_verified`。这是人工恢复，不是 replacement actor 的 ABORT 成功；原业务、游标、三个旧操作、零 commit 和 revision 49 保持。
+**最新已完成的源码检查点（2026-10-03）：首次准备诊断树全量3868 passed、2 skipped（144.94 s）。** 此前观察恢复树全量3851 passed、2 skipped（194.04 s），failure-only 有界资料诊断 targeted 66 passed，观察恢复的实际 state/bridge/cursor/coordinator 链69 passed。较早 `hybrid_worker.py` 冻结 SHA-256 `486107924a460b8d3f41b7858e184cee58a9f93cbf8218ddfac73c56d48a5b11` 对应下述冷准备/撤销门；新增准备诊断已改变文件字节，该实机门不自动覆盖后续树。更早完整树的3705 passed、2 skipped（109.50 s）、hybrid/composer/cache targeted 488 passed、私人诊断 wrapper failure-injection 11 passed保留为历史；重叠结果不能叠加。后续诊断补充仍待独立全量及发布证据。新鲜外部有序边与父类名证明及同一冷准备同步过程内省去两次重复整树枚举的优化保持；消息、正文、候选唯一性和最后独立关键边界仍新鲜核验，COMMIT/ABORT 仍以完整新 snapshot 开始。
+
+当前会话只读探针 `263f7b35b12d4c30bd8d140ecc91f48f` 的 OBSERVE 成功用时11.984秒，13 bubbles，无输入、reservation、发送或游标/配置改变，全部 worker 回收、暂停恢复至 revision 61。随后 profiled 门 `a5526cd4fed541f8ace40f0589822d71` 完成实际50字符冷 PREPARE 21.270秒、ticket 生命周期15.000秒及同 actor ABORT 7.461秒，精确 reservation 为 cleaned、无 hold，全部 worker 回收、暂停恢复至 revision 63；原三个操作、游标和配置保持，send/adopt/commit 与授权/Hub增量均为零。原45秒 UTC/QPC round、20秒写入预留和10秒资料证据年龄保持。这两个探针明确为 current-chat adapter 诊断：N1 为 `not_tested_current_chat_adapter_probe`，独立 observation epoch 不适用；不证明 N1 导航或业务 M10 资格。
+
+`r20261003-01` 已实际安装。wheel SHA-256 为 `79977722167bfcee334f5a3a0147cfb7372593bc8fa33687779c1843e88213e1`，29文件 manifest SHA-256 为 `a6797391981ee2d2699f7cefe0dbdcc08ef7599e1e612d9e5bdee6b80d7fa402`。独立 installed-release 门 `132e3d12` 对168模块、6个 helper payload 完成闭合逐字节匹配；配置检查有效，canonical、业务数据库和暂停 revision 63 保持，检查本身无 UI 输入、API 请求或 worker startup。随后正常 hybrid V2 以 paused 启动、精确 run UUID resume 受理；fresh 状态 `979d1395` 确认同 run running/unpaused、global revision 64、driver available、ready true，本轮与新鲜 active unpaused observation 均为1。三个历史 failed 操作保持、receipts 为0；新入站与真实回复尚待验收，实际 V2 发送仍为零，G1–G4 未完成。
+
+**保留的 r20261003-01 正常观察失败：** 上述 ready 之后的下一轮观察失败，测试联系人自动暂停，reason 为 `ui_automation_unavailable:identity_profile_capture_failed`。用户已发送新入站消息，但没有新增 planner 结果或 receipt。精确 run UUID pause 已受理，global revision 65；graceful stop exit 0，`runtime_process_alive=false`，该正常 Runtime 已停止。曾取得 fresh ready 不证明持续观察或真实收发通过。资料采集失败的具体根因仍在诊断；保留安装、此前冷准备/同 actor 撤销成功和本次正常观察失败各自的事实。
+
+随后安静的只读探针 `36289c5f3b774f9aaab301bdca8db2b5` 以当前资料 HMAC 匹配通过 N1（13.448秒），raw OBSERVE 11.878秒读取14 bubbles。无导航动作/模型请求、RuntimeState apply、cursor改变、草稿输入或发送，无授权或 reservation；原三个操作/配置保持，原联系人暂停及 global pause 恢复至 revision 67，全部 worker 回收、无 hold。单次安静成功不确定历史 helper 失败根因，也不证明自动暂停恢复或真实回复通过。
+
+`r20261003-02` 已实际安装成功，29文件 manifest SHA-256 为 `b90b9a38ef9f1b58eee1bac46248e6dfe9a5f9c12de61a42765ce5fa6991c73b`，wheel SHA-256 为 `9c675c7dd6fc52aaeb705959d38b9a0ec209f87f1ed989566615aad690b2630a`。独立 guest 门 `3b7d5af` 匹配169模块、29files、6个 helper payload，canonical/DB/global pause revision 67 保持；settings SHA-256 为 `56d416ac71bfdb28da5c0c6e2b5363e8e88fec82f497cc23b0a167469e5cfa5b`。新正常 run 精确 resume 受理至 global revision 68。
+
+**新观察恢复已有实际成功，真实回复仍未通过：** 当前聊天 N1 `c451` 为 `candidate_opened`，随后 independent OBSERVE 和精确 recovery finish 成功，原 conversation revision 8→9、cursor next-sequence 8→9、outbox key 8 delivered。新入站 planner `380a` 选择 `auto_reply_candidate`，8.736秒完成安排；当时尚未 send。之后正常 due N1 `f80` 约20秒成功，但 cold PREPARE 留下 `cleanup_required / staged_cleanup_unproven` reservation，ticket/evidence/operation 均为空，实际 composer 只有3字符自有草稿。最终 cleanup error 覆盖了首个 PREPARE error，不能把它当成初始失败根因。联系人因 `driver_quarantine:hybrid_cleanup_or_baseline_required` 暂停；原三个操作保持、receipts 仍0。已 exact global pause revision 69、graceful stop exit 0且确认 process 不存活，无自动 retry/clear。准备阶段诊断和精确人工清理仍在进行，尚不确定具体失败根因，不宣称 G1–G4 或完成；成功的 recovery/apply/ACK 及 CR9/cursor next9 保持独立事实。
+
+后续只读检查 `40960de5` 确认该计划已经过期、status 为 `cancelled`，due outbox 4 为 `navigation_attention / staged_cleanup_required`、operation 为空。已接收的入站观察保持；该计划不是待重试回复，清理恢复不得续期或重放旧计划。
+
+只读 preclear `98296` 以当前资料 HMAC 核对精确3字符自有正文，无DB写入或输入。操作者随后通过QQ菜单全选；原生选择证明 `ce93a242` 确认完整选中该精确正文，QQ剪切菜单操作后操作者看到空 composer。人工 ACK `b7d456b6` 仍以 `ProfileCaptureError` 失败：初始空框检查通过，但无DB写入或commit，helper留下资料popup，随后由操作者关闭。精确reservation仍 `cleanup_required`、原联系人reason及global pause revision69保持，没有成功manualACK或pause release，真实回复仍0；不从泛化错误或popup推断具体失败原因。
+
+`candidate-dist-r20261003-03` 仅已构建，wheel SHA-256 为 `82fdfed87db77f4c1bec40d24bcddd5a1410ce68226b5252a760c0bed6edf6e8`、169个闭合模块精确匹配；尚未冻结或安装。当前已安装版本仍为r02，不据构建成功宣称ready、真实收发或G1–G4完成。
+
+**保留的失败和人工恢复历史：** 前一源码全量3587 passed、2 skipped属于另一冻结树。`e1d3db73` 的 PREPARE 40.411秒仅留下0.647秒 ticket，ABORT 未能执行；人工清空后 `b9ce98d7` 用独立当前资料 HMAC 和两次空框读取结算精确记录，原过期 ticket、owner 字段、stale selected-row ACK 拒绝及原失败保留。随后 `3891bf72` 的 OBSERVE 19.658秒、PREPARE 44.393秒被原 round 截止终止，same actor 已不可用于 ABORT，没有 ticket/prepared evidence。人工删除完整测试草稿后 `d5a4d6ac` 用冻结外部 anchor 的当前证明结算该精确 null-ticket 记录、暂停仍57；不伪造 prepared evidence，不复活原 deadline，也不是自动 ABORT 成功。其后19.168秒只观察计时（full identity 17.744秒、profile 8.835秒、两次 snapshot 合计8.814秒）促成了当前优化。以下更早状态段落同样保留为历史，不能替代最新验收。
+
+**历史状态（2026-10-02）：独立 V2 runner、生产装配、supervisor 显式启用、导航/N2 核验、staged prepare/adopt 和新进程 VERIFY 已有实现。当前会话和一次不同起点的生产装配只读探针已通过；一次实际冷准备的 PREPARE/ABORT 失败，测试草稿后来已人工清除并完成精确记录结算。实际 V2 发送为零，自动草稿恢复及 G1–G4 未通过。** 当时正常 Runtime 保持停止和暂停。原失败 `4619dcc2`（PREPARE 21.938 s `hybrid_ui_action_failed`、ABORT 2.946 s `cleanup_required / needs_manual_cleanup`）仍是失败样本。QQ 菜单全选/剪切人工清除后，`1d649d31` 只读确认空 composer；`432b145a` 用两次独立 fresh empty 读取和原 scope/RID/selected/config 核对、私有 fsync evidence 与 full-row CAS，仅结算该 reservation 为 `cleaned / manual_cleanup_verified`。这是人工恢复，不是 replacement actor 的 ABORT 成功；原业务、游标、三个旧操作、零 commit 和 revision 49 保持。
 
 后续 `cddb7d78` 只执行 N1 current-profile：12.849 s profile HMAC 匹配，但 `identity_evidence_stale` 在 28.574 s 返回 `needs_attention`，未进入草稿或输入，也没有 raw input error。全部 worker 回收、暂停恢复至 revision 51、diagnostic reservations 为零、无 cleanup obligation、无业务 DB 变化。该次不能确认 placeholder-COM 根因；定位仍未完成。
 
-较早冻结树全量 pytest 为 3410 passed、2 skipped（109.78 s）；shared structure 与 verified-click 分别通过 750、825 项 targeted 检查，不能叠加。之后有限十种 composer 错误码分类通过 212 项 targeted 检查，尚无该后续代码的新全量结果。实机诊断 `52dd491f` 从 QQ 游戏中心起点以 1 model / 1 click 完成 full N2，N1 `candidate_opened` 32.189 s，独立新 epoch OBSERVE 14.300 s/13 bubbles；全部 worker 回收、global pause 恢复、原配置 SHA 保持。此前 `008b` 保留为原 45 s 预算内资料采集超时样本。此前 `uv build` wheel 也对应更早代码，发布前须重建；新 release 尚未冻结或安装。单次只读成功和人工清理均不升级为 G1 或发送验收，详见 [实现状态](IMPLEMENTATION_STATUS.md)。
+较早冻结树全量 pytest 为 3410 passed、2 skipped（109.78 s）；shared structure 与 verified-click 分别通过 750、825 项 targeted 检查，不能叠加。之后有限十种 composer 错误码分类通过 212 项 targeted 检查，尚无该后续代码的新全量结果。实机诊断 `52dd491f` 从 QQ 游戏中心起点以 1 model / 1 click 完成 full N2，N1 `candidate_opened` 32.189 s，独立新 epoch OBSERVE 14.300 s/13 bubbles；全部 worker 回收、global pause 恢复、原配置 SHA 保持。此前 `008b` 保留为原 45 s 预算内资料采集超时样本。当时的 `uv build` wheel 对应更早代码，发布前仍须重建；该历史检查点的新 release 尚未冻结或安装。单次只读成功和人工清理均不升级为 G1 或发送验收，详见 [实现状态](IMPLEMENTATION_STATUS.md)。
 
 本文接替 [V1 架构](ARCHITECTURE-V1.md) 中的驱动、导航、身份交接和实施顺序；V1 的产品范围、人设与记忆、控制语义、持久化原则和备份要求继续适用。两者冲突时，以本文明确覆盖的部分为准。
 
@@ -159,6 +181,16 @@ N1 与 N4 使用共享 `current_chat_structure` 投影：仅从 composer ClassNa
 
 程序自己的 surface epoch 无法发现全部人工切换，特别是同名会话之间的切换。每次消息读取及 PREPARE/COMMIT 的关键边界仍需本地新鲜核验当前聊天关联；“零模型快路径”不等于零核验。短 TTL 或没有收到导航事件均不能替代该检查。
 
+### Composer 内外的结构检查
+
+编辑器输入会正常替换 placeholder 和文字 DOM。当前 fence 保留原 composer 根实例及外部关键控件，只在证明属于该 composer 的严格后代中重新读取小树；跨进程、父子边不完整、重复或循环 RuntimeId、group marker 与未知元数据均拒绝。
+
+外部检查覆盖根及每个 composer 外部节点的有序直接子节点，包括原空叶，防止新插入的 group 分支被静态 ClassName 检查漏掉。基线来自已完成的同一次 UIA phase 图；后续每个边界重新读取，最多1024个父节点及1024条边。Windows `cached_outside_proof` 使用实际 ViewWalker.Condition、原 retained element 和每父一次 fresh `BuildUpdatedCache`，仅请求 Element|Children、cache-only 的 RuntimeId（30000）及 ClassName（30012）。返回有序 edges 和同一父缓存中关联的 RID/ClassName；类名须为真实 string、允许空串、最长4096字符。缓存不跨边界，不取 Current、不 refind、不新建递归树或替换基线；原生错误直接终止，无慢路径 fallback。原 `cached_direct_adjacency` API 仍只请求 RuntimeId。
+
+仅在真实 core 已持有 exact reservation/nonce，并明确提升刚完成 full identity 的 pending fence 后，同步冷准备中的两次 `_current` 可重用原 graph。新鲜证明仍对所有可能匹配的外部父类名及严格 composer 小树做筛选，再读取 ControlTypeName、AutomationId、required patterns、PID 和 RuntimeId，要求原角色唯一、rows 与原集合完全一致。仅 flat 且有 class constraint 的 selectors 可启用；有 ancestor constraint 或没有新 producer 的普通路径仍完整建树。每次 property/pattern/runtime 读取都受原取消与双钟预算约束；selector boundary 结束后另开 fresh critical boundary 核对角色、selected、composer 小树、关键 edges、native、guard 与 tail。实际当次 bubbles、正文和 current guard 生成新 witness 时间戳，原 properties/edges/sequence 不改。最多刷新两次；其它 begin、profile、discard、close、失败及 core prepare finally 均清空该能力，不能跨 IPC、ABORT 或 COMMIT 复用。
+
+V2 输入保留32码点分批。最后一批后的完整复核由紧邻的等待读回首个完整复核承担；中间不能插入 UI 操作或异步等待。已获得焦点时可跳过重复 SetFocus，实际输入和清空前仍要求完整 scope/focus 证明。旧默认路径不改变。这些调整不延长45秒 round、20秒写入预留、10秒资料证据或15秒 ticket 上限。当前冻结源码的50字符 PREPARE/同 actor ABORT 实机门已通过；真实业务发送、持续稳定性和 G1–G4 验收仍未完成。
+
 ### 真实运行 guard 与桌面所有权
 
 `QQHybridRuntimeScope.snapshot(*, target, purpose, worker_epoch, deadline_at, desktop_lease_id, observation_epoch)` 从实际 Runtime SQLite、同步 pause fence、原 bridge operation 和新 reservation 读取控制版本及在途义务；模型不能提交或更新这些 flags。`QQNavigationGuardPublisher` 在已获得共享锁后首次成功原子发布，factory 才创建 native worker。每个 epoch 使用独立绝对 guard 路径；heartbeat 与 `publish_now()` 串行，刷新 published_at 不续桌面租约。失效、暂停、错误 epoch/target/window/start 或未知外来草稿均不能授权输入。
@@ -258,7 +290,7 @@ UI-TARS 的截图与动作执行接口、逐步观察循环和取消机制可供
 
 ## 10 持久化与运维
 
-V2.0 继续使用现有业务库及跨库核对，不把全面合库作为前提。production 装配在原 data_dir 新增独立 `qq-v2-navigation.sqlite3`，由 `NavigationTaskStore` 管理，不属于 `runtime.sqlite3` 的 RuntimeState。其表为 `runtime_nav_tasks`、`runtime_nav_episodes` 与 service 的 `runtime_nav_cleanup_obligations`。稳定任务键绑定 account、conversation、binding/revision 和 `pending_input_key`；保存 target、状态、错误/retry_at、owner/deadline 和模型/动作预留计数。截图、bbox、活跃 lease 不作为重启后的可执行动作保存。
+V2.0 继续使用现有业务库及跨库核对，不把全面合库作为前提。production 装配在原 data_dir 新增独立 `qq-v2-navigation.sqlite3`，由 `NavigationTaskStore` 管理，不属于 `runtime.sqlite3` 的 RuntimeState。其表为 `runtime_nav_tasks`、`runtime_nav_episodes`、单次观察恢复审计 `runtime_nav_observation_recoveries` 与 service 的 `runtime_nav_cleanup_obligations`。稳定任务键绑定 account、conversation、binding/revision 和 `pending_input_key`；保存 target、状态、错误/retry_at、owner/deadline 和模型/动作预留计数。截图、bbox、活跃 lease 不作为重启后的可执行动作保存。
 
 bridge 在原 `qq-vm-bridge.sqlite3` 增加 `qq_v2_draft_reservations` 等准备证据/所有权记录，继续使用原 `qq_vm_ops`、`qq_vm_receipts` 和 cursor 库，不另建业务发送账本。Hub、M9、pacing 的既有库和结算事实保持。新增表不重置旧 operation、adoption、message key、memory 或 persona；跨库 CAS/claim 核对仍必需。
 
@@ -268,7 +300,21 @@ bridge 在原 `qq-vm-bridge.sqlite3` 增加 `qq_v2_draft_reservations` 等准备
 
 持久化的 `candidate_opened` 仅表示此前曾核验成功，不是跨重启的输入资格。恢复时其临时证据/lease 失效，保留原 task scope 和预算；若存在准备 reservation 或原 operation，先走其精确清理/核对阶段，不据成功导航记录创建第二个 operation。准备不明、未回收进程和 commit uncertainty 分别保留 hold，不伪造“清理成功”。
 
+### 一次有界的观察恢复
+
+`QQHybridObservationRecovery.context(conversation_id, binding_revision=..., conversation_revision=...)` 仅处理 exact `ui_automation_unavailable:identity_profile_capture_failed` 自动暂停。`NavigationTaskStore.claim_observation_recovery(...)` 必须找到真实已结束的 typed failure、相同 target 和原观察版本，先持久消费 account/conversation/binding revision 的一次 quota，再允许 UI 读取。沿用至少10秒 cooldown 和300秒内最多3个未成功 episode 的门，cooling/rate-limited 不消费 quota；消费之后失败、取消或重启都不退款，CR/global 变化不能产生第二次同 binding-version quota。
+
+`RuntimeState.observation_recovery_scope(receipt, contact_id=...)` 只在 `observing` 阶段让精确旧自动暂停的 `one_shot_observation_execution_state` 可读；普通 `execution_state`、planner 和 send 始终 paused。完整 batch 的 `apply_observation` 仍保留暂停，并记下 applied phase、正文批次摘要及 resulting CR。coordinator 必须先 apply，再 ACK；`handle.finish(batch, events, acknowledged_count)` 不信任 ACK 数量，逐个查询真实 cursor `observation_outbox` 的 exact batch key 均为 delivered 后才调用 `RuntimeState.finish_observation_recovery(context, batch)`。
+
+claim 前后和 finish 都必须确认导航无 active round/持久清理 hold、worker idle且回收结束、bridge 无 draft 或 commit uncertainty、global active且没有同步 pause intent。最后 exact CAS 核对原 account/contact/binding、global revision、旧 pause reason 和 resulting CR，仅清 paused/reason，不额外增加 conversation revision。incomplete、UNKNOWN、控制或绑定漂移、异常/cancel 均不能解除；UNKNOWN 保留原 hard reason，不能转换成可普遍自动恢复的 prefix。scope finally 撤销 mutable context，已复制 Context 在退出后失效。RuntimeState 清 pause 与 NavStore 审计结算是独立 CAS，不是跨库原子事务；审计未落定仍为 consumed，不允许重放。该 scope 不签发送、绑定、续租或草稿清理权限。
+
 正常诊断记录固定阶段/错误、scope 引用、耗时、尺寸、模型使用量和计数；导航状态库不保存 PNG 或消息文本。guard/cleanup 文件和完整身份/准备证据是私有运行数据，公开投影只含有限状态。若单独采集本地图像诊断，不能让它成为重启后的动作许可，也不能进入仓库/公开报告。模型输入画面视为数据，不能修改系统动作范围。
+
+资料 child 只在失败时 best-effort 写有界 metadata：固定 stage/code/category、耗时及白名单 helper exit、输出长度/hash；不保存原 stdout/stderr、身份、聊天内容，不检查或 stringify unknown exception。诊断 I/O 失败不能覆盖原错误或改变清理 owner；公共错误合同、预算与无自动输入重试保持。新增66项 targeted 负例只验证这条诊断边界，不使历史 `identity_profile_capture_failed` 获得已知根因。
+
+准备诊断在独立 `qq_v2_prepare_failure_diagnostics` 记录中保存首个实际观察到的 PREPARE failure 和首个 cleanup failure，分别以 COALESCE 保留；写入先验证现有精确 owner及原 reservation/nonce/deadline，有限code、stage、原双钟耗时不含正文或UI内容。本地 before_input callback只标记是否尝试输入，不取得输入权限。诊断写入失败不改变原13列reservation、hold、公共错误或截止合同；它不能恢复历史上已被覆盖的初始错误，也不能把parent看到的round失败冒充未知的child根因。
+
+N4 的 exact `ProfileCaptureError` 可另外保留55个固定白名单 `helper_code` 与 `header/profile` 阶段；只读取既有 plain 字段，不复制原 diagnostic、异常文本或 helper 输出。未知值归空，typed IPC 与首写记录保持该有限原因，不改变公开错误、暂停或权限。2026-10-03 的关机暂停状态、未通过回归和实际清理断点见 [暂停检查点](checkpoints/2026-10-03-paused.md)；恢复须先核对当前私有状态，不能将设计或构建视为发送验收。
 
 当前 runner 写有限 `qq_hybrid_runtime_status_v2` witness，supervisor 按 actual run UUID、fresh witness、真实 DB scope/global revision 和本轮成功观察判断 ready；有限 session 的 idle 不等于 worker 故障。原 WebUI、pause/error 和 run-scoped 文件控制继续使用。更细的寻找/输入阶段展示是运维体验目标，不能据架构标签宣称已完成 UI。暂停立即阻止新动作，迟到模型结果失效；排空 UI tick/回收 worker 后才确认 paused/stopping，保留原人工接管语义。
 

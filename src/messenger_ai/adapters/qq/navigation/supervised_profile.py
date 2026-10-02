@@ -15,17 +15,18 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import json
 import multiprocessing as mp
 import os
 from pathlib import Path
 import threading
 import time
 from typing import Any, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from messenger_ai.adapters.qq.vm_driver.profile_identity import _bounded_run
+from messenger_ai.adapters.qq.vm_driver.profile_identity import ProfileCaptureError, _HELPER_FAILURES, _bounded_run
 from .contracts import ContactTarget, NavigationFrame, NavigationModel, _aware
 from .identity import Digest, ProfileIdentityExpectation, ScopeId
 from .profile_verifier import ProfileAcquisitionError, ValidatedProfileAcquisition, capture_profile_acquisition
@@ -34,6 +35,25 @@ from .windows_backend import NavigationGuardState
 
 _REPLY_LIMIT = 16384
 _REAP_SECONDS = 0.5
+_DIAGNOSTIC_LIMIT = 4096
+_PROFILE_FAILURE_CODES = _HELPER_FAILURES | frozenset({
+    "CAPTURE_INPUT_INVALID", "CAPTURE_CLOCK_INVALID", "CAPTURE_DEADLINE_EXHAUSTED",
+    "IDENTITY_KEY_UNAVAILABLE", "IDENTITY_KEY_MISSING", "IDENTITY_KEY_INVALID",
+    "HELPER_OUTPUT_LIMIT", "HELPER_TIMEOUT", "HELPER_START_FAILED", "HELPER_INVALID_OUTPUT", "HELPER_FAILED",
+    "HEADER_SCOPE_MISMATCH", "GUEST_ENVIRONMENT_MISMATCH", "HEADER_PRIVACY_CONTRACT_FAILED",
+    "HEADER_DIGEST_INVALID", "RIGHT_REGION_DIGEST_INVALID",
+    "MISSING_FIELD", "INVALID_DIGEST", "INVALID_OUTPUT", "INVALID_SCHEMA", "PRIVACY_CONTRACT_FAILED",
+    "RECOVERY_CONTRACT_FAILED", "VERSION_MISMATCH", "MODE_MISMATCH", "STATUS_MISMATCH",
+    "HWND_OR_PROCESS_MISMATCH", "WINDOW_NOT_MAXIMIZED", "HEADER_MISMATCH", "ENVIRONMENT_MISMATCH",
+    "SELECTOR_MISMATCH", "HEADER_NOT_UNIQUE", "PROFILE_CANDIDATE_NOT_UNIQUE", "EVIDENCE_TYPE_MISMATCH",
+    "QQ_FOREGROUND_NOT_RESTORED", "RIGHT_REGION_MISMATCH",
+})
+_ACQUISITION_FAILURE_CODES = frozenset({
+    "identity_profile_scope_mismatch", "identity_profile_capture_revoked",
+    "identity_profile_acquisition_invalid", "identity_profile_window_mismatch",
+    "identity_profile_report_invalid", "identity_profile_capture_order_invalid",
+    "identity_profile_evidence_invalid", "identity_profile_evidence_unavailable",
+})
 _FRAME_FIELDS = ("run_id", "session_epoch", "surface_epoch", "worker_epoch", "desktop_lease_id",
                  "control_revision", "binding_id", "binding_revision", "process_id", "window_handle")
 _GUARD_FIELDS = tuple(x for x in _FRAME_FIELDS if not x.startswith("binding_")) + (
@@ -143,9 +163,101 @@ def _certified_guest() -> bool:
     return os.name == "nt" and os.environ.get("PERSONAL_MESSENGER_VM_GUEST") == "1"
 
 
+def _write_profile_failure(config, request, exc, *, stage, started_ns, stage_started_ns, timings):
+    """Best-effort child-local diagnostics; never expose reports or affect IPC.
+
+    Only exact trusted exception types supply whitelisted fields. In particular,
+    unknown native exceptions are not inspected, formatted, or serialized.
+    """
+    temporary = None
+    try:
+        if config is None or request is None:
+            return
+        request_uuid = str(UUID(request.request_id))
+        if request_uuid != request.request_id:
+            return
+        now_ns = time.monotonic_ns()
+        value = {
+            "schema": "qq_profile_failure_diagnostic_v1",
+            "run_id": config.run_id, "worker_epoch": config.worker_epoch,
+            "request_id": request_uuid, "deadline_at": request.deadline_at.isoformat(),
+            "failed_at": datetime.now(UTC).isoformat(), "stage": stage,
+            "started_monotonic_ns": started_ns, "failed_monotonic_ns": now_ns,
+            "stage_started_monotonic_ns": stage_started_ns,
+            "stage_timings": timings + [{"stage": stage, "elapsed_ns": max(0, now_ns - stage_started_ns)}],
+            "exception_category": "unknown", "code": "unknown",
+        }
+        if type(exc) is ProfileCaptureError:
+            value["exception_category"] = "profile_capture_error"
+            if type(exc.code) is str and exc.code in _PROFILE_FAILURE_CODES:
+                value["code"] = exc.code
+            source = exc.diagnostic
+            if type(source) is dict:
+                diagnostic = {}
+                for name in ("stage", "exit_code", "stdout_bytes", "stdout_sha256",
+                             "stderr_bytes", "stderr_sha256", "output_limit_exceeded"):
+                    item = source.get(name)
+                    if name == "stage" and type(item) is str and item in {"header", "profile"}:
+                        diagnostic[name] = item
+                    elif name == "exit_code" and type(item) is int and -(2**31) <= item < 2**32:
+                        diagnostic[name] = item
+                    elif name.endswith("_bytes") and type(item) is int and 0 <= item < 2**31:
+                        diagnostic[name] = item
+                    elif (name.endswith("_sha256") and type(item) is str and len(item) == 64
+                          and all(char in "0123456789abcdef" for char in item)):
+                        diagnostic[name] = item
+                    elif name == "output_limit_exceeded" and type(item) is bool:
+                        diagnostic[name] = item
+                value["helper_diagnostic"] = diagnostic
+        elif type(exc) is ProfileAcquisitionError:
+            value["exception_category"] = "profile_acquisition_error"
+            if type(exc.code) is str and exc.code in _ACQUISITION_FAILURE_CODES:
+                value["code"] = exc.code
+        elif type(exc) is ValidationError:
+            value["exception_category"] = "validation_error"
+        elif type(exc) is OSError:
+            value["exception_category"] = "os_error"
+        elif type(exc) is RuntimeError:
+            value["exception_category"] = "runtime_error"
+        raw = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(raw) > _DIAGNOSTIC_LIMIT:
+            return
+        path = Path(config.guard_state_path).with_suffix(".profilediagnostic.json")
+        temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
+        with temporary.open("xb") as stream:
+            stream.write(raw)
+        os.replace(temporary, path)
+    except BaseException:
+        # Even diagnostic I/O or malicious field values cannot replace the
+        # original failure, extend its deadline, or alter cleanup ownership.
+        pass
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except BaseException:
+                pass
+
+
 def _profile_capture_main(config_raw, request_raw, permitted, revoked, ready, output, length):
     """Fixed child entry point: only approved capture and strict projection."""
     request_id = "invalid"
+    config = request = None
+    stage = "admission"
+    started_ns = stage_started_ns = time.monotonic_ns()
+    timings = []
+
+    def set_stage(value):
+        nonlocal stage, stage_started_ns
+        if value != stage:
+            tick = time.monotonic_ns()
+            timings.append({"stage": stage, "elapsed_ns": max(0, tick - stage_started_ns)})
+            stage, stage_started_ns = value, tick
+
+    def diagnose(exc):
+        _write_profile_failure(config, request, exc, stage=stage, started_ns=started_ns,
+                               stage_started_ns=stage_started_ns, timings=timings)
+
     try:
         config = SupervisedProfileConfig.model_validate(config_raw)
         request = _CaptureRequest.model_validate(request_raw)
@@ -165,8 +277,18 @@ def _profile_capture_main(config_raw, request_raw, permitted, revoked, ready, ou
             _certify_window_process(config)
 
         def guarded_runner(command, **kwargs):
+            helper_stage = None
+            if "--inspect-guest-current-header" in command:
+                helper_stage = "header"
+            elif "--capture-current-identity-guest-foreground" in command:
+                helper_stage = "profile"
+            set_stage("admission")
             check()  # Admission before BOTH header and profile helper launches.
-            return _bounded_run(command, **kwargs)
+            if helper_stage is not None:
+                set_stage(helper_stage)
+            completed = _bounded_run(command, **kwargs)
+            set_stage("parse")
+            return completed
 
         check()
         result = capture_profile_acquisition(
@@ -176,15 +298,19 @@ def _profile_capture_main(config_raw, request_raw, permitted, revoked, ready, ou
             selector_pack_version=config.selector_pack_version,
             deadline=request.deadline_at, runner=guarded_runner,
         )
+        set_stage("postcapture")
         check()
+        set_stage("parse")
         result = ValidatedProfileAcquisition.model_validate(result)
         reply = _CaptureReply(request_id=request_id, acquisition=result)
     except ProfileAcquisitionError as exc:
         code = exc.code if exc.code in {"identity_profile_scope_mismatch", "identity_profile_capture_revoked"} else "identity_profile_capture_failed"
         reply = _CaptureReply(request_id=request_id, error_code=code)
-    except BaseException:
+        diagnose(exc)
+    except BaseException as exc:
         # Never serialize a native exception, traceback, key or raw report.
         reply = _CaptureReply(request_id=request_id, error_code="identity_profile_capture_failed")
+        diagnose(exc)
     raw = reply.model_dump_json().encode("utf-8")
     if len(raw) > _REPLY_LIMIT:
         raw = _CaptureReply(request_id=request_id, error_code="identity_profile_capture_failed").model_dump_json().encode()

@@ -32,7 +32,7 @@ from messenger_ai.adapters.qq.navigation.profile_verifier import (
 )
 from messenger_ai.adapters.qq.navigation.windows_backend import WindowsNavigationConfig
 from messenger_ai.runtime.staged_preparation import (
-    DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket,
+    DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket, preparation_failure, _HELPER_FAILURE_CODES,
 )
 from .contracts import (
     PreparedBubbleAnchor, PreparedTargetIdentity, PreparedVerificationEvidence,
@@ -45,9 +45,10 @@ from .message_cursor import MessageCursorStore
 
 
 class HybridWorkerError(RuntimeError):
-    def __init__(self, code: str, *, cleanup_required: bool = False):
+    def __init__(self, code: str, *, cleanup_required: bool = False, prepare_failure=None):
         super().__init__(code)
         self.code, self.cleanup_required = code, cleanup_required
+        self.prepare_failure = prepare_failure
 
 
 class HybridWorkerConfig(NavigationModel):
@@ -150,6 +151,7 @@ class HybridQQWorker:
         self._end_ns = self._last_ns = 0
         self._global_deadline = deadline_at
         self._global_end_ns = int(stop_at * 1e9) if stop_at is not None else None
+        self.last_prepare_failure = None
 
     def _begin(self, deadline_at: datetime, mode: str):
         now, tick = self.clock(), self.monotonic_ns()
@@ -297,6 +299,15 @@ class HybridQQWorker:
     def prepare_draft(self, request: DraftPreparationRequest, *, expected_sequence_digest: str) -> PreparedDraftTicket:
         """Cold owned draft only: no Hub operation or send authorization exists."""
         with self._lock:
+            stage, input_attempted = "admission", False
+            self.last_prepare_failure = None
+            try:
+                observer = getattr(self.port, "set_prepare_input_observer", None)
+            except BaseException:
+                observer = None
+            def mark_input():
+                nonlocal input_attempted
+                input_attempted = True
             try:
                 request = DraftPreparationRequest.model_validate(request.model_dump(warnings=False))
                 if self._prepared is not None:
@@ -316,6 +327,7 @@ class HybridQQWorker:
                 if (request.account_id != target.account_id or request.conversation_id != target.conversation_id
                         or request.contact_id != binding.contact_id or request.binding_revision != target.binding_revision):
                     raise HybridWorkerError("operation_binding_mismatch")
+                stage = "identity"
                 frame, snap, proof = self._full_identity(target)
                 if not snap.bubbles or semantic_sequence_digest(snap.bubbles) != expected_sequence_digest:
                     raise HybridWorkerError("stale_context")
@@ -326,20 +338,38 @@ class HybridQQWorker:
                                           text_hash=request.body_hash, segment_ref=segment_ref)
                 if self._live() <= self.config.prepare_write_reserve_seconds:
                     raise HybridWorkerError("prepare_write_budget_exhausted")
+                stage = "ownership"
                 record = _Prepared(request, frame, snap, proof, portable)
                 self._prepared = record
                 self._used_owners.add(request.reservation_id)
+                retain = getattr(self.port, "retain_prepare_fence", None)
+                if callable(retain):
+                    retain(target, request)
                 self.port.begin("owned", deadline_at=self._effective_deadline())
+                if callable(observer):
+                    try:
+                        observer(mark_input)
+                    except BaseException:
+                        input_attempted = None
+                else:
+                    input_attempted = None  # An uninstrumented port is genuinely unknown.
+                stage = "before_write"
+                def before_write():
+                    nonlocal stage
+                    self._current(record, composer="", messages=True)
+                    stage = "write"
                 self.port.write(target, request.body,
-                                before_action=lambda: self._current(record, composer="", messages=True))
+                                before_action=before_write)
                 # The transport independently requires empty entry and exact
                 # readback. No profile or selection is permitted after write.
+                stage = "after_write"
                 post = self._current(record, composer=request.body, messages=True)
                 remaining = min(15, self._live(), (request.deadline_monotonic_ns - self.monotonic_ns()) / 1e9)
                 issued, tick = self.clock(), self.monotonic_ns()
                 delta_us = int(remaining * 1e6)
                 if delta_us <= 0:
                     raise HybridWorkerError("hybrid_deadline_exhausted")
+                stage = "ticket"
                 ticket = PreparedDraftTicket(**request.model_dump(exclude={"body"}),
                     **{f: getattr(post.witness, f) for f in (
                         "run_id", "session_epoch", "surface_epoch", "worker_epoch", "process_id",
@@ -351,8 +381,35 @@ class HybridQQWorker:
                 record.ticket = ticket
                 return ticket
             except Exception as exc:
-                raise HybridWorkerError(self._error_code(exc), cleanup_required=self._prepared is not None) from None
+                code = self._error_code(exc)
+                try:
+                    # Retain only exact capture-error finite metadata. Never
+                    # serialize its diagnostic dictionary or exception text.
+                    from .profile_identity import ProfileCaptureError
+                    helper_code = helper_stage = None
+                    if type(exc) is ProfileCaptureError:
+                        fields = object.__getattribute__(exc, "__dict__")
+                        candidate = dict.get(fields, "code")
+                        if type(candidate) is str and candidate in _HELPER_FAILURE_CODES:
+                            helper_code = candidate
+                            diagnostic = dict.get(fields, "diagnostic")
+                            if type(diagnostic) is dict:
+                                helper_stage = dict.get(diagnostic, "stage")
+                    self.last_prepare_failure = preparation_failure(request, code=code, stage=stage,
+                        now=self.clock(), tick=self.monotonic_ns(), input_attempted=input_attempted,
+                        helper_code=helper_code, helper_stage=helper_stage,
+                        ticket_known=bool(self._prepared and self._prepared.request.reservation_id == request.reservation_id
+                                          and self._prepared.ticket is not None))
+                except BaseException:
+                    pass
+                raise HybridWorkerError(code, cleanup_required=self._prepared is not None,
+                                        prepare_failure=self.last_prepare_failure) from None
             finally:
+                if callable(observer):
+                    try:
+                        observer(None)
+                    except BaseException:
+                        pass
                 self._discard_fence()
 
     def adopt_prepared(self, ticket: PreparedDraftTicket, command: WorkerCommand) -> WorkerResult:
@@ -668,6 +725,12 @@ class WindowsHybridCurrentChatPort:
     Its action dispatcher is never exposed. A dedicated guard admits current
     reads while this worker retains its exact draft; it never admits navigation.
     """
+    # Trusted witness limits, not model/config input. The legacy phase index
+    # has no node cap. The measured QQ surface has 552 outside parents/edges;
+    # this admits that surface while bounding each new read-only proof.
+    _OUTSIDE_MAX_PARENTS = 1024
+    _OUTSIDE_MAX_EDGES = 1024
+
     def __init__(self, config, revoked, *, deadline_at, stop_at, transport=None, surface=None):
         from messenger_ai.adapters.qq.navigation.windows_backend import (
             NavigationGuardState, WindowsNavigationCommandHandler,
@@ -708,14 +771,27 @@ class WindowsHybridCurrentChatPort:
         self.handler = ReadHandler(config.navigation, revoked, deadline_at,
                                    transport=transport, surface=surface)
         self._pending_fence = None
+        self._prepare_fence = None
+        self._prepare_promotion = None
+        self._prepare_owner = None
+        self._prepare_refreshes = 0
 
     def begin(self, mode, *, deadline_at):
         if mode not in {"idle", "owned", "verify", "abort", "health"}:
             raise HybridWorkerError("hybrid_mode_invalid")
+        # Only the synchronous cold preparation can refresh its just-certified
+        # scope. A new command, cleanup, profile or round must start fresh.
+        promotion = self._prepare_promotion
+        retained = (self._pending_fence if mode == "owned" and self.mode == "idle"
+                    and promotion is not None and promotion[0] is self._pending_fence else None)
         self.mode = mode
         self.discard_fence()
         self.deadline = min(deadline_at, self.global_deadline)
         self.handler.deadline_at = self.deadline
+        if retained is not None and self._can_refresh_prepare():
+            self._prepare_fence = retained
+            self._prepare_owner = promotion[1:]
+            retained["prepare_refresh"] = True
 
     def close(self):
         self.discard_fence()
@@ -723,6 +799,38 @@ class WindowsHybridCurrentChatPort:
 
     def discard_fence(self):
         self._pending_fence = None
+        self._prepare_fence = None
+        self._prepare_promotion = None
+        self._prepare_owner = None
+        self._prepare_refreshes = 0
+
+    def retain_prepare_fence(self, target, request):
+        # Called by the core only after it records this exact prepared owner.
+        # Merely beginning an owned mode cannot promote an observation fence.
+        fence = self._pending_fence
+        if not self._can_refresh_prepare():
+            return
+        if (self.mode != "idle" or fence is None or fence["target"] != target
+                or request.binding_id != target.binding_id or request.binding_revision != target.binding_revision
+                or request.account_id != target.account_id or request.conversation_id != target.conversation_id
+                or request.global_revision != fence["guard"].control_revision):
+            raise HybridWorkerError("hybrid_input_fence_missing")
+        self._prepare_promotion = (fence, request.reservation_id, request.nonce, target)
+
+    def _selectors(self):
+        nav = self.config.navigation
+        return (("header", nav.header_selector), ("messages", nav.message_selector),
+                ("composer", nav.composer_selector),
+                ("send", self.config.selector_pack.selector("send")), ("rows", nav.row_selector))
+
+    def _can_refresh_prepare(self):
+        # Ancestor selectors keep the original complete phase path. Flat
+        # selectors must have a class constraint so every new possible match
+        # can be checked against the complete fresh outside class proof.
+        return (callable(getattr(self.handler.transport, "cached_outside_proof", None))
+                and all((selector.class_name or selector.class_name_tokens)
+                        and not selector.ancestor_automation_ids and not selector.ancestor_control_types
+                        for _, selector in self._selectors()))
 
     def allow_paused_cleanup_revision(self, target, original, current):
         guard = self.handler._guard(target)
@@ -782,7 +890,7 @@ class WindowsHybridCurrentChatPort:
             crop_origin_x=x, crop_origin_y=y, crop_width=width, crop_height=height, dpi_scale=dpi,
             allowed_regions=(), privacy_mask_applied=True, png_bytes=_encode_bgra_png(width, height, pixels))
 
-    def _properties(self, fence, reads):
+    def _properties(self, fence, reads, *, static_groups=True):
         from .session_identity import _GROUP_MARKERS
         from messenger_ai.adapters.qq.navigation.windows_backend import selected_runtime_token
         selected = []
@@ -810,7 +918,8 @@ class WindowsHybridCurrentChatPort:
         # the certified editor. Every outside COM control stays frozen.
         nodes = fence["nodes"]
         if "group_static_nodes" in fence:
-            nodes = (*fence["group_static_nodes"], *self._composer_descendants(fence, reads))
+            nodes = (*(fence["group_static_nodes"] if static_groups else (fence["composer"],)),
+                     *self._composer_descendants(fence, reads))
         for node in nodes:
             name = reads.property(node, "ClassName")
             if type(name) is not str:
@@ -830,7 +939,7 @@ class WindowsHybridCurrentChatPort:
 
     def _composer_read(self, read):
         # Native calls are bounded by the supervising Job. These cheap local
-        # checks also stop a long small-subtree walk without reloading the
+        # checks also stop a bounded graph proof without reloading the
         # guard or taking a window snapshot for each individual property.
         def current():
             if (self.revoked.is_set() or datetime.now(UTC) >= self.deadline
@@ -856,7 +965,8 @@ class WindowsHybridCurrentChatPort:
         call = self._composer_read
         composer_id = call(lambda: reads.runtime(composer))
         composer_pid = call(lambda: reads.property(composer, "ProcessId"))
-        if type(composer_pid) is not int or composer_pid != self.config.navigation.window.process_id:
+        if (len(composer_id) > 64 or type(composer_pid) is not int
+                or composer_pid != self.config.navigation.window.process_id):
             raise HybridWorkerError("hybrid_composer_scope_unproven")
         forbidden = fence.get("composer_outside_runtime_ids", frozenset())
         seen_controls, seen_ids, result = {id(composer)}, {composer_id}, []
@@ -884,7 +994,8 @@ class WindowsHybridCurrentChatPort:
                     raise HybridWorkerError("identity_conversation_not_direct")
                 actual_parent = (opening_graph.get(id(child)) if opening_graph is not None
                                  else call(lambda: reads.index.call(child, "GetParentControl")))
-                if actual_parent is None or call(lambda: reads.runtime(actual_parent)) != parent_id:
+                if (actual_parent is None or call(lambda: reads.runtime(actual_parent)) != parent_id
+                        or call(lambda: reads.property(actual_parent, "ProcessId")) != pid):
                     raise HybridWorkerError("hybrid_composer_scope_unproven")
                 result.append(child)
                 stack.append((child, rid, depth + 1))
@@ -903,12 +1014,133 @@ class WindowsHybridCurrentChatPort:
                 or any(id(node) not in graph for node in descendants)):
             raise HybridWorkerError("hybrid_composer_scope_unproven")
         static = tuple(node for node in fence["nodes"] if id(node) not in descendant_controls)
+        outside = (root, *(node for node in static if node is not fence["composer"]))
+        if len(outside) > self._OUTSIDE_MAX_PARENTS:
+            raise HybridWorkerError("hybrid_group_adjacency_unproven")
         outside_ids = frozenset(self._composer_read(lambda node=node: reads.runtime(node))
                                 for node in (root, *static))
         if any(reads.runtime(node) in outside_ids for node in descendants):
             raise HybridWorkerError("hybrid_composer_scope_unproven")
         fence["group_static_nodes"] = static
+        fence["static_runtime_ids"] = tuple(reads.runtime(node) for node in static)
         fence["composer_outside_runtime_ids"] = outside_ids
+        fence["outside_parents"] = outside
+
+    def _outside_proof(self, fence):
+        """One fresh cached edge/class proof; never a replacement baseline."""
+        from .raw_adjacency import RawAdjacencyError
+        from .session_identity import _GROUP_MARKERS
+        try:
+            edges, classes = self.handler.transport.cached_outside_proof(
+                fence["outside_parents"], read=self._composer_read,
+                max_parents=self._OUTSIDE_MAX_PARENTS, max_edges=self._OUTSIDE_MAX_EDGES)
+        except RawAdjacencyError:
+            raise HybridWorkerError("hybrid_group_adjacency_unproven") from None
+        if (type(edges) is not tuple or type(classes) is not tuple
+                or edges != fence["outside_edges"]
+                or len(classes) != len(edges)
+                or any(type(item) is not tuple or len(item) != 2 or item[0] != edge[0]
+                       or type(item[1]) is not str or len(item[1]) > 4096
+                       for item, edge in zip(classes, edges))):
+            raise HybridWorkerError("target_drift")
+        if any(_GROUP_MARKERS & set(name.split()) for _, name in classes):
+            raise HybridWorkerError("identity_conversation_not_direct")
+        return classes
+
+    def _verify_prepare_selectors(self, fence, classes, reads):
+        # An existing node can become a second matching role/selected row
+        # without changing its RuntimeId or edges. Recheck all possible
+        # matches, including fresh strict composer descendants, before using
+        # a retained graph as a current snapshot. No locator or tree retry.
+        from .transport import WindowsUIAQQAccessibility
+        prop = lambda node, name: self._composer_read(lambda: reads.property(node, name))
+        runtime = lambda node: self._composer_read(lambda: reads.runtime(node))
+        by_id = dict(classes)
+        candidates = []
+        for node, rid in zip(fence["group_static_nodes"], fence["static_runtime_ids"]):
+            name = (prop(node, "ClassName") if node is fence["composer"] else by_id.get(rid))
+            if type(name) is not str:
+                raise HybridWorkerError("hybrid_group_adjacency_unproven")
+            candidates.append((node, name))
+        candidates.extend((node, prop(node, "ClassName"))
+                          for node in self._composer_descendants(fence, reads))
+        normalize = WindowsUIAQQAccessibility._control_type
+        for role, selector in self._selectors():
+            matches = []
+            for node, name in candidates:
+                if (selector.class_name and name != selector.class_name
+                        or selector.class_name_tokens and not set(selector.class_name_tokens).issubset(name.split())):
+                    continue
+                kind = prop(node, "ControlTypeName")
+                if type(kind) is not str:
+                    raise HybridWorkerError("identity_chat_correlation_unproven")
+                if normalize(kind) != normalize(selector.control_type):
+                    continue
+                if selector.automation_id:
+                    automation_id = prop(node, "AutomationId")
+                    if type(automation_id) is not str:
+                        raise HybridWorkerError("identity_chat_correlation_unproven")
+                    if automation_id != selector.automation_id:
+                        continue
+                supported = True
+                for name in selector.required_patterns:
+                    pattern = WindowsUIAQQAccessibility._PATTERN_GETTERS.get(name.lower())
+                    if pattern is None or self._composer_read(lambda: reads.pattern(node, *pattern)) is None:
+                        supported = False
+                        break
+                if supported:
+                    pid = prop(node, "ProcessId")
+                    if type(pid) is not int or pid != self.config.navigation.window.process_id:
+                        raise HybridWorkerError("identity_chat_correlation_unproven")
+                    matches.append(runtime(node))
+            expected = tuple(runtime(node) for node in fence["rows"]) if role == "rows" else (runtime(fence[role]),)
+            if tuple(matches) != expected:
+                raise HybridWorkerError("identity_chat_correlation_unproven")
+
+    def _outside_adjacency(self, fence, reads, *, opening=False):
+        """Complete ordered outside edges, including every previously empty leaf.
+
+        Opening uses only the completed phase graph and already-cached IDs.
+        Closing reads each frozen parent's direct children once, never follows
+        an inserted child, and never uses the editor as a checked parent.
+        """
+        parents = fence["outside_parents"]
+        if len(parents) > self._OUTSIDE_MAX_PARENTS:
+            raise HybridWorkerError("hybrid_group_adjacency_unproven")
+        call = self._composer_read
+        producer = getattr(self.handler.transport, "cached_direct_adjacency", None)
+        if not opening and callable(producer):
+            from .raw_adjacency import RawAdjacencyError
+            try:
+                return producer(parents, read=call, max_parents=self._OUTSIDE_MAX_PARENTS,
+                                max_edges=self._OUTSIDE_MAX_EDGES)
+            except RawAdjacencyError:
+                raise HybridWorkerError("hybrid_group_adjacency_unproven") from None
+            # Unknown native failures propagate. Never reanchor/refind or
+            # fall back to another provider traversal after a failed read.
+        edges, seen_parents, seen_children, edge_count = [], set(), set(), 0
+        for parent in parents:
+            if opening:
+                # Unknown wrappers may not fall back to a new provider walk.
+                if reads._owned or reads.index.indexed_children(parent) is None:
+                    raise HybridWorkerError("hybrid_group_adjacency_unproven")
+            parent_id = call(lambda: reads.runtime(parent))
+            if len(parent_id) > 64 or parent_id in seen_parents:
+                raise HybridWorkerError("hybrid_group_adjacency_unproven")
+            seen_parents.add(parent_id)
+            children = call(lambda: reads.children(parent))
+            edge_count += len(children)
+            if edge_count > self._OUTSIDE_MAX_EDGES:
+                raise HybridWorkerError("hybrid_group_adjacency_unproven")
+            child_ids = []
+            for child in children:
+                rid = call(lambda: reads.runtime(child))
+                if len(rid) > 64 or rid in seen_children:
+                    raise HybridWorkerError("hybrid_group_adjacency_unproven")
+                seen_children.add(rid)
+                child_ids.append(rid)
+            edges.append((parent_id, tuple(child_ids)))
+        return tuple(edges)
 
     def _edges(self, controls, reads):
         # Direct-child membership on the critical controls' parent paths detects
@@ -976,32 +1208,58 @@ class WindowsHybridCurrentChatPort:
             raise HybridWorkerError("target_drift")
         # snapshot has just established this opening proof in the same phase.
         # Input guards do not get this exception, and always read both sides.
+        cached_groups = callable(getattr(self.handler.transport, "cached_outside_proof", None))
+        if fence.get("prepare_refresh") and not cached_groups:
+            raise HybridWorkerError("hybrid_group_adjacency_unproven")
         if not opening_certified:
             with _BoundaryReads() as reads:
-                if (self._properties(fence, reads) != fence["properties"]
+                if (self._properties(fence, reads, static_groups=not cached_groups) != fence["properties"]
                         or self._edges(fence["parents"], reads) != fence["edges"]):
                     raise HybridWorkerError("target_drift")
                 self._tail(fence["messages"], reads)
         # Decoder values are fresh even relative to the opening property scan:
         # a same-key edit/direction change must not inherit that scan's values.
+        bubbles = None
         with _BoundaryReads() as reads:
-            if messages and semantic_sequence_digest(self._region_bubbles(
-                    fence["messages"], fence["properties"][3], reads=reads)) != fence["sequence"]:
+            if messages:
+                bubbles = self._region_bubbles(fence["messages"], fence["properties"][3], reads=reads)
+            if messages and semantic_sequence_digest(bubbles) != fence["sequence"]:
                 raise HybridWorkerError("stale_context")
-        if not composer_check(read_composer_text(fence["composer"])):
+        text = read_composer_text(fence["composer"])
+        if not composer_check(text):
             raise HybridWorkerError("composer_drift")
+        # A class-only probe cannot see a new descendant inserted into an
+        # otherwise unchanged outside branch. Check all original adjacency
+        # without traversing the new tree or accepting a replacement baseline.
+        # Keep its index separate: the following original critical proof must
+        # remain independently fresh after this potentially slower scan.
+        classes = self._outside_proof(fence) if cached_groups else None
+        if not cached_groups:
+            with _BoundaryReads() as reads:
+                if self._outside_adjacency(fence, reads) != fence["outside_edges"]:
+                    raise HybridWorkerError("target_drift")
         # Region reads may yield to native providers. Re-read identity and
         # control/foreground/process/cancellation after the final content read.
+        if fence.get("prepare_refresh"):
+            with _BoundaryReads() as reads:
+                self._verify_prepare_selectors(fence, classes, reads)
         with _BoundaryReads() as reads:
-            if (self._properties(fence, reads) != fence["properties"]
+            if (self._properties(fence, reads, static_groups=not cached_groups) != fence["properties"]
                     or self._edges(fence["parents"], reads) != fence["edges"]
-                    or self.handler.surface.snapshot(self.config.navigation.window) != fence["surface"]
-                    or self.handler._guard(target).model_dump(exclude={"published_at"}) != fence["guard"].model_dump(exclude={"published_at"})):
+                    or self.handler.surface.snapshot(self.config.navigation.window) != fence["surface"]):
+                raise HybridWorkerError("target_drift")
+            final_guard = self.handler._guard(target)
+            if final_guard.model_dump(exclude={"published_at"}) != fence["guard"].model_dump(exclude={"published_at"}):
                 raise HybridWorkerError("target_drift")
             self._tail(fence["messages"], reads)
+        # These are this boundary's actual content reads, never timestamped
+        # copies of the opening snapshot. Owned refresh cannot renew identity.
+        return bubbles, text, final_guard
 
     def snapshot(self, target):
         from .guest_composer import read_composer_text
+        if self.mode == "owned" and self._prepare_fence is not None:
+            return self._refresh_prepare_snapshot(target)
         self.discard_fence()
         handler, nav = self.handler, self.config.navigation
         guard = handler._guard(target)
@@ -1023,6 +1281,7 @@ class WindowsHybridCurrentChatPort:
                 fence["edges"] = self._edges(fence["parents"], reads)
                 properties = fence["properties"] = self._properties(fence, reads)
                 self._partition_composer(fence, phase.root, reads)
+                fence["outside_edges"] = self._outside_adjacency(fence, reads, opening=True)
                 self._tail(fence["messages"], reads)
                 bubbles = self._region_bubbles(fence["messages"], properties[3], reads=reads)
             text = read_composer_text(fence["composer"])
@@ -1030,6 +1289,12 @@ class WindowsHybridCurrentChatPort:
             fence["sequence"] = semantic_sequence_digest(bubbles)
             # Exactly one full tree phase, followed by uncached critical reads.
             self._check_fence(target, fence, composer_check=lambda value: value == text, opening_certified=True)
+        snapshot = self._snapshot_from_fence(target, fence, bubbles, text, guard)
+        self._pending_fence = fence
+        return snapshot
+
+    def _snapshot_from_fence(self, target, fence, bubbles, text, guard):
+        properties = fence["properties"]
         witness = CurrentChatWitness(**{f: getattr(guard, f) for f in (
             "run_id", "session_epoch", "surface_epoch", "worker_epoch", "observation_epoch", "desktop_lease_id",
             "control_revision", "process_id", "process_started_at_100ns", "window_handle")},
@@ -1039,8 +1304,22 @@ class WindowsHybridCurrentChatPort:
             header_digest=properties[2], selected_row_runtime_id_hash=properties[0], selected_row_selection_source=properties[1],
             selected_row_candidate_count=1, active_chat_structure_digest=properties[3], conversation_type="direct",
             group_marker_probe_complete=True, group_marker_count=0, latest_tail=True, composer_empty=text == "")
-        self._pending_fence = fence
         return HybridSnapshot(witness, bubbles, text)
+
+    def _refresh_prepare_snapshot(self, target):
+        fence = self._prepare_fence
+        try:
+            if self._prepare_owner is None or self._prepare_owner[2] != target or self._prepare_refreshes >= 2:
+                raise HybridWorkerError("hybrid_input_fence_missing")
+            bubbles, text, guard = self._check_fence(target, fence, composer_check=lambda value: True)
+            snapshot = self._snapshot_from_fence(target, fence, bubbles, text, guard)
+            self._prepare_refreshes += 1
+            fence["composer_text"] = text
+            self._pending_fence = fence
+            return snapshot
+        except BaseException:
+            self.discard_fence()
+            raise
 
     def capture(self, target, frame, expectation, *, deadline_at):
         from messenger_ai.adapters.qq.navigation.profile_verifier import capture_profile_acquisition
@@ -1065,10 +1344,26 @@ class WindowsHybridCurrentChatPort:
 
     def _take_fence(self):
         fence = self._pending_fence
-        self.discard_fence()
+        self._pending_fence = None
         if fence is None:
             raise HybridWorkerError("hybrid_input_fence_missing")
         return fence
+
+    def _focused_scope(self, target, fence):
+        """Cheap existing-focus scope only; never a substitute for input proof."""
+        call = self._composer_read
+        guard = call(lambda: self.handler._guard(target))
+        if (guard.model_dump(exclude={"published_at"}) != fence["guard"].model_dump(exclude={"published_at"})
+                or call(lambda: self.handler.surface.snapshot(self.config.navigation.window)) != fence["surface"]):
+            raise HybridWorkerError("target_drift")
+        admitted = call(lambda: self.handler.transport._guest_scope(self.config.navigation.window))
+        after = call(lambda: self.handler._guard(target))
+        if after.model_dump(exclude={"published_at"}) != fence["guard"].model_dump(exclude={"published_at"}):
+            raise HybridWorkerError("target_drift")
+        return admitted
+
+    def set_prepare_input_observer(self, observer):
+        self._prepare_input_observer = observer
 
     def write(self, target, text, *, before_action):
         from .guest_composer import get_uia_pattern, write_with_text_pattern, write_with_value_pattern
@@ -1083,9 +1378,12 @@ class WindowsHybridCurrentChatPort:
         writer = write_with_value_pattern if pattern is not None and not bool(getattr(pattern, "IsReadOnly", True)) else write_with_text_pattern
         def scope():
             self._check_fence(target, fence, composer_check=lambda value: text.startswith(value))
-            return self.handler.transport._guest_scope(self.config.navigation.window)
+            return self._composer_read(lambda: self.handler.transport._guest_scope(self.config.navigation.window))
+        options = {"defer_last_batch_postcheck": True} if writer is write_with_text_pattern else {}
         writer(control, text, scope_guard=scope,
-               focus_guard=lambda c: self.handler.transport._composer_focused(c, self.config.navigation.window))
+               focus_guard=lambda c: self._composer_read(lambda: self.handler.transport._composer_focused(c, self.config.navigation.window)),
+               focused_scope_guard=lambda: self._focused_scope(target, fence),
+               before_input=getattr(self, "_prepare_input_observer", None), **options)
 
     def send(self, target, *, before_action):
         from .guest_composer import get_uia_pattern
@@ -1114,7 +1412,8 @@ class WindowsHybridCurrentChatPort:
         before_action()
         def scope():
             self._check_fence(target, fence, composer_check=lambda value: value in ("", text), messages=False)
-            return self.handler.transport._guest_scope(self.config.navigation.window)
+            return self._composer_read(lambda: self.handler.transport._guest_scope(self.config.navigation.window))
         clear_with_local_selection(fence["composer"], clear_action=_select_all_delete,
             expected_text=text, scope_guard=scope,
-            focus_guard=lambda c: self.handler.transport._composer_focused(c, self.config.navigation.window))
+            focus_guard=lambda c: self._composer_read(lambda: self.handler.transport._composer_focused(c, self.config.navigation.window)),
+            focused_scope_guard=lambda: self._focused_scope(target, fence))

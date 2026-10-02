@@ -255,6 +255,20 @@ class WindowsUIAQQAccessibility:
                 result.append(QQWindow(process_id=pid, window_handle=handle, class_name=str(getattr(control, "ClassName", "")), title=str(getattr(control, "Name", ""))))
         return result
 
+    def cached_direct_adjacency(self, controls, *, read, max_parents, max_edges):
+        """Fetch one fresh shallow cache per frozen parent, using our walker view."""
+        from .raw_adjacency import cached_direct_adjacency
+
+        return cached_direct_adjacency(controls, auto=self._auto, read=read,
+                                      max_parents=max_parents, max_edges=max_edges)
+
+    def cached_outside_proof(self, controls, *, read, max_parents, max_edges):
+        """Return fresh ordered edges and same-cache parent RuntimeId/classes."""
+        from .raw_adjacency import cached_outside_proof
+
+        return cached_outside_proof(controls, auto=self._auto, read=read,
+                                    max_parents=max_parents, max_edges=max_edges)
+
     def tree_digest(self, window: QQWindow) -> str:
         control = self._window(window)
         rows = []

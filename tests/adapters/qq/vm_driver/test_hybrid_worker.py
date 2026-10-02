@@ -1126,17 +1126,17 @@ def test_complete_index_and_decoder_deduplicate_actual_provider_reads(counted_na
     # independently read once, rather than visiting each row's shared ancestors.
     assert sum(node.reads["GetParentControl"] for node in transport.all_nodes) == 0
     for node in (transport.root, transport.sidebar, transport.chat):
-        assert node.reads["GetChildren"] == 2
-        assert node.reads["GetRuntimeId"] == 2
+        assert node.reads["GetChildren"] == 3  # Opening, adjacency, final independent critical fence.
+        assert node.reads["GetRuntimeId"] == 3
     for node in (transport.controls["header"], transport.controls["composer"], transport.rows[0]):
         assert node.reads["ClassName"] == 2  # Complete opening + independent closing.
-        assert node.reads["GetRuntimeId"] == 2
+        assert node.reads["GetRuntimeId"] == 3
     # The real decoder revisits message descendants and each text leaf. Each
     # native value is fetched once in the baseline, once in the new decode,
     # and ClassName once more by the final independent group/identity fence.
     for node in (*transport.message_rows, *transport.content_nodes, *transport.leaves):
         assert node.reads["ClassName"] == 3
-        assert node.reads["GetChildren"] == 2
+        assert node.reads["GetChildren"] == 3  # Opening, fresh decode, then complete outside adjacency.
     for node in (*transport.message_rows, *transport.leaves):
         assert node.reads["ControlTypeName"] == 2
     assert all(node.reads["ControlTypeName"] == 1 for node in transport.content_nodes)
@@ -1154,7 +1154,7 @@ def test_complete_index_values_are_not_reused_in_next_snapshot(counted_native):
     second = port.snapshot(target)
     assert first.bubbles[-1].text == "synthetic-15" and second.bubbles[-1].text == "fresh next command"
     assert transport.leaves[-1].reads["Name"] == 2
-    assert transport.root.reads["GetChildren"] == 2 and transport.phases == 2
+    assert transport.root.reads["GetChildren"] == 3 and transport.phases == 2
     assert all(not phase.active for phase in transport.indices)
 
 
@@ -1276,6 +1276,731 @@ def test_actual_health_only_proves_fixed_native_window_without_uia_tree(native):
     assert transport.phases == 0 and transport.inputs == []
 
 
+class RetiredUIAElement(RuntimeError):
+    hresult = -2147220991
+
+
+class ComposerDOMNode(CountedUIANode):
+    """Provider-shaped element that becomes unreadable when Chromium drops it."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.available, self.process_id, self.runtime_value = True, 123, [1, self.rid]
+
+    def read(self, name, value):
+        if not self.available:
+            self.reads["retired_access"] += 1
+            raise RetiredUIAElement()
+        return super().read(name, value)
+
+    ProcessId = property(lambda self: self.read("ProcessId", self.process_id))
+
+    def GetRuntimeId(self):
+        return self.read("GetRuntimeId", self.runtime_value)
+
+
+@pytest.fixture
+def cold_text_dom(cold_native, native, monkeypatch):
+    """Actual cold core/port/TextPattern/Unicode batching over a changing DOM."""
+    from messenger_ai.adapters.qq.vm_driver import guest_composer
+    worker, port, transport, old_request, events = cold_native
+    composer = transport.controls["composer"]
+    body = "PMAI-V2-DRAFT-" + str(uuid4())
+    assert len(body) == 50
+    request = DraftPreparationRequest.model_validate(old_request.model_copy(update={
+        "body": body, "body_hash": hashlib.sha256(body.encode()).hexdigest()}).model_dump())
+    placeholder = ComposerDOMNode(700, "placeholder", control_type="TextControl")
+    placeholder.parent = composer
+    outside = ComposerDOMNode(799, "outside")
+    outside.parent = transport.root
+    transport.controls["outside"] = outside
+    dom = SimpleNamespace(children=[placeholder], nodes=[placeholder], after_chunk=None,
+        placeholder=placeholder, outside=outside, clears=0, text_reads=0, adjacency_calls=[])
+    adjacency = port._outside_adjacency
+    def counted_adjacency(fence, reads, *, opening=False):
+        dom.adjacency_calls.append(opening)
+        return adjacency(fence, reads, opening=opening)
+    port._outside_adjacency = counted_adjacency
+    composer.GetChildren = lambda: list(dom.children)
+    composer.GetValuePattern = lambda: None
+
+    def get_text(length):
+        assert length == -1
+        dom.text_reads += 1
+        return transport.body if transport.body else guest_composer.EMPTY_PLACEHOLDER + "\n"
+    composer.GetTextPattern = lambda: SimpleNamespace(DocumentRange=SimpleNamespace(GetText=get_text))
+
+    def replace_children(*, empty=False):
+        for node in dom.nodes:
+            node.available = False
+        if empty:
+            child = ComposerDOMNode(710, "placeholder", control_type="TextControl")
+            child.parent = composer
+            dom.children = [child]
+            dom.nodes = [child]
+        else:
+            leaf = ComposerDOMNode(702, "", control_type="TextControl")
+            group = ComposerDOMNode(701, "paragraph", children=(leaf,))
+            group.parent = composer
+            dom.children = [group]
+            dom.nodes = [group, leaf]
+    dom.replace_children = replace_children
+
+    def send_inputs(inputs):
+        assert worker._prepared is not None and worker._prepared.request == request
+        assert worker._prepared.ticket is None and not worker._prepared.commit_attempted
+        assert all(event.type == 1 and event.u.ki.dwFlags & 4 for event in inputs)
+        chunk = "".join(chr(event.u.ki.wScan) for event in inputs if not event.u.ki.dwFlags & 2)
+        transport.inputs.append(("unicode", chunk))
+        transport.body += chunk
+        composer.ClassName = "ProseMirror ExEditor-qq-msg-editor ProseMirror-focused"
+        if len(transport.inputs) == 1:
+            assert len(transport.body) == 32
+            replace_children()
+        if dom.after_chunk:
+            dom.after_chunk(len(transport.inputs))
+    monkeypatch.setattr(guest_composer, "_send_inputs", send_inputs)
+
+    def clear():
+        assert worker._prepared is not None and worker._prepared.request == request
+        assert not worker._prepared.commit_attempted and transport.body == request.body
+        dom.clears += 1
+        transport.body = ""
+        replace_children(empty=True)
+        composer.ClassName = "ProseMirror is-empty ExEditor-qq-msg-editor ProseMirror-focused"
+        events.append("owned-clear")
+    monkeypatch.setattr(guest_composer, "_select_all_delete", clear)
+    return worker, port, transport, request, events, dom, native
+
+
+@pytest.mark.parametrize("owner_kind", ["request", "ticket"])
+def test_text_batches_rebuild_only_strict_composer_dom_and_abort_exact_owner(cold_text_dom, owner_kind, monkeypatch):
+    from messenger_ai.adapters.qq.vm_driver.phase_index import UIAPhaseIndex
+    original_nodes = UIAPhaseIndex.nodes
+    def scoped_nodes(index):
+        assert index.root is not None, "fresh boundary must not materialize a whole phase tree"
+        return original_nodes(index)
+    monkeypatch.setattr(UIAPhaseIndex, "nodes", scoped_nodes)
+    worker, port, transport, request, events, dom, _ = cold_text_dom
+    ticket = worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert transport.inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+    assert transport.body == request.body and worker._prepared.ticket == ticket
+    assert not dom.placeholder.available and dom.placeholder.reads["retired_access"] == 0
+    assert transport.phases == 4  # The core's original cold snapshots; input scopes add none.
+    assert dom.adjacency_calls.count(True) == 4 and dom.adjacency_calls.count(False) == 9
+    assert dom.text_reads > 2 and events == ["profile"]
+    assert worker._prepared.operation_id is None and not worker._prepared.commit_attempted
+    current_nodes = tuple(dom.nodes)
+    result = worker.abort_draft(request if owner_kind == "request" else ticket, deadline_at=request.deadline_at)
+    assert result.status == "cleaned" and worker._prepared is None and transport.body == ""
+    assert dom.clears == 1 and all(not node.available and node.reads["retired_access"] == 0 for node in current_nodes)
+    assert events == ["profile", "owned-clear"] and port._pending_fence is None
+    assert transport.phases == 6  # Original pre/post-abort snapshots only.
+    assert dom.adjacency_calls.count(True) == 6 and dom.adjacency_calls.count(False) == 14
+    # No descendant Name/Text/Value pattern was read by a group/scope probe.
+    assert all(node.reads["Name"] == 0 for node in (*current_nodes, dom.placeholder, *dom.nodes))
+    assert transport.inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+
+
+def test_frozen_outside_element_failure_is_not_treated_as_editable_dom(cold_text_dom):
+    worker, _, transport, request, _, dom, _ = cold_text_dom
+    dom.after_chunk = lambda _: setattr(dom.outside, "available", False)
+    with pytest.raises(HybridWorkerError, match="hybrid_ui_action_failed") as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert error.value.cleanup_required and worker._prepared.ticket is None
+    assert transport.body == request.body[:32] and dom.clears == 0
+    diagnostic = error.value.prepare_failure
+    assert diagnostic == worker.last_prepare_failure
+    assert diagnostic.stage == "write" and diagnostic.input_attempted is True and diagnostic.ticket_known is False
+    assert diagnostic.code == "hybrid_ui_action_failed" and diagnostic.deadline_at == request.deadline_at
+    assert diagnostic.deadline_monotonic_ns == request.deadline_monotonic_ns
+    assert diagnostic.remaining_monotonic_ns == request.deadline_monotonic_ns - diagnostic.observed_monotonic_ns
+    assert request.body not in diagnostic.model_dump_json() and request.body_hash not in diagnostic.model_dump_json()
+    assert dom.outside.reads["retired_access"] == 1 and dom.placeholder.reads["retired_access"] == 0
+    assert transport.inputs == [("unicode", request.body[:32])]
+
+
+def test_prepare_failure_before_native_input_is_known_false_and_keeps_original_owner(cold_text_dom, monkeypatch):
+    worker, port, transport, request, _, _, _ = cold_text_dom
+    original = port._check_fence
+    def reject(target, fence, **kwargs):
+        if port.mode == "owned":
+            raise HybridWorkerError("target_drift")
+        return original(target, fence, **kwargs)
+    monkeypatch.setattr(port, "_check_fence", reject)
+    with pytest.raises(HybridWorkerError, match="target_drift") as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    diagnostic = error.value.prepare_failure
+    assert diagnostic.input_attempted is False and diagnostic.stage == "before_write" and not diagnostic.ticket_known
+    assert transport.inputs == [] and transport.body == "" and worker._prepared is not None
+    assert getattr(port, "_prepare_input_observer") is None
+
+
+def test_uninstrumented_port_failure_reports_unknown_input_instead_of_guessing(rig):
+    worker, port, request = rig
+    def fail():
+        raise HybridWorkerError("target_drift")
+    port.write_hook = fail
+    with pytest.raises(HybridWorkerError, match="target_drift") as error:
+        prepare(rig)
+    assert error.value.prepare_failure.input_attempted is None and port.writes == 0
+    assert error.value.prepare_failure.stage == "before_write"
+
+
+def test_real_profile_window_failure_preserves_first_code_without_input(rig, report, monkeypatch):
+    worker, port, request = rig
+    report["acquisition"]["profile_window_handle"] = port.base_frame.window_handle
+
+    def capture(*args, **kwargs):
+        assert kwargs["deadline_at"] <= request.deadline_at
+        return parse(report)  # The actual strict acquisition parser rejects this HWND.
+
+    monkeypatch.setattr(port, "capture", capture)
+    with pytest.raises(HybridWorkerError, match="identity_profile_window_mismatch") as error:
+        prepare(rig)
+
+    diagnostic = error.value.prepare_failure
+    assert diagnostic.code == "identity_profile_window_mismatch" and diagnostic.stage == "identity"
+    assert diagnostic.input_attempted is False and diagnostic.ticket_known is False
+    assert diagnostic.requested_at == request.requested_at and diagnostic.deadline_at == request.deadline_at
+    assert diagnostic.requested_monotonic_ns == request.requested_monotonic_ns
+    assert diagnostic.deadline_monotonic_ns == request.deadline_monotonic_ns
+    assert port.writes == port.sends == port.clears == 0 and worker._prepared is None
+    assert request.body not in diagnostic.model_dump_json() and request.body_hash not in diagnostic.model_dump_json()
+
+
+@pytest.mark.parametrize("helper_stage,helper_code", [("header", "ACTIVE_HEADER_AMBIGUOUS"),
+                                                      ("profile", "PROFILE_WINDOW_AMBIGUOUS")])
+def test_real_capture_helper_error_keeps_finite_metadata_and_original_public_error(rig, monkeypatch, helper_stage, helper_code):
+    import json
+    import subprocess
+    from messenger_ai.adapters.qq.navigation.profile_verifier import capture_profile_acquisition
+    from tests.adapters.qq.vm_driver.test_profile_capture import reports, Store
+    worker, port, request = rig
+    header = reports()[0]
+    header.update(process_id=123, window_handle=456, active_header_digest="f"*64,
+                  right_region_structure_digest="e"*64)
+    calls = []
+    def runner(command, **kwargs):
+        stage = "header" if "--inspect-guest-current-header" in command else "profile"
+        calls.append(stage)
+        port.advance(.25)
+        assert kwargs["timeout"] <= (request.deadline_at - request.requested_at).total_seconds()
+        failed = stage == helper_stage
+        payload = {"succeeded": False, "status": helper_code, "private_body": request.body} if failed else header
+        return subprocess.CompletedProcess(command, 1 if failed else 0, json.dumps(payload).encode(), b"private stderr")
+    def capture(*args, **kwargs):
+        return capture_profile_acquisition(worker.config.helper_path, pid=123, hwnd=456,
+            vault=worker.config.vault_path, environment_fingerprint="e"*64, selector_pack_version="selectors",
+            deadline=kwargs["deadline_at"], runner=runner, secret_store=Store(),
+            clock=lambda: port.now, monotonic=lambda: port.tick / NS)
+    monkeypatch.setattr(port, "capture", capture)
+    with pytest.raises(HybridWorkerError, match="^hybrid_ui_action_failed$") as error:
+        prepare(rig)
+    value = error.value.prepare_failure
+    assert value.code == "hybrid_ui_action_failed" and value.stage == "identity"
+    assert value.helper_code == helper_code and value.helper_stage == helper_stage
+    assert value.input_attempted is False and value.ticket_known is False
+    assert value.deadline_at == request.deadline_at and value.deadline_monotonic_ns == request.deadline_monotonic_ns
+    assert calls == (["header"] if helper_stage == "header" else ["header", "profile"])
+    assert port.writes == port.sends == port.clears == 0 and worker._prepared is None
+    assert request.body not in value.model_dump_json() and "private stderr" not in value.model_dump_json()
+    assert not set(type(value).model_fields) & {"diagnostic", "stdout", "stderr", "profile_id_hmac"}
+
+
+@pytest.mark.parametrize("known_code,plain_stage", [(False, True), (True, False)])
+def test_capture_error_unknown_code_or_untrusted_diagnostic_is_sanitized(rig, monkeypatch, known_code, plain_stage):
+    from messenger_ai.adapters.qq.vm_driver.profile_identity import ProfileCaptureError
+    worker, port, _ = rig
+    class UntrustedDict(dict):
+        def get(self, *args):
+            pytest.fail("must not invoke an arbitrary diagnostic mapping")
+    exc = ProfileCaptureError("HELPER_TIMEOUT" if known_code else "private_body",
+        {"stage": "profile"} if plain_stage else UntrustedDict(stage="profile", stdout="private_body"))
+    def capture(*args, **kwargs):
+        raise exc
+    monkeypatch.setattr(port, "capture", capture)
+    with pytest.raises(HybridWorkerError, match="^hybrid_ui_action_failed$") as error:
+        prepare(rig)
+    value = error.value.prepare_failure
+    assert value.helper_code == ("HELPER_TIMEOUT" if known_code else None) and value.helper_stage is None
+    assert "private_body" not in value.model_dump_json() and port.writes == port.sends == 0
+
+
+@pytest.mark.parametrize("fault", ["group", "class", "type", "pid", "pid_bool", "rid_empty", "rid_bool",
+    "rid_long", "duplicate_rid", "outside_alias", "critical_alias", "parent", "parent_pid", "cycle", "count", "depth"])
+def test_rebuilt_composer_tree_metadata_and_membership_are_closed(cold_text_dom, fault):
+    worker, _, transport, request, _, dom, _ = cold_text_dom
+    def change(_):
+        group, leaf = dom.nodes
+        if fault == "group":
+            leaf.class_name = "group-member-list"
+        elif fault == "class":
+            leaf.class_name = None
+        elif fault == "type":
+            leaf.control_type = "UnknownControl"
+        elif fault in {"pid", "pid_bool"}:
+            leaf.process_id = 987 if fault == "pid" else True
+        elif fault.startswith("rid_"):
+            leaf.runtime_value = {"rid_empty": [], "rid_bool": [True, 702], "rid_long": list(range(65))}[fault]
+        elif fault == "duplicate_rid":
+            leaf.runtime_value = group.runtime_value
+        elif fault == "outside_alias":
+            leaf.runtime_value = dom.outside.runtime_value
+        elif fault == "critical_alias":
+            leaf.runtime_value = transport.controls["header"].GetRuntimeId()
+        elif fault == "parent":
+            leaf.parent = transport.root
+        elif fault == "parent_pid":
+            leaf.parent = ComposerDOMNode(701, "paragraph")
+            leaf.parent.process_id = 987
+        elif fault == "cycle":
+            leaf.children = [group]
+        elif fault == "count":
+            group.children = [ComposerDOMNode(800 + i, "", control_type="TextControl") for i in range(257)]
+            for child in group.children:
+                child.parent = group
+        else:
+            tail = leaf
+            for i in range(33):
+                child = ComposerDOMNode(800 + i, "", control_type="TextControl")
+                child.parent = tail
+                tail.children = [child]
+                tail = child
+    dom.after_chunk = change
+    with pytest.raises(HybridWorkerError) as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert error.value.code == ("identity_conversation_not_direct" if fault == "group" else
+        "identity_chat_correlation_unproven" if fault in {"rid_empty", "rid_bool"} else "hybrid_composer_scope_unproven")
+    assert error.value.cleanup_required and worker._prepared.ticket is None
+    assert transport.body == request.body[:32] and dom.clears == 0
+    assert transport.inputs == [("unicode", request.body[:32])]
+    assert dom.placeholder.reads["retired_access"] == 0
+
+
+@pytest.mark.parametrize("critical", ["row", "header", "bubbles", "send"])
+def test_initial_graph_cannot_exempt_a_critical_control_as_composer_descendant(native, critical):
+    port, transport, target, *_ = native
+    composer, node = transport.controls["composer"], transport.controls[critical]
+    transport.root.GetChildren = lambda: [value for key, value in transport.controls.items() if key != critical]
+    composer.GetChildren = lambda: [node]
+    node.GetParentControl = lambda: composer
+    with pytest.raises(HybridWorkerError, match="hybrid_composer_scope_unproven"):
+        port.snapshot(target)
+    assert transport.inputs == [] and port._pending_fence is None
+
+
+def test_initial_full_tree_group_probe_still_includes_composer_placeholder(cold_text_dom):
+    worker, _, transport, request, events, dom, _ = cold_text_dom
+    dom.placeholder.class_name = "group-member-list"
+    with pytest.raises(HybridWorkerError, match="identity_conversation_not_direct") as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert not error.value.cleanup_required and worker._prepared is None
+    assert transport.inputs == [] and events == [] and transport.body == ""
+
+
+@pytest.mark.parametrize("kind", _INTERLEAVES)
+def test_dom_replacement_does_not_hide_original_identity_body_or_control_change(cold_text_dom, kind):
+    worker, _, transport, request, _, dom, native = cold_text_dom
+    dom.after_chunk = lambda _: mutate_native(native, kind)
+    with pytest.raises(HybridWorkerError) as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert error.value.cleanup_required and worker._prepared.ticket is None
+    assert transport.inputs == [("unicode", request.body[:32])] and dom.clears == 0
+    assert transport.body == ("human draft" if kind == "draft" else request.body[:32])
+    assert dom.placeholder.reads["retired_access"] == 0
+
+
+@pytest.mark.parametrize("change", ["utc", "monotonic", "revoked"])
+def test_composer_probe_checks_remaining_time_and_revoke_at_each_native_read(cold_text_dom, change):
+    worker, port, transport, request, _, dom, native = cold_text_dom
+    def after_input(_):
+        def during_property(name, count):
+            if name != "ClassName":
+                return
+            if change == "utc":
+                port.deadline = datetime.now(UTC) - timedelta(microseconds=1)
+            elif change == "monotonic":
+                port.stop_at = time.monotonic() - 1
+            else:
+                native[-1].set()
+        dom.nodes[-1].hook = during_property
+    dom.after_chunk = after_input
+    with pytest.raises(HybridWorkerError, match="hybrid_revoked") as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert error.value.cleanup_required and worker._prepared.ticket is None
+    assert transport.inputs == [("unicode", request.body[:32])] and transport.body == request.body[:32]
+    assert dom.clears == 0 and dom.placeholder.reads["retired_access"] == 0
+
+
+@pytest.mark.parametrize("site", ["container", "empty_leaf"])
+@pytest.mark.parametrize("change", ["insert", "insert_plain", "delete", "order", "replace", "class_group"])
+def test_complete_outside_adjacency_detects_changes_without_walking_new_tree(native, site, change):
+    port, transport, target, *_ = native
+    first, second = ComposerDOMNode(810, "first"), ComposerDOMNode(811, "second")
+    outside = ComposerDOMNode(809, "outside", children=(first, second))
+    outside.parent = transport.root
+    transport.controls["outside"] = outside
+    inserted = ComposerDOMNode(812, "group-member-list" if change == "insert" else "plain")
+    parent = outside if site == "container" else first
+    # For deletion/order/replacement the previously empty leaf becomes a
+    # baseline container; insertion/class mutations retain its empty shape.
+    if site == "empty_leaf" and change in {"delete", "order", "replace"}:
+        parent.children = [ComposerDOMNode(813, "a"), ComposerDOMNode(814, "b")]
+        for child in parent.children:
+            child.parent = parent
+    def mutate():
+        if transport.region_reads != 2:
+            return
+        if change.startswith("insert"):
+            inserted.parent = parent
+            parent.children.append(inserted)
+        elif change == "delete":
+            parent.children.pop()
+        elif change == "order":
+            parent.children.reverse()
+        elif change == "replace":
+            inserted.parent = parent
+            parent.children[0] = inserted
+        else:
+            parent.class_name = "group-member-list"
+    transport.read_hook = mutate
+    with pytest.raises(HybridWorkerError, match="identity_conversation_not_direct" if change == "class_group" else "target_drift"):
+        port.snapshot(target)
+    assert transport.inputs == [] and port._pending_fence is None and transport.phases == 1
+    assert inserted.reads["GetChildren"] == inserted.reads["ClassName"] == inserted.reads["ControlTypeName"] == 0
+    assert inserted.reads["GetRuntimeId"] <= 1
+
+
+def test_outside_adjacency_reads_each_frozen_parent_and_runtime_once_per_boundary(counted_native, monkeypatch):
+    from messenger_ai.adapters.qq.vm_driver.hybrid_worker import _BoundaryReads
+    from messenger_ai.adapters.qq.vm_driver.phase_index import UIAPhaseIndex
+    port, transport, target, *_ = counted_native
+    port.snapshot(target)
+    fence = port._pending_fence
+    expected_parents = tuple(node for node in transport.all_nodes if node is not transport.controls["composer"])
+    assert {id(node) for node in fence["outside_parents"]} == {id(node) for node in expected_parents}
+    for node in transport.all_nodes:
+        node.reads.clear()
+    def no_phase(_):
+        raise AssertionError("adjacency must not materialize a new phase")
+    monkeypatch.setattr(UIAPhaseIndex, "nodes", no_phase)
+    with _BoundaryReads() as reads:
+        assert port._outside_adjacency(fence, reads) == fence["outside_edges"]
+    assert all(node.reads["GetChildren"] == 1 for node in expected_parents)
+    assert transport.controls["composer"].reads["GetChildren"] == 0
+    assert all(node.reads["GetRuntimeId"] == 1 for node in transport.all_nodes)
+    assert all(node.reads["ClassName"] == node.reads["Name"] == node.reads["ControlTypeName"] == 0 for node in transport.all_nodes)
+    assert transport.phases == 1
+
+
+@pytest.mark.parametrize("method", ["GetChildren", "GetRuntimeId"])
+def test_outside_adjacency_com_failure_retains_partial_owned_body_without_replay(cold_text_dom, method):
+    worker, _, transport, request, _, dom, _ = cold_text_dom
+    def after_input(_):
+        def failed_read():
+            dom.outside.reads["native_failure"] += 1
+            raise RetiredUIAElement()
+        setattr(dom.outside, method, failed_read)
+    dom.after_chunk = after_input
+    with pytest.raises(HybridWorkerError, match="hybrid_ui_action_failed") as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert error.value.cleanup_required and worker._prepared.ticket is None
+    assert dom.outside.reads["native_failure"] == 1 and dom.placeholder.reads["retired_access"] == 0
+    assert transport.inputs == [("unicode", request.body[:32])] and transport.body == request.body[:32]
+    assert dom.clears == 0
+
+
+@pytest.mark.parametrize("change", ["utc", "monotonic", "revoked", "control", "pause"])
+def test_outside_scan_native_calls_and_following_critical_fence_preserve_original_limits(native, change):
+    port, transport, target, guard, path, revoked = native
+    outside = ComposerDOMNode(830, "outside")
+    outside.parent = transport.root
+    transport.controls["outside"] = outside
+    def during_read(name, count):
+        if name != "GetChildren" or count != 2:  # First fresh scan; opening only used its indexed graph.
+            return
+        if change == "utc":
+            port.deadline = datetime.now(UTC) - timedelta(microseconds=1)
+        elif change == "monotonic":
+            port.stop_at = time.monotonic() - 1
+        elif change == "revoked":
+            revoked.set()
+        elif change == "control":
+            path.write_text(guard.model_copy(update={"control_revision": 4}).model_dump_json(), encoding="utf-8")
+        else:
+            path.write_text(guard.model_copy(update={"paused": True}).model_dump_json(), encoding="utf-8")
+    outside.hook = during_read
+    with pytest.raises(HybridWorkerError, match={"control": "target_drift", "pause": "hybrid_paused"}.get(change, "hybrid_revoked")):
+        port.snapshot(target)
+    assert outside.reads["GetChildren"] == 2 and port._pending_fence is None
+    assert transport.inputs == [] and transport.phases == 1
+
+
+@pytest.mark.parametrize("which", ["parent", "edge"])
+def test_trusted_outside_witness_caps_reject_before_followup_native_reads(native, which):
+    from messenger_ai.adapters.qq.vm_driver.hybrid_worker import _BoundaryReads
+    port, transport, target, *_ = native
+    # Root + four ordinary controls are checked parents; composer is a child
+    # of root but its own children remain outside this immutable witness.
+    extra = [ComposerDOMNode(10000 + i, "extra") for i in range(1020 if which == "parent" else 1019)]
+    for i, node in enumerate(extra):
+        node.parent = transport.root
+        transport.controls[f"extra-{i}"] = node
+    if which == "parent":
+        with pytest.raises(HybridWorkerError, match="hybrid_group_adjacency_unproven"):
+            port.snapshot(target)
+        # The unchanged critical opening edges already read these IDs once;
+        # cap failure must not add a new child walk or native ID call.
+        assert all(node.reads["GetChildren"] == 1 and node.reads["GetRuntimeId"] == 1 for node in extra)
+    else:
+        port.snapshot(target)
+        fence = port._pending_fence
+        assert len(fence["outside_parents"]) == 1024 and sum(len(children) for _, children in fence["outside_edges"]) == 1024
+        inserted = ComposerDOMNode(20000, "plain")
+        inserted.parent = transport.root
+        transport.controls["inserted"] = inserted
+        with _BoundaryReads() as reads, pytest.raises(HybridWorkerError, match="hybrid_group_adjacency_unproven"):
+            port._outside_adjacency(fence, reads)
+        assert inserted.reads["GetRuntimeId"] == inserted.reads["GetChildren"] == 0
+    assert transport.inputs == [] and transport.phases == 1
+
+
+def test_abort_outside_insert_after_snapshot_keeps_owned_ticket_and_never_reanchors(cold_text_dom):
+    worker, port, transport, request, _, dom, _ = cold_text_dom
+    ticket = worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    clear = port.clear
+    inserted = ComposerDOMNode(850, "plain")
+    inserted.parent = dom.outside
+    def insert_then_clear(*args, **kwargs):
+        dom.outside.children.append(inserted)
+        return clear(*args, **kwargs)
+    port.clear = insert_then_clear
+    result = worker.abort_draft(ticket, deadline_at=request.deadline_at)
+    assert result.status == "cleanup_required" and result.error_code == "target_drift"
+    assert worker._prepared.ticket == ticket and transport.body == request.body and dom.clears == 0
+    assert transport.inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+    assert inserted.reads["GetChildren"] == inserted.reads["ClassName"] == 0
+
+
+def _install_decoded_inbound_region(port, transport):
+    """Use the production decoder over provider-shaped inbound message nodes."""
+    leaf = ComposerDOMNode(860, "text", name="synthetic original inbound", control_type="TextControl")
+    content = ComposerDOMNode(861, "msg-content-container container--others", children=(leaf,))
+    message = ComposerDOMNode(862, "message", children=(content,))
+    message.parent = transport.controls["bubbles"]
+    rows = [message]
+    transport.controls["bubbles"].GetChildren = lambda: list(rows)
+    del port._region_bubbles  # Remove the fixture's value stub; retain the real port and decoder.
+    return rows
+
+
+@pytest.mark.parametrize("change", ["reorder", "badge"])
+def test_other_contact_change_stable_before_abort_snapshot_allows_exact_owned_cleanup(cold_text_dom, change):
+    worker, port, transport, request, events, dom, native = cold_text_dom
+    _install_decoded_inbound_region(port, transport)
+    selected = transport.controls["row"]
+    other = ComposerDOMNode(870, "row")
+    second_other = ComposerDOMNode(871, "row")
+    sidebar = ComposerDOMNode(872, "recent-list", children=(selected, other, second_other))
+    sidebar.parent = transport.root
+    selected.GetParentControl = lambda: sidebar
+    root_siblings = tuple(node for name, node in transport.controls.items() if name != "row")
+    transport.root.GetChildren = lambda: [sidebar, *root_siblings]
+    select = transport._select
+
+    def selected_rows(root, selector):
+        if selector.name == "row":
+            tuple(transport.phase.controls())
+            return list(sidebar.children)
+        return select(root, selector)
+    transport._select = selected_rows
+    target = native[2]
+    initial = port.snapshot(target)
+    ticket = worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(initial.bubbles))
+    record = worker._prepared
+    request_json, ticket_json = record.request.model_dump_json(), ticket.model_dump_json()
+    original_binding = worker.config.bindings[0].model_dump_json()
+    original_inputs = list(transport.inputs)
+    phases = transport.phases
+    if change == "reorder":
+        sidebar.children[:] = [other, selected, second_other]
+    else:
+        badge = ComposerDOMNode(873, "unread-badge", name="1", control_type="TextControl")
+        badge.parent = other
+        other.children.append(badge)
+    # The new shape is already stable before ABORT takes its first snapshot;
+    # the original selected control and all current-chat roles stay unchanged.
+    snapshots = []
+    snapshot = port.snapshot
+    def capture_snapshot(current_target):
+        value = snapshot(current_target)
+        snapshots.append(value)
+        return value
+    port.snapshot = capture_snapshot
+    result = worker.abort_draft(ticket, deadline_at=request.deadline_at)
+    assert result.status == "cleaned" and result.error_code is None
+    assert result.reservation_id == request.reservation_id and result.nonce == request.nonce
+    assert worker._prepared is None and transport.body == "" and dom.clears == 1
+    assert transport.inputs == original_inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+    assert events == ["profile", "owned-clear"] and transport.phases == phases + 2
+    assert port._pending_fence is None and transport.active == 0
+    assert record.request.model_dump_json() == request_json and ticket.model_dump_json() == ticket_json
+    assert worker.config.bindings[0].model_dump_json() == original_binding
+    assert len(snapshots) == 2
+    for value in snapshots:
+        assert value.witness.latest_tail and value.witness.group_marker_count == 0
+        assert all(getattr(value.witness, field) == getattr(record.snapshot.witness, field) for field in (
+            "selected_row_runtime_id_hash", "header_digest", "active_chat_structure_digest"))
+    assert other.reads["Name"] == second_other.reads["Name"] == 0
+    if change == "badge":
+        assert badge.reads["ClassName"] > 0 and badge.reads["Name"] == 0
+
+
+def test_current_contact_inbound_stable_before_abort_snapshot_allows_exact_owned_cleanup(cold_text_dom):
+    worker, port, transport, request, events, dom, native = cold_text_dom
+    rows = _install_decoded_inbound_region(port, transport)
+    initial = port.snapshot(native[2])
+    ticket = worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(initial.bubbles))
+    record = worker._prepared
+    request_json, ticket_json = record.request.model_dump_json(), ticket.model_dump_json()
+    original_binding = worker.config.bindings[0].model_dump_json()
+    original_inputs, phases = list(transport.inputs), transport.phases
+    leaf = ComposerDOMNode(880, "text", name="synthetic later inbound", control_type="TextControl")
+    content = ComposerDOMNode(881, "msg-content-container container--others", children=(leaf,))
+    message = ComposerDOMNode(882, "message", children=(content,))
+    message.parent = transport.controls["bubbles"]
+    rows.append(message)
+    # A genuine decoded inbound has arrived, but the selected/header/role
+    # identity and strict native latest-tail proof remain the original ones.
+    snapshots = []
+    snapshot = port.snapshot
+    def capture_snapshot(current_target):
+        value = snapshot(current_target)
+        snapshots.append(value)
+        return value
+    port.snapshot = capture_snapshot
+    result = worker.abort_draft(ticket, deadline_at=request.deadline_at)
+    assert result.status == "cleaned" and result.error_code is None
+    assert result.reservation_id == request.reservation_id and result.nonce == request.nonce
+    assert worker._prepared is None and transport.body == "" and dom.clears == 1
+    assert transport.inputs == original_inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+    assert events == ["profile", "owned-clear"] and transport.phases == phases + 2
+    assert port._pending_fence is None and transport.active == 0
+    assert record.request.model_dump_json() == request_json and ticket.model_dump_json() == ticket_json
+    assert worker.config.bindings[0].model_dump_json() == original_binding
+    assert len(snapshots) == 2 and len(record.snapshot.bubbles) == 1
+    for value in snapshots:
+        assert len(value.bubbles) == 2 and all(b.direction is BubbleDirection.INBOUND for b in value.bubbles)
+        assert semantic_sequence_digest(value.bubbles) != ticket.expected_sequence_digest
+        assert value.witness.latest_tail and value.witness.group_marker_count == 0
+        assert all(getattr(value.witness, field) == getattr(record.snapshot.witness, field) for field in (
+            "selected_row_runtime_id_hash", "header_digest", "active_chat_structure_digest"))
+    assert leaf.reads["Name"] > 0  # The actual decoder read the new inbound, rather than a value stub.
+
+
+def fake_cached_adjacency(controls, *, read, max_parents, max_edges):
+    """Contract seam only: architecture's separate tests exercise raw COM."""
+    assert len(controls) <= max_parents
+    result, edges = [], 0
+    for parent in controls:
+        parent_id = tuple(read(parent.GetRuntimeId))
+        children = read(parent.GetChildren)
+        edges += len(children)
+        assert edges <= max_edges
+        result.append((parent_id, tuple(tuple(read(child.GetRuntimeId)) for child in children)))
+    return tuple(result)
+
+
+def test_cache_capability_is_closing_only_and_final_identity_is_independently_fresh(native):
+    port, transport, target, *_ = native
+    calls = []
+    def producer(controls, **kwargs):
+        calls.append((controls, kwargs["max_parents"], kwargs["max_edges"]))
+        result = fake_cached_adjacency(controls, **kwargs)
+        transport.controls["header"].Name = "changed while native cached scan completed"
+        return result
+    transport.cached_direct_adjacency = producer
+    with pytest.raises(HybridWorkerError, match="target_drift"):
+        port.snapshot(target)
+    assert len(calls) == 1 and calls[0][1:] == (1024, 1024)
+    assert transport.controls["composer"] not in calls[0][0]
+    assert transport.inputs == [] and transport.phases == 1
+
+
+def test_real_core_text_and_abort_pipeline_uses_optional_cached_producer(cold_text_dom):
+    worker, port, transport, request, _, dom, _ = cold_text_dom
+    calls = []
+    def producer(controls, **kwargs):
+        calls.append(controls)
+        return fake_cached_adjacency(controls, **kwargs)
+    transport.cached_direct_adjacency = producer
+    ticket = worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert len(calls) == 9 and dom.adjacency_calls.count(False) == 9 and transport.phases == 4
+    assert worker.abort_draft(ticket, deadline_at=request.deadline_at).status == "cleaned"
+    assert len(calls) == 14 and dom.adjacency_calls.count(False) == 14 and transport.phases == 6
+    assert dom.placeholder.reads["retired_access"] == 0 and dom.clears == 1 and transport.body == ""
+    assert port._pending_fence is None
+
+
+@pytest.mark.parametrize("error_kind", ["bounded", "native", "revoked"])
+def test_cached_producer_failure_cannot_fall_back_or_reanchor(native, error_kind):
+    from messenger_ai.adapters.qq.vm_driver.hybrid_worker import _BoundaryReads
+    from messenger_ai.adapters.qq.vm_driver.raw_adjacency import RawAdjacencyError
+    port, transport, target, _, _, revoked = native
+    port.snapshot(target)
+    fence, calls = port._pending_fence, []
+    def producer(controls, *, read, **kwargs):
+        calls.append(1)
+        if error_kind == "bounded":
+            raise RawAdjacencyError()
+        if error_kind == "native":
+            raise RetiredUIAElement()
+        read(lambda: revoked.set())
+        raise AssertionError("revoked read must not return")
+    transport.cached_direct_adjacency = producer
+    def no_slow_read(*_):
+        raise AssertionError("native cache failure must not cause a slow traversal")
+    with _BoundaryReads() as reads:
+        reads.children = reads.runtime = no_slow_read
+        if error_kind == "native":
+            with pytest.raises(RetiredUIAElement):
+                port._outside_adjacency(fence, reads)
+        else:
+            with pytest.raises(HybridWorkerError, match="hybrid_group_adjacency_unproven" if error_kind == "bounded" else "hybrid_revoked"):
+                port._outside_adjacency(fence, reads)
+    assert calls == [1] and transport.inputs == [] and transport.phases == 1
+
+
+@pytest.mark.parametrize("stage", ["focus", "last_input"])
+@pytest.mark.parametrize("change", ["utc", "monotonic", "revoked", "foreground", "control"])
+def test_optimized_focus_and_terminal_postproof_preserve_native_fences(cold_text_dom, stage, change):
+    worker, port, transport, request, _, dom, native = cold_text_dom
+    def invalidate():
+        if change == "utc":
+            port.deadline = datetime.now(UTC) - timedelta(microseconds=1)
+        elif change == "monotonic":
+            port.stop_at = time.monotonic() - 1
+        elif change == "revoked":
+            native[-1].set()
+        else:
+            mutate_native(native, change)
+    if stage == "focus":
+        def focus(*_):
+            invalidate()
+            return True
+        transport._composer_focused = focus
+    else:
+        dom.after_chunk = lambda count: invalidate() if count == 2 else None
+    with pytest.raises(HybridWorkerError) as error:
+        worker.prepare_draft(request, expected_sequence_digest=semantic_sequence_digest(tuple(transport.bubbles)))
+    assert error.value.cleanup_required and worker._prepared.ticket is None and dom.clears == 0
+    if stage == "focus":
+        assert transport.inputs == [] and transport.body == ""
+    else:
+        assert transport.inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+        assert transport.body == request.body
+
+
 def test_paused_health_is_readonly_and_does_not_admit_profile_or_observe(rig, native):
     worker, fake, _ = rig
     fake.paused = True
@@ -1377,3 +2102,481 @@ def test_known_partial_input_failure_preserves_foreign_and_unmatched_draft(rig):
     with pytest.raises(HybridWorkerError, match="ui_reserved"):
         prepare(rig)
     assert port.writes == 1 and port.profiles == 1
+
+
+@pytest.fixture
+def cached_prepare_native(cold_text_dom):
+    """Real core/port/raw cache producer; only native UIA values are synthetic."""
+    from messenger_ai.adapters.qq.vm_driver.transport import WindowsUIAQQAccessibility
+    from tests.adapters.qq.vm_driver.test_raw_adjacency import CachedElement, scene
+    worker, port, transport, request, events, dom, native = cold_text_dom
+    cache = scene()
+    state = SimpleNamespace(worker=worker, port=port, transport=transport, request=request,
+        events=events, dom=dom, native=native, cache=cache, calls=[], snapshots=[],
+        refreshes=[], expected_baselines=[], before_refresh=None, after_cache=None, promotion_owners=[])
+
+    class NativeElement:
+        def __init__(self, node):
+            self.node = node
+
+        def BuildUpdatedCache(self, cache_request):
+            cache.trace.native("BuildUpdatedCache")
+            assert cache_request.TreeScope == 3 and cache_request.AutomationElementMode == 0
+            assert cache_request.TreeFilter is cache.condition
+            assert cache_request.properties == [30000, 30012]
+            # The native provider materializes one shallow cache atomically.
+            # The actual producer never sees this retained control's getters.
+            node = self.node
+            rid, class_name = tuple(node.GetRuntimeId()), node.ClassName
+            children = tuple(CachedElement(cache.trace, tuple(child.GetRuntimeId()))
+                             for child in node.GetChildren())
+            return CachedElement(cache.trace, rid, children, class_name=class_name)
+
+    def attach(node):
+        node._element = NativeElement(node)
+        for child in node.GetChildren():
+            attach(child)
+    state.attach = attach
+    attach(transport.root)
+
+    def producer(controls, *, read, max_parents, max_edges):
+        state.calls.append(tuple(controls))
+        proof = WindowsUIAQQAccessibility.cached_outside_proof(cache.port, controls,
+            read=lambda callback: read(lambda: cache.trace.read(callback)),
+            max_parents=max_parents, max_edges=max_edges)
+        if state.after_cache:
+            state.after_cache()
+        return proof
+    transport.cached_outside_proof = producer
+
+    roles = {"row": ("row",), "header": ("chat-header__contact-name",),
+             "bubbles": ("ml-root",), "composer": ("ProseMirror", "ExEditor-qq-msg-editor"),
+             "send": ("send",)}
+    selectors = {}
+    for role, tokens in roles.items():
+        control = transport.controls[role]
+        control.AutomationId = "flat-" + role
+        patterns = ("TextPattern",) if role == "composer" else ("InvokePattern",) if role == "send" else ()
+        selectors[role] = QQSelector(name=role, control_type="GroupControl", class_name_tokens=tokens,
+            automation_id=None if role == "row" else control.AutomationId, required_patterns=patterns,
+            selected_class_name_token="selected" if role == "row" else None)
+    nav = port.config.navigation.model_copy(update={
+        "row_selector": selectors["row"], "header_selector": selectors["header"],
+        "message_selector": selectors["bubbles"], "composer_selector": selectors["composer"]})
+    pack = port.config.selector_pack.model_copy(update={"selectors": tuple(
+        selectors.get(item.name, item) for item in port.config.selector_pack.selectors)})
+    port.config = worker.config = port.config.model_copy(update={"navigation": nav, "selector_pack": pack})
+    port.handler.config = nav
+
+    retain = port.retain_prepare_fence
+    def retained(target, owner_request):
+        assert worker._prepared is not None and worker._prepared.request == owner_request
+        state.promotion_owners.append((owner_request.reservation_id, owner_request.nonce, target))
+        return retain(target, owner_request)
+    port.retain_prepare_fence = retained
+    refresh = port._refresh_prepare_snapshot
+    def refreshed(target):
+        index = len(state.refreshes) + 1
+        state.refreshes.append((port._prepare_owner, port._prepare_fence))
+        fence = port._prepare_fence
+        state.expected_baselines.append(tuple(fence[name] for name in (
+            "properties", "edges", "outside_edges", "sequence")))
+        if state.before_refresh:
+            state.before_refresh(index)
+        return refresh(target)
+    port._refresh_prepare_snapshot = refreshed
+    snapshot = port.snapshot
+    def observed(target):
+        phases = transport.phases
+        value = snapshot(target)
+        state.snapshots.append((port.mode, transport.phases - phases, value))
+        return value
+    port.snapshot = observed
+    return state
+
+
+def prepare_cached(state):
+    return state.worker.prepare_draft(state.request,
+        expected_sequence_digest=semantic_sequence_digest(tuple(state.transport.bubbles)))
+
+
+def test_cached_prepare_real_core_saves_two_phases_but_abort_starts_two_fresh_phases(cached_prepare_native, monkeypatch):
+    state = cached_prepare_native
+    worker, port, transport, request = state.worker, state.port, state.transport, state.request
+    clock_values, generated = [], []
+    real_clock = time.monotonic_ns
+    def observed_clock():
+        value = real_clock()
+        clock_values.append(value)
+        return value
+    monkeypatch.setattr(time, "monotonic_ns", observed_clock)
+    build_snapshot = port._snapshot_from_fence
+    def freshly_timestamped(*args):
+        before = len(clock_values)
+        value = build_snapshot(*args)
+        assert len(clock_values) == before + 1
+        assert value.witness.captured_monotonic_ns == clock_values[-1]
+        generated.append(value)
+        return value
+    port._snapshot_from_fence = freshly_timestamped
+    guard_bytes = state.native[-2].read_bytes()
+    ticket = prepare_cached(state)
+    assert state.promotion_owners == [(request.reservation_id, request.nonce, state.native[2])]
+    assert len(state.refreshes) == 2 and all(owner == state.promotion_owners[0] for owner, _ in state.refreshes)
+    assert [(mode, phases) for mode, phases, _ in state.snapshots] == [("idle", 1), ("idle", 1), ("owned", 0), ("owned", 0)]
+    assert transport.phases == 2
+    assert transport.body == request.body and transport.inputs == [("unicode", request.body[:32]), ("unicode", request.body[32:])]
+    assert port._prepare_fence is port._pending_fence is port._prepare_owner is None
+    first, second = (state.snapshots[i][2] for i in (2, 3))
+    assert first.composer_text == "" and second.composer_text == request.body
+    assert first.witness.captured_at < second.witness.captured_at
+    # Windows can legitimately expose the same QPC tick. Both timestamps
+    # must still have been independently collected by the actual builder.
+    assert first.witness.captured_monotonic_ns <= second.witness.captured_monotonic_ns
+    assert generated == [snapshot for _, _, snapshot in state.snapshots]
+    assert first.bubbles is not second.bubbles
+    baseline = state.refreshes[0][1]
+    assert all(fence is baseline for _, fence in state.refreshes)
+    assert state.expected_baselines[0] == state.expected_baselines[1]
+    assert tuple(baseline[name] for name in ("properties", "edges", "outside_edges", "sequence")) == state.expected_baselines[0]
+    assert baseline["sequence"] == ticket.expected_sequence_digest
+    assert worker._prepared.portable.text_hash == request.body_hash
+    assert state.native[-2].read_bytes() == guard_bytes
+    assert worker.abort_draft(ticket, deadline_at=request.deadline_at).status == "cleaned"
+    assert [(mode, phases) for mode, phases, _ in state.snapshots[-2:]] == [("abort", 1), ("abort", 1)]
+    assert transport.phases == 4 and state.dom.clears == 1 and transport.body == ""
+    assert state.events == ["profile", "owned-clear"] and port._prepare_fence is None
+    assert all(request.properties == [30000, 30012] for request in state.cache.trace.requests)
+    assert len(state.cache.trace.requests) == len(state.calls)
+    assert state.cache.trace.events.count("BuildUpdatedCache") == sum(map(len, state.calls))
+    assert state.dom.placeholder.reads["retired_access"] == 0
+
+
+@pytest.mark.parametrize("role,field", [(role, field) for role in ("header", "send", "composer")
+                                      for field in ("ControlTypeName", "AutomationId", "pattern")])
+def test_cached_prepare_rechecks_same_id_role_metadata_before_first_input(cached_prepare_native, role, field):
+    state = cached_prepare_native
+    node = state.transport.controls[role]
+    original_id = node.GetRuntimeId()
+    def change(index):
+        if index != 1:
+            return
+        if field == "ControlTypeName":
+            node.ControlTypeName = "TextControl"
+        elif field == "AutomationId":
+            node.AutomationId = "changed-same-id"
+        elif role == "send":
+            node.GetInvokePattern = lambda: None
+        elif role == "composer":
+            node.GetTextPattern = lambda: None
+        else:
+            # Header normally has no required pattern. Add its real pattern
+            # requirement before opening and remove support at refresh below.
+            node.GetInvokePattern = lambda: None
+    if role == "header" and field == "pattern":
+        node.GetInvokePattern = lambda: SimpleNamespace(Invoke=lambda: pytest.fail("read-only test"))
+        nav = state.port.config.navigation.model_copy(update={"header_selector":
+            state.port.config.navigation.header_selector.model_copy(update={"required_patterns": ("InvokePattern",)})})
+        state.port.config = state.worker.config = state.port.config.model_copy(update={"navigation": nav})
+        state.port.handler.config = nav
+    state.before_refresh = change
+    with pytest.raises(HybridWorkerError) as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert node.GetRuntimeId() == original_id and state.transport.inputs == [] and state.transport.body == ""
+    assert state.dom.clears == 0 and state.events == ["profile"]
+    assert state.port._prepare_fence is state.port._prepare_owner is state.port._pending_fence is None
+
+
+@pytest.mark.parametrize("change", ["second_selected", "second_header", "group", "outside_edge"])
+def test_cached_prepare_all_original_parent_classes_and_edges_remain_authoritative(cached_prepare_native, change):
+    state = cached_prepare_native
+    def changed(index):
+        if index != 1:
+            return
+        if change == "second_selected":
+            state.dom.outside.class_name = "row selected"
+        elif change == "second_header":
+            state.dom.outside.class_name = "chat-header__contact-name"
+            state.dom.outside.AutomationId = "flat-header"
+        elif change == "group":
+            state.dom.outside.class_name = "group-member-list"
+        else:
+            inserted = ComposerDOMNode(990, "unread inserted child")
+            inserted.parent = state.dom.outside
+            state.dom.outside.children.append(inserted)
+    state.before_refresh = changed
+    with pytest.raises(HybridWorkerError) as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert state.transport.inputs == [] and state.transport.body == "" and state.dom.clears == 0
+    assert state.transport.phases == 2 and state.port._prepare_fence is None
+
+
+@pytest.mark.parametrize("change", ["focus", "utc", "monotonic", "revoked", "foreground", "control", "process"])
+def test_cached_prepare_native_and_original_budget_guards_block_input(cached_prepare_native, change):
+    state = cached_prepare_native
+    def changed(index):
+        if index != 1:
+            return
+        if change == "focus":
+            state.transport._composer_focused = lambda *_: False
+        elif change == "utc":
+            state.port.deadline = datetime.now(UTC) - timedelta(microseconds=1)
+        elif change == "monotonic":
+            state.port.stop_at = time.monotonic() - 1
+        else:
+            mutate_native(state.native, change)
+    state.before_refresh = changed
+    with pytest.raises(HybridWorkerError) as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert state.transport.inputs == [] and state.transport.body == "" and state.dom.clears == 0
+    assert state.port._prepare_fence is state.port._pending_fence is None
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+def test_cached_prepare_reads_current_same_key_message_content_before_and_after_write(cached_prepare_native, stage):
+    state = cached_prepare_native
+    original = state.transport.bubbles[0]
+    def edited(index):
+        if index == stage:
+            state.transport.bubbles[0] = original.model_copy(update={"text": "edited same message key and count"})
+    state.before_refresh = edited
+    with pytest.raises(HybridWorkerError, match="stale_context") as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert state.transport.bubbles[0].message_key == original.message_key
+    assert state.transport.bubbles[0].text_hash != original.text_hash
+    assert state.transport.body == ("" if stage == 1 else state.request.body)
+    assert state.transport.inputs == ([] if stage == 1 else [("unicode", state.request.body[:32]), ("unicode", state.request.body[32:])])
+    assert state.dom.clears == 0 and state.port._prepare_fence is None
+
+
+def test_cached_prepare_post_write_exact_text_is_current_and_never_replayed(cached_prepare_native):
+    state = cached_prepare_native
+    state.before_refresh = lambda index: setattr(state.transport, "body", state.request.body + " foreign") if index == 2 else None
+    with pytest.raises(HybridWorkerError, match="composer_drift") as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert state.transport.body.endswith(" foreign") and state.dom.clears == 0
+    assert state.transport.inputs == [("unicode", state.request.body[:32]), ("unicode", state.request.body[32:])]
+    assert state.port._prepare_fence is state.port._prepare_owner is None
+
+
+def test_cached_prepare_final_critical_fence_is_fresh_after_outside_cache(cached_prepare_native):
+    state = cached_prepare_native
+    def change_after_cache():
+        if state.port.mode == "owned":
+            state.transport.controls["header"].Name = "changed after completed cached outside proof"
+    state.after_cache = change_after_cache
+    with pytest.raises(HybridWorkerError, match="target_drift"):
+        prepare_cached(state)
+    assert state.transport.inputs == [] and state.dom.clears == 0 and state.transport.body == ""
+    assert state.port._prepare_fence is None
+
+
+@pytest.mark.parametrize("boundary", ["owned", "abort", "verify", "health", "idle", "discard", "close"])
+def test_cached_prepare_fence_is_discarded_at_each_new_command_boundary(cached_prepare_native, boundary):
+    state = cached_prepare_native
+    def invalidate(index):
+        if index != 1:
+            return
+        assert state.port._prepare_fence is not None
+        if boundary == "discard":
+            state.port.discard_fence()
+        elif boundary == "close":
+            state.port.close()
+        else:
+            state.port.begin(boundary, deadline_at=state.request.deadline_at)
+        assert state.port._prepare_fence is state.port._prepare_owner is state.port._pending_fence is None
+    state.before_refresh = invalidate
+    with pytest.raises(HybridWorkerError, match="hybrid_input_fence_missing"):
+        prepare_cached(state)
+    assert state.transport.inputs == [] and state.dom.clears == 0
+
+
+@pytest.mark.parametrize("constraint", ["no_class", "ancestor_id", "ancestor_type", "no_producer"])
+def test_cached_prepare_requires_explicit_flat_selector_capability_or_keeps_legacy_phases(cached_prepare_native, constraint):
+    state = cached_prepare_native
+    if constraint == "no_producer":
+        del state.transport.cached_outside_proof
+    else:
+        selector = state.port.config.navigation.header_selector
+        changes = {"class_name_tokens": ()} if constraint == "no_class" else {"ancestor_automation_ids": ("parent",)} if constraint == "ancestor_id" else {"ancestor_control_types": ("PaneControl",)}
+        nav = state.port.config.navigation.model_copy(update={"header_selector": selector.model_copy(update=changes)})
+        state.port.config = state.worker.config = state.port.config.model_copy(update={"navigation": nav})
+        state.port.handler.config = nav
+    ticket = prepare_cached(state)
+    assert state.refreshes == [] and state.transport.phases == 4
+    assert state.worker.abort_draft(ticket, deadline_at=state.request.deadline_at).status == "cleaned"
+    assert state.transport.phases == 6 and state.dom.clears == 1 and state.port._prepare_fence is None
+
+
+def test_cached_prepare_standalone_owned_begin_cannot_promote_readonly_snapshot(cached_prepare_native):
+    state = cached_prepare_native
+    state.port.snapshot(state.native[2])
+    assert state.port._pending_fence is not None and state.worker._prepared is None
+    state.port.begin("owned", deadline_at=state.request.deadline_at)
+    assert state.port._prepare_fence is state.port._pending_fence is state.port._prepare_owner is None
+    state.port.snapshot(state.native[2])
+    assert state.transport.phases == 2 and state.refreshes == []
+
+
+def test_cached_prepare_com_failure_retains_owner_without_fallback_tree_or_input(cached_prepare_native):
+    state = cached_prepare_native
+    failures = []
+    class CacheCOMError(RuntimeError):
+        def __str__(self):
+            raise AssertionError("must not read unknown provider exception text")
+    def failed(name):
+        if state.port.mode == "owned" and name == "BuildUpdatedCache":
+            failures.append(name)
+            raise CacheCOMError("private UI data")
+    state.cache.trace.after_native = failed
+    with pytest.raises(HybridWorkerError, match="hybrid_ui_action_failed") as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert failures == ["BuildUpdatedCache"] and state.transport.phases == 2
+    assert state.transport.inputs == [] and state.transport.body == "" and state.dom.clears == 0
+    assert state.port._prepare_fence is state.port._pending_fence is state.port._prepare_owner is None
+
+
+def test_cached_prepare_refresh_count_is_bounded_to_its_two_synchronous_snapshots(cached_prepare_native):
+    state = cached_prepare_native
+    def extra_post_read(index):
+        if index == 2:
+            # Spend the second permitted current observation. The original
+            # caller's next observation cannot silently turn into a third one.
+            state.port.snapshot(state.native[2])
+            assert state.port._prepare_refreshes == 2
+    state.before_refresh = extra_post_read
+    with pytest.raises(HybridWorkerError, match="hybrid_input_fence_missing") as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert len(state.refreshes) == 3 and state.transport.phases == 2
+    assert state.transport.body == state.request.body and state.dom.clears == 0
+    assert state.port._prepare_fence is state.port._prepare_owner is None
+
+
+def test_cached_prepare_real_decoder_reads_changed_inbound_after_exact_body_write(cached_prepare_native):
+    state = cached_prepare_native
+    rows = _install_decoded_inbound_region(state.port, state.transport)
+    state.attach(state.transport.controls["bubbles"])
+    original = state.port.snapshot(state.native[2])
+    leaf = rows[0].children[0].children[0]
+    def edited(index):
+        if index == 2:
+            leaf.name = "fresh actual decoder content after owned write"
+    state.before_refresh = edited
+    with pytest.raises(HybridWorkerError, match="stale_context") as error:
+        state.worker.prepare_draft(state.request,
+            expected_sequence_digest=semantic_sequence_digest(original.bubbles))
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert leaf.reads["Name"] > 0 and state.transport.body == state.request.body
+    assert state.transport.inputs == [("unicode", state.request.body[:32]), ("unicode", state.request.body[32:])]
+    assert state.dom.clears == 0 and state.port._prepare_fence is None
+
+
+def test_cached_prepare_commit_new_command_uses_full_fresh_phase_and_no_prepare_refresh(cached_prepare_native):
+    state = cached_prepare_native
+    ticket = prepare_cached(state)
+    request = state.request
+    prepare_command = WorkerCommand(kind=WorkerKind.PREPARE, binding_id=request.binding_id,
+        binding_revision=request.binding_revision, conversation_revision=request.conversation_revision,
+        operation_id=uuid4(), text=request.body, segment_ref=f"{request.pacing_plan_id}:{request.segment_index}",
+        deadline=request.deadline_at)
+    assert state.worker.adopt_prepared(ticket, prepare_command).status is WorkerStatus.OK
+    before = len(state.refreshes)
+    result = state.worker.execute(prepare_command.model_copy(update={"kind": WorkerKind.COMMIT}))
+    assert result.status is WorkerStatus.OK
+    assert state.transport.phases == 3 and state.snapshots[-1][1] == 1
+    assert len(state.refreshes) == before == 2
+    assert state.transport.inputs[-1] == ("send",)
+    assert state.port._prepare_fence is state.port._prepare_owner is state.port._pending_fence is None
+
+
+@pytest.mark.parametrize("method,property_name", [("property", "ControlTypeName"),
+    ("property", "AutomationId"), ("property", "ProcessId"), ("pattern", "GetInvokePattern"), ("runtime", None)])
+@pytest.mark.parametrize("change", ["utc", "monotonic", "revoked"])
+def test_cached_prepare_each_selector_read_stops_immediately_on_original_budget_change(
+        cached_prepare_native, monkeypatch, method, property_name, change):
+    from messenger_ai.adapters.qq.vm_driver.hybrid_worker import _BoundaryReads
+    state = cached_prepare_native
+    active, calls, stopped = [False], [], []
+    selected_node = state.transport.controls["send" if method == "pattern" else "header"]
+    verify = state.port._verify_prepare_selectors
+    def verification(*args):
+        active[0] = True
+        try:
+            return verify(*args)
+        finally:
+            active[0] = False
+    state.port._verify_prepare_selectors = verification
+    original = getattr(_BoundaryReads, method)
+    def read(boundary, node, *args, **kwargs):
+        if active[0]:
+            calls.append((node, args[0] if args else None))
+        value = original(boundary, node, *args, **kwargs)
+        if (active[0] and node is selected_node and (property_name is None or args[0] == property_name)
+                and not stopped):
+            stopped.append(len(calls))
+            if change == "utc":
+                state.port.deadline = datetime.now(UTC) - timedelta(microseconds=1)
+            elif change == "monotonic":
+                state.port.stop_at = time.monotonic() - 1
+            else:
+                state.native[-1].set()
+        return value
+    monkeypatch.setattr(_BoundaryReads, method, read)
+    with pytest.raises(HybridWorkerError, match="hybrid_revoked") as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and stopped == [len(calls)]
+    assert calls[-1] == (selected_node, property_name)
+    assert state.transport.inputs == [] and state.transport.body == "" and state.dom.clears == 0
+    assert state.port._prepare_fence is state.port._pending_fence is None
+
+
+@pytest.mark.parametrize("change", ["selected_id", "header_id", "header_class", "composer_id", "tail", "guard"])
+def test_cached_prepare_final_critical_reads_do_not_inherit_selector_boundary_values(cached_prepare_native, change):
+    state = cached_prepare_native
+    verify = state.port._verify_prepare_selectors
+    changes = []
+    def verification(*args):
+        result = verify(*args)
+        if not changes:
+            changes.append(change)
+            if change.endswith("_id"):
+                role = {"selected_id": "row", "header_id": "header", "composer_id": "composer"}[change]
+                state.transport.controls[role].GetRuntimeId = lambda: [1, 995]
+            elif change == "header_class":
+                state.transport.controls["header"].ClassName = "changed-after-selector-check"
+            elif change == "tail":
+                mutate_native(state.native, "tail")
+            else:
+                mutate_native(state.native, "control")
+        return result
+    state.port._verify_prepare_selectors = verification
+    with pytest.raises(HybridWorkerError) as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and changes == [change]
+    assert state.transport.inputs == [] and state.transport.body == "" and state.dom.clears == 0
+    assert state.port._prepare_fence is state.port._pending_fence is None
+
+
+def test_cached_prepare_lost_producer_cannot_fall_back_to_legacy_tree(cached_prepare_native):
+    state = cached_prepare_native
+    adjacency = state.port._outside_adjacency
+    def opening_only(fence, reads, *, opening=False):
+        assert opening, "retained prepare proof must not fall back after producer loss"
+        return adjacency(fence, reads, opening=opening)
+    state.port._outside_adjacency = opening_only
+    def loss(index):
+        if index == 1:
+            del state.transport.cached_outside_proof
+    state.before_refresh = loss
+    with pytest.raises(HybridWorkerError, match="hybrid_group_adjacency_unproven") as error:
+        prepare_cached(state)
+    assert error.value.cleanup_required and state.worker._prepared.ticket is None
+    assert state.transport.inputs == [] and state.transport.phases == 2 and state.dom.clears == 0
+    assert state.port._prepare_fence is None

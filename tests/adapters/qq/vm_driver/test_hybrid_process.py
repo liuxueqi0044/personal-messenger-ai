@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -28,7 +28,8 @@ from messenger_ai.adapters.qq.vm_driver.contracts import (
 )
 from messenger_ai.adapters.qq.vm_driver.hybrid_process import HybridPreparedDraft, HybridProcessError, HybridWorkerProcess
 from messenger_ai.adapters.qq.vm_driver.hybrid_worker import HybridWorkerConfig
-from messenger_ai.runtime.staged_preparation import DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket, source_keys_digest
+from messenger_ai.runtime.staged_preparation import (DraftCleanupResult, DraftPreparationRequest, PreparedDraftTicket,
+    source_keys_digest, preparation_failure)
 from tests.adapters.qq.navigation.test_identity import case
 
 
@@ -235,6 +236,68 @@ async def test_one_owned_worker_epoch_cold_prepare_adopt_commit_and_abort(config
     with pytest.raises(HybridProcessError, match="lifetime_used"):
         async with protected(rig):
             pass
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+@pytest.mark.parametrize("helper_metadata", [False, True])
+@pytest.mark.asyncio
+async def test_closed_prepare_failure_diagnostic_crosses_ipc_without_changing_owned_error(foreign, helper_metadata, config):
+    diagnostics = []
+    code = "hybrid_ui_action_failed" if helper_metadata else "composer_readback_mismatch"
+    def reply(call):
+        value = preparation_failure(call.request, code=code, stage="identity" if helper_metadata else "write",
+            now=datetime.now(UTC), tick=time.monotonic_ns(), input_attempted=not helper_metadata, ticket_known=False,
+            helper_code="PROFILE_WINDOW_AMBIGUOUS" if helper_metadata else None,
+            helper_stage="profile" if helper_metadata else None)
+        diagnostics.append(value)
+        if foreign:
+            value = value.model_copy(update={"nonce": uuid4()})
+        return module._Reply(request_id=call.request_id, worker_epoch=call.worker_epoch, action=call.action,
+            error_code=code, cleanup_required=True, prepare_failure=value)
+    rig = fake_rig(config, reply=reply)
+    async with protected(rig):
+        req = request()
+        with pytest.raises(HybridProcessError, match=code) as error:
+            await rig.process.prepare_draft(req, expected_sequence_digest="a"*64)
+        assert error.value.prepare_failure == (None if foreign else diagnostics[0])
+        assert error.value.cleanup_required and rig.context.process.alive  # Existing correlated failure can exact-abort.
+    assert rig.job.closed and rig.desktop.released == 1
+
+
+@pytest.mark.parametrize("helper_metadata", [False, True])
+def test_real_child_entry_emits_only_closed_first_failure_diagnostic(config, helper_metadata):
+    from messenger_ai.adapters.qq.vm_driver.hybrid_worker import HybridWorkerError
+    req, epoch = request(), UUID(config.navigation.expected_worker_epoch)
+    code = "hybrid_ui_action_failed" if helper_metadata else "target_drift"
+    value = preparation_failure(req, code=code, stage="identity" if helper_metadata else "write", now=datetime.now(UTC),
+        tick=time.monotonic_ns(), input_attempted=not helper_metadata, ticket_known=False,
+        helper_code="HELPER_TIMEOUT" if helper_metadata else None, helper_stage="header" if helper_metadata else None)
+    class Worker:
+        def prepare_draft(self, *args, **kwargs):
+            raise HybridWorkerError(code, cleanup_required=True, prepare_failure=value)
+        def close(self):
+            pass
+    signals = [threading.Event() for _ in range(4)]
+    permitted, revoked, incoming, outgoing = signals
+    call = module._Call(worker_epoch=epoch, action="prepare_draft", deadline_at=req.deadline_at,
+        stop_at_monotonic_ns=req.deadline_monotonic_ns, request=req, expected_sequence_digest="a"*64)
+    raw = call.model_dump_json().encode()
+    inbox, outbox = bytearray(module._MAILBOX_LIMIT), bytearray(module._MAILBOX_LIMIT)
+    inbox[:len(raw)] = raw
+    length, result_length = SimpleNamespace(value=len(raw)), SimpleNamespace(value=0)
+    permitted.set(); incoming.set()
+    thread = threading.Thread(target=module._hybrid_main, args=(config.model_dump(), epoch, req.deadline_at,
+        req.deadline_monotonic_ns/1e9, permitted, revoked, incoming, outgoing, inbox, length,
+        outbox, result_length, lambda *args, **kwargs: Worker()))
+    thread.start()
+    try:
+        assert outgoing.wait(1)
+        reply = module._Reply.model_validate_json(bytes(outbox[:result_length.value]))
+        assert reply.error_code == code and reply.prepare_failure == value and reply.cleanup_required
+        assert req.body.encode() not in bytes(outbox[:result_length.value])
+    finally:
+        revoked.set(); thread.join(1)
+    assert not thread.is_alive()
 
 
 @pytest.mark.asyncio

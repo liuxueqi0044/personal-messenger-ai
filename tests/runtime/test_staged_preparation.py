@@ -12,6 +12,7 @@ from messenger_ai.runtime.staged_preparation import (
     DraftPreparationRequest, PreparedDraftTicket, DraftCleanupResult, ControlCancellation,
     StagedPreparationController, StagedPrepareAdapter, StagedPreparationError,
     StagedCleanupRequired, source_keys_digest,
+    PreparationFailureDiagnostic, preparation_failure, matching_prepare_failure,
 )
 
 NOW = datetime(2026, 10, 2, tzinfo=UTC)
@@ -55,6 +56,93 @@ class Port:
 
     def retain_cleanup_hold(self, owner, *, reason):
         self.holds.append((owner, reason))
+
+
+def test_failure_diagnostic_is_closed_original_dual_clock_observation_only():
+    req = request()
+    diagnostic = preparation_failure(req, code="target_drift", stage="write", now=NOW+timedelta(seconds=3),
+        tick=4_000_000_000, input_attempted=True, ticket_known=False)
+    assert diagnostic.elapsed_utc_seconds == 3 and diagnostic.remaining_utc_seconds == 42
+    assert diagnostic.elapsed_monotonic_ns == 4_000_000_000 and diagnostic.remaining_monotonic_ns == 41_000_000_000
+    assert diagnostic.deadline_at == req.deadline_at and diagnostic.deadline_monotonic_ns == req.deadline_monotonic_ns
+    assert not set(PreparationFailureDiagnostic.model_fields) & {"body", "body_hash", "source_message_keys", "evidence", "authorization_id"}
+    assert matching_prepare_failure(diagnostic, req) == diagnostic
+    assert matching_prepare_failure(diagnostic.model_copy(update={"nonce": uuid4()}), req) is None
+    for extra in ({"body": "private"}, {"code": "private_body"}, {"stage": "private"}, {"remaining_monotonic_ns": 1}):
+        with pytest.raises(ValidationError):
+            PreparationFailureDiagnostic.model_validate({**diagnostic.model_dump(), **extra})
+    assert preparation_failure(req, code="private_body", stage="write", now=NOW, tick=0).code == "prepare_failure_unknown"
+
+
+def test_helper_failure_fields_are_optional_finite_and_never_an_arbitrary_diagnostic():
+    req = request()
+    value = preparation_failure(req, code="hybrid_ui_action_failed", stage="identity", now=NOW, tick=0,
+        helper_code="PROFILE_WINDOW_AMBIGUOUS", helper_stage="profile")
+    assert value.helper_code == "PROFILE_WINDOW_AMBIGUOUS" and value.helper_stage == "profile"
+    assert value.code == "hybrid_ui_action_failed" and value.stage == "identity"
+    assert matching_prepare_failure(value, req) == value
+    for fields in ({"helper_code": "private_body"}, {"helper_stage": "private_body"},
+                   {"diagnostic": {"stdout": "private_body"}}, {"helper_code": None}):
+        with pytest.raises(ValidationError):
+            PreparationFailureDiagnostic.model_validate({**value.model_dump(), **fields})
+    unknown = preparation_failure(req, code=value.code, stage=value.stage, now=NOW, tick=0,
+        helper_code="private_body", helper_stage="profile")
+    assert unknown.helper_code is None and unknown.helper_stage is None
+    legacy = PreparationFailureDiagnostic.model_validate(value.model_dump(exclude={"helper_code", "helper_stage"}))
+    assert legacy.helper_code is None and legacy.helper_stage is None
+
+
+@pytest.mark.asyncio
+async def test_timeout_first_diagnostic_is_recorded_before_late_cancellation_and_not_reanchored():
+    port, req = Port(), request(.02)
+    release, ended, records = asyncio.Event(), asyncio.Event(), []
+    port.record_prepare_failure = lambda owner, diagnostic: records.append(diagnostic)
+    async def pending(req, *, cancel_event):
+        try:
+            await release.wait()
+        finally:
+            assert records[0].code == "staged_prepare_timeout" and cancel_event.is_set()
+            ended.set()
+    port.prepare_draft = pending
+    controller = StagedPreparationController(port, clock=lambda: NOW, monotonic_ns=lambda: 0)
+    with pytest.raises(StagedPreparationError, match="staged_prepare_timeout"):
+        await controller.prepare(req)
+    await asyncio.wait_for(ended.wait(), .2)
+    assert len(records) == 1 and records[0].stage == "controller_wait"
+    assert records[0].input_attempted is None and records[0].ticket_known is False
+    assert records[0].deadline_at == req.deadline_at and records[0].deadline_monotonic_ns == req.deadline_monotonic_ns
+
+
+@pytest.mark.asyncio
+async def test_failed_diagnostic_recording_does_not_replace_prepare_exception():
+    port, req = Port(), request()
+    class PrivateError(Exception):
+        def __str__(self):
+            pytest.fail("diagnostics must not format an unknown exception")
+    async def fail(*args, **kwargs):
+        raise PrivateError("private body")
+    def bad_record(owner, diagnostic):
+        assert diagnostic.code == "prepare_failure_unknown"
+        raise OSError("diagnostic unavailable")
+    port.prepare_draft, port.record_prepare_failure = fail, bad_record
+    controller = StagedPreparationController(port, clock=lambda: NOW, monotonic_ns=lambda: 0)
+    with pytest.raises(PrivateError):
+        await controller.prepare(req)
+    assert controller.cancel.is_set()
+
+
+@pytest.mark.asyncio
+async def test_broken_optional_diagnostic_capability_cannot_replace_original_prepare_failure():
+    class BrokenPort(Port):
+        @property
+        def record_prepare_failure(self):
+            raise OSError("private diagnostic details")
+        async def prepare_draft(self, *args, **kwargs):
+            raise StagedPreparationError("staged_control_cancelled")
+    controller = StagedPreparationController(BrokenPort(), clock=lambda: NOW, monotonic_ns=lambda: 0)
+    with pytest.raises(StagedPreparationError, match="staged_control_cancelled"):
+        await controller.prepare(request())
+    assert controller.cancel.is_set()
 
 
 @pytest.mark.parametrize("field,value", [("body", "Other"), ("body_hash", "c"*64), ("source_keys_digest", "c"*64),

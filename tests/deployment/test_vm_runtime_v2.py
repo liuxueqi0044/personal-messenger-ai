@@ -17,6 +17,7 @@ from messenger_ai.adapters.qq.vm_driver.hybrid_bridge import QQHybridDriverBridg
 from messenger_ai.adapters.qq.vm_driver.hybrid_session import HybridSessionStatus
 from messenger_ai.runtime.contracts import ObservationBatch
 from messenger_ai.runtime.navigation import RuntimeNavigationResult
+from messenger_ai.runtime.state import RuntimeState
 from tests.runtime.test_qq_hybrid_config import configuration
 from tests.runtime.test_qq_hybrid_scope import scope_case
 
@@ -148,10 +149,15 @@ def driver(runner,tmp_path):
     bridge._last_health = WorkerResult(request_id=uuid4(),kind=WorkerKind.HEALTH,status=WorkerStatus.OK,
         worker_epoch=worker.status.worker_epoch)
     case = SimpleNamespace(bridge=bridge,worker=worker,binding=binding,events=events,pause=asyncio.Event())
-    bridge.app_lookup = lambda:SimpleNamespace(_pause_requested=case.pause)
+    state = RuntimeState(tmp_path/"runtime.sqlite3")
+    state.register(account_id=binding.account_id,contact_id=binding.contact_id,
+        conversation_id=binding.hub_conversation_id,binding_revision=1,conversation_type="direct")
+    state.connection.execute("UPDATE runtime_conversations SET conversation_revision=3")
+    bridge.app_lookup = lambda:SimpleNamespace(_pause_requested=case.pause,state=state)
     yield case
     bridge._cursor.close()
     bridge._db.close()
+    state.close()
 
 
 def test_typed_active_uuid_witness_serializes_without_chat_or_secret_data(runner,driver,tmp_path):
@@ -207,6 +213,24 @@ async def test_only_navigation_success_with_a_lease_reaches_independent_worker_o
     result = await c.bridge.observe_conversation(c.binding.hub_conversation_id,binding_revision=1,conversation_revision=3)
     assert result.complete is should_observe
     assert calls == (["navigate","worker-observe"] if should_observe else ["navigate"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["manual_pause", "identity_mismatch",
+    "ui_automation_unavailable:identity_profile_capture_failed"])
+async def test_hard_contact_pause_without_a_recovery_scope_never_starts_navigation(driver, reason):
+    c = driver
+    state = c.bridge.app_lookup().state
+    state.connection.execute("UPDATE runtime_conversations SET paused=1,pause_reason=?", (reason,))
+    async def forbidden(*args, **kwargs):
+        pytest.fail("hard pause must not start another UI episode")
+    c.bridge.navigation = SimpleNamespace(navigate=forbidden)
+    before = tuple(c.bridge._cursor.connection.iterdump())
+    result = await c.bridge.observe_conversation(c.binding.hub_conversation_id,
+        binding_revision=1,conversation_revision=3)
+    assert not result.complete and result.gap_reason == reason and not result.messages
+    assert tuple(c.bridge._cursor.connection.iterdump()) == before
+    assert state.execution_state(c.binding.hub_conversation_id)[2]
 
 
 @pytest.mark.asyncio

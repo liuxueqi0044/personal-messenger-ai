@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ from messenger_ai.adapters.qq.navigation import supervised_profile as module
 from messenger_ai.adapters.qq.navigation.profile_verifier import ProfileAcquisitionError
 from messenger_ai.adapters.qq.navigation.supervised_profile import SupervisedProfileConfig, SupervisedProfileSource
 from messenger_ai.adapters.qq.navigation.windows_backend import NavigationGuardState
+from messenger_ai.adapters.qq.vm_driver.profile_identity import ProfileCaptureError, run_profile_helper
 from .test_identity import case
 from .test_profile_verifier import report, parse
 
@@ -466,6 +468,200 @@ def test_uncertified_host_worker_cannot_read_identity_key_or_invoke_helper(setup
     assert not calls and ready.is_set()
     assert json.loads(bytes(output[:length.value]))["error_code"] == "identity_profile_capture_failed"
     assert not Path(rig.config.vault_path).exists()
+
+
+def _diagnostic_child(rig, monkeypatch, acquire, *, native=None, deadline=None, revoked=None):
+    monkeypatch.setattr(module, "_certified_guest", lambda: True)
+    monkeypatch.setattr(module, "_certify_window_process", native or (lambda config: None))
+    monkeypatch.setattr(module, "capture_profile_acquisition", acquire)
+    permit, ready = threading.Event(), threading.Event()
+    revoked = revoked or threading.Event()
+    permit.set()
+    output, length = bytearray(module._REPLY_LIMIT), SimpleNamespace(value=0)
+    request = module._CaptureRequest(request_id=str(uuid4()), guard=rig.guard,
+                                     deadline_at=deadline or datetime.now(UTC) + timedelta(seconds=30))
+    module._profile_capture_main(rig.config.model_dump(), request.model_dump(), permit, revoked, ready, output, length)
+    reply = json.loads(bytes(output[:length.value])) if ready.is_set() else None
+    path = rig.guard_path.with_suffix(".profilediagnostic.json")
+    diagnostic = json.loads(path.read_bytes()) if path.exists() else None
+    return request, ready, reply, path, diagnostic
+
+
+@pytest.mark.parametrize("helper_stage", ["header", "profile"])
+def test_child_preserves_finite_real_helper_failure_diagnostic_without_changing_reply(setup, monkeypatch, helper_stage):
+    rig = setup
+    launches, native_calls, capture_deadlines = [], [], []
+    flag = "--inspect-guest-current-header" if helper_stage == "header" else "--capture-current-identity-guest-foreground"
+    private_output = b'{"succeeded":false,"status":"RESTORATION_FAILED","private":"body/key/HMAC"}'
+    def bounded(command, **kwargs):
+        launches.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 2, private_output, b"private stderr/body/key/HMAC")
+    def acquire(helper, **kwargs):
+        capture_deadlines.append(kwargs["deadline"])
+        return run_profile_helper([helper, flag], stage=helper_stage, timeout=3, runner=kwargs["runner"])
+    monkeypatch.setattr(module, "_bounded_run", bounded)
+    request, ready, reply, path, diagnostic = _diagnostic_child(
+        rig, monkeypatch, acquire, native=lambda config: native_calls.append(config))
+    assert ready.is_set() and reply == dict(request_id=request.request_id, acquisition=None,
+                                           error_code="identity_profile_capture_failed")
+    assert diagnostic["schema"] == "qq_profile_failure_diagnostic_v1"
+    assert diagnostic["run_id"] == rig.config.run_id and diagnostic["worker_epoch"] == rig.config.worker_epoch
+    assert diagnostic["request_id"] == request.request_id
+    assert datetime.fromisoformat(diagnostic["deadline_at"]) == request.deadline_at == capture_deadlines[0]
+    assert diagnostic["stage"] == "parse" and diagnostic["code"] == "RESTORATION_FAILED"
+    assert diagnostic["exception_category"] == "profile_capture_error"
+    helper = diagnostic["helper_diagnostic"]
+    assert helper["stage"] == helper_stage and helper["exit_code"] == 2
+    assert helper["stdout_bytes"] == len(private_output) and helper["stderr_bytes"] > 0
+    assert len(helper["stdout_sha256"]) == len(helper["stderr_sha256"]) == 64
+    assert [entry["stage"] for entry in diagnostic["stage_timings"]] == ["admission", helper_stage, "parse"]
+    assert diagnostic["started_monotonic_ns"] <= diagnostic["stage_started_monotonic_ns"] <= diagnostic["failed_monotonic_ns"]
+    assert all(type(entry["elapsed_ns"]) is int and entry["elapsed_ns"] >= 0 for entry in diagnostic["stage_timings"])
+    assert len(launches) == 1 and len(native_calls) == 2  # Exactly the pre-existing admission checks.
+    assert len(path.read_bytes()) <= module._DIAGNOSTIC_LIMIT
+    assert b"body/key/HMAC" not in path.read_bytes() and b"private stderr" not in path.read_bytes()
+    assert set(reply) == {"request_id", "acquisition", "error_code"} and not list(path.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("helper_stage", ["header", "profile"])
+def test_child_timeout_tracks_actual_helper_stage_and_keeps_original_deadline(setup, monkeypatch, helper_stage):
+    rig = setup
+    seen = []
+    flag = "--inspect-guest-current-header" if helper_stage == "header" else "--capture-current-identity-guest-foreground"
+    def bounded(command, **kwargs):
+        seen.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"private body", stderr=b"private key")
+    def acquire(helper, **kwargs):
+        return run_profile_helper([helper, flag], stage=helper_stage, timeout=1.25, runner=kwargs["runner"])
+    monkeypatch.setattr(module, "_bounded_run", bounded)
+    request, ready, reply, _, diagnostic = _diagnostic_child(rig, monkeypatch, acquire)
+    assert ready.is_set() and reply["error_code"] == "identity_profile_capture_failed"
+    assert seen == [1.25] and diagnostic["stage"] == helper_stage
+    assert diagnostic["helper_diagnostic"] == {"stage": helper_stage}
+    assert diagnostic["code"] == "HELPER_TIMEOUT"
+    assert diagnostic["deadline_at"] == request.deadline_at.isoformat()
+
+
+def test_child_scope_change_before_second_helper_has_no_extra_native_reads_or_launch(setup, monkeypatch):
+    rig = setup
+    launches, native_calls = [], []
+    def bounded(command, **kwargs):
+        launches.append(command)
+        rig.guard_path.write_text(rig.guard.model_copy(update={"paused": True}).model_dump_json(), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, b"{}", b"")
+    def acquire(helper, **kwargs):
+        kwargs["runner"]([helper, "--inspect-guest-current-header"])
+        kwargs["runner"]([helper, "--capture-current-identity-guest-foreground"])
+        pytest.fail("must not launch after scope change")
+    monkeypatch.setattr(module, "_bounded_run", bounded)
+    _, ready, reply, _, diagnostic = _diagnostic_child(rig, monkeypatch, acquire, native=lambda config: native_calls.append(config))
+    assert ready.is_set() and reply["error_code"] == "identity_profile_scope_mismatch"
+    assert len(launches) == 1 and len(native_calls) == 2
+    assert diagnostic["stage"] == "admission" and diagnostic["code"] == "identity_profile_scope_mismatch"
+
+
+@pytest.mark.parametrize("failure_stage", ["admission", "postcapture", "parse"])
+def test_child_admission_postcapture_and_validation_failures_remain_distinct(setup, monkeypatch, failure_stage):
+    rig = setup
+    calls = []
+    def native(config):
+        if failure_stage == "admission":
+            raise ProfileAcquisitionError("identity_profile_scope_mismatch")
+    def acquire(helper, **kwargs):
+        calls.append(kwargs["deadline"])
+        if failure_stage == "postcapture":
+            rig.guard_path.write_text(rig.guard.model_copy(update={"paused": True}).model_dump_json(), encoding="utf-8")
+        return {"private": "body/key/HMAC"} if failure_stage == "parse" else rig.acquired
+    _, ready, reply, path, diagnostic = _diagnostic_child(rig, monkeypatch, acquire, native=native)
+    assert ready.is_set() and diagnostic["stage"] == failure_stage
+    assert len(calls) == (0 if failure_stage == "admission" else 1)
+    expected = "identity_profile_capture_failed" if failure_stage == "parse" else "identity_profile_scope_mismatch"
+    assert reply["error_code"] == expected and b"body/key/HMAC" not in path.read_bytes()
+    assert diagnostic["exception_category"] == ("validation_error" if failure_stage == "parse" else "profile_acquisition_error")
+
+
+def test_child_unknown_exception_is_not_formatted_or_inspected(setup, monkeypatch):
+    touched = []
+    class PrivateNativeError(Exception):
+        @property
+        def code(self):
+            touched.append("code")
+            raise AssertionError()
+        @property
+        def diagnostic(self):
+            touched.append("diagnostic")
+            raise AssertionError()
+        def __str__(self):
+            touched.append("str")
+            raise AssertionError()
+    def acquire(*args, **kwargs):
+        raise PrivateNativeError("private body/key/HMAC")
+    _, ready, reply, path, diagnostic = _diagnostic_child(setup, monkeypatch, acquire)
+    assert ready.is_set() and reply["error_code"] == "identity_profile_capture_failed"
+    assert diagnostic["code"] == diagnostic["exception_category"] == "unknown" and not touched
+    assert b"PrivateNativeError" not in path.read_bytes() and b"body/key/HMAC" not in path.read_bytes()
+
+
+def test_child_rejects_untyped_malicious_diagnostic_values_and_unknown_code(setup, monkeypatch):
+    class PrivateValue:
+        def __str__(self):
+            pytest.fail("must not format diagnostic values")
+    private = PrivateValue()
+    def acquire(*args, **kwargs):
+        raise ProfileCaptureError("private body/key/HMAC", {
+            "stage": "profile", "exit_code": True, "stdout_bytes": -1, "stderr_bytes": private,
+            "stdout_sha256": "0" * 64, "stderr_sha256": "private body/key/HMAC",
+            "output_limit_exceeded": True, "stdout": private, "stderr": private, "key": private,
+        })
+    _, ready, reply, path, diagnostic = _diagnostic_child(setup, monkeypatch, acquire)
+    assert ready.is_set() and reply["error_code"] == "identity_profile_capture_failed"
+    assert diagnostic["code"] == "unknown"
+    assert diagnostic["helper_diagnostic"] == {"stage": "profile", "stdout_sha256": "0" * 64, "output_limit_exceeded": True}
+    assert b"body/key/HMAC" not in path.read_bytes()
+
+
+@pytest.mark.parametrize("failure", ["open", "replace"])
+def test_child_diagnostic_io_failure_preserves_original_reply_and_existing_file(setup, monkeypatch, failure):
+    rig = setup
+    path = rig.guard_path.with_suffix(".profilediagnostic.json")
+    path.write_bytes(b'{"previous":true}')
+    original_open = Path.open
+    if failure == "open":
+        def denied(path, *args, **kwargs):
+            if path.name.endswith(".tmp"):
+                raise PermissionError("private path/body")
+            return original_open(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "open", denied)
+    else:
+        def denied(*args):
+            raise PermissionError("private path/body")
+        monkeypatch.setattr(module.os, "replace", denied)
+    def acquire(*args, **kwargs):
+        raise ProfileCaptureError("HEADER_INVOKE_FAILED")
+    _, ready, reply, _, _ = _diagnostic_child(rig, monkeypatch, acquire)
+    assert ready.is_set() and reply["error_code"] == "identity_profile_capture_failed"
+    assert path.read_bytes() == b'{"previous":true}' and not list(path.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("mode", ["expired", "revoked"])
+def test_child_diagnostic_does_not_revive_expired_or_revoked_capture(setup, monkeypatch, mode):
+    calls = []
+    revoked = threading.Event()
+    if mode == "revoked":
+        revoked.set()
+    deadline = datetime.now(UTC) - timedelta(seconds=1) if mode == "expired" else None
+    request, ready, reply, _, diagnostic = _diagnostic_child(
+        setup, monkeypatch, lambda *args, **kwargs: calls.append(True), deadline=deadline, revoked=revoked)
+    assert not calls and diagnostic["code"] == "identity_profile_capture_revoked"
+    assert diagnostic["deadline_at"] == request.deadline_at.isoformat() and diagnostic["stage"] == "admission"
+    assert ready.is_set() is (mode == "expired")
+    assert (reply["error_code"] if reply else None) == ("identity_profile_capture_revoked" if mode == "expired" else None)
+
+
+def test_successful_child_emits_no_failure_diagnostic(setup, monkeypatch):
+    _, ready, reply, path, diagnostic = _diagnostic_child(setup, monkeypatch, lambda *args, **kwargs: setup.acquired)
+    assert ready.is_set() and reply["acquisition"] == setup.acquired.model_dump(mode="json")
+    assert diagnostic is None and not path.exists()
 
 
 @pytest.mark.parametrize("field,value", [("helper_path", "relative.exe"), ("vault_path", "relative"),
