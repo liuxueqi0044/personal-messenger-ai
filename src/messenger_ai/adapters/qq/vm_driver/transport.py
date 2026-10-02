@@ -1257,20 +1257,17 @@ class WindowsUIAQQAccessibility:
                 if self._matches(item, selector, automation_ancestors, type_ancestors)]
 
     def _descendants(self, root: Any) -> Iterable[Any]:
-        phase = getattr(self, "_active_phase", None)
-        if phase is not None and phase.root is root:
-            for node in phase.nodes():
-                yield node.control
-            return
         for item, _automation_ancestors, _type_ancestors in self._walk(root):
             yield item
 
     def _walk(self, root: Any) -> Iterable[tuple[Any, tuple[str, ...], tuple[str, ...]]]:
         phase = getattr(self, "_active_phase", None)
-        if phase is not None and phase.root is root:
-            for node in phase.nodes():
-                yield node.control, node.automation_ancestors, node.type_ancestors
-            return
+        if phase is not None:
+            nodes = phase.subtree_nodes(root)
+            if nodes is not None:
+                for node in nodes:
+                    yield node.control, node.automation_ancestors, node.type_ancestors
+                return
         queue = [(item, (), ()) for item in root.GetChildren()]
         while queue:
             item, automation_ancestors, type_ancestors = queue.pop(0)

@@ -7,6 +7,7 @@ from collections import Counter
 import pytest
 
 from messenger_ai.adapters.qq import QQConversation, QQSelector, QQWindow
+from messenger_ai.adapters.qq.vm_driver.phase_index import UIAPhaseIndex
 from messenger_ai.adapters.qq.vm_driver.transport import (
     UIAUnavailable,
     WindowsUIAQQAccessibility,
@@ -110,6 +111,168 @@ class Node:
     def GetLegacyIAccessiblePattern(self):
         self.calls["GetLegacyIAccessiblePattern"] += 1
         return self.legacy_pattern
+
+
+@pytest.mark.parametrize("cache_kind", ["property", "pattern", "call"])
+def test_cached_subtree_wrapper_is_retained_until_phase_closes(cache_kind):
+    root = Node(control="Window")
+    phase = UIAPhaseIndex(window=object(), root=root, pattern_loader=lambda *_args: None)
+    control = Node(class_name="item__info")
+    reference = weakref.ref(control)
+    if cache_kind == "property":
+        assert phase.property(control, "ClassName") == "item__info"
+    elif cache_kind == "pattern":
+        assert phase.pattern(control, "GetValuePattern", 10002) is None
+    else:
+        assert phase.call(control, "GetRuntimeId") == (1,)
+    del control
+    gc.collect()
+    assert reference() is not None
+    phase.close()
+    gc.collect()
+    assert reference() is None
+
+
+def test_subtree_with_fresh_transient_wrappers_never_borrows_another_nodes_class():
+    class FreshSubtree:
+        def GetChildren(self):
+            return [Node(class_name="avatar"), Node(class_name="item__info"), Node(class_name="summary-main")]
+
+    access = _transport(Node(control="Window"))
+    selector = QQSelector(name="info",control_type="Group",class_name_tokens=("item__info",))
+    with access.read_phase(QQWindow(process_id=7,window_handle=9,class_name="QQ")):
+        for _ in range(40):
+            matches = access._select(FreshSubtree(),selector)
+            assert [item.ClassName for item in matches] == ["item__info"]
+            del matches
+
+
+class NameForbiddenNode(Node):
+    @property
+    def Name(self):
+        raise AssertionError("structural phase selection must not read Name")
+
+    @Name.setter
+    def Name(self, value):
+        pass
+
+
+def _structural_tree():
+    label = NameForbiddenNode(control="TextControl", class_name="label")
+    preview = NameForbiddenNode(control="TextControl", class_name="preview")
+    summary = NameForbiddenNode(class_name="summary-main", automation_id="summary-id", children=(preview,))
+    info = NameForbiddenNode(class_name="item__info", automation_id="info-id", children=(label, summary))
+    row = NameForbiddenNode(class_name="recent-contact-item", automation_id="row-id", children=(info,))
+    other_label = NameForbiddenNode(control="Text", class_name="other-label")
+    other_info = NameForbiddenNode(class_name="item__info", children=(other_label,))
+    other_row = NameForbiddenNode(class_name="recent-contact-item", children=(other_info,))
+    pane = NameForbiddenNode(control="PaneControl", automation_id="pane-id", children=(row, other_row))
+    root = NameForbiddenNode(control="WindowControl", children=(pane,))
+    return root, pane, row, info, label, summary, preview, other_row, other_info, other_label
+
+
+def test_indexed_subtree_preserves_relative_ancestors_and_direct_boundaries_without_name_reads():
+    nodes = _structural_tree()
+    root, pane, row, info, label, summary, preview, other_row, other_info, other_label = nodes
+    access = _transport(root)
+    window = QQWindow(process_id=7, window_handle=9, class_name="QQ")
+    info_selector = QQSelector(name="info", control_type="Group", class_name_tokens=("item__info",))
+    text_selector = QQSelector(name="text", control_type="Text")
+    relative_preview = QQSelector(name="preview", control_type="Text",
+        ancestor_automation_ids=("summary-id",), ancestor_control_types=("group",))
+    with access.read_phase(window) as phase:
+        assert access._select(root, info_selector) == [info, other_info]
+        assert access._select(row, info_selector) == [info]
+        assert access._select(info, text_selector) == [label, preview]
+        assert access._select(other_row, text_selector) == [other_label]
+        assert list(access._descendants(row)) == [info, label, summary, preview]
+        assert phase.indexed_children(info) == (label, summary)
+        assert access._select(info, relative_preview) == [preview]
+        # The subtree root's own global ancestors and AutomationId are excluded.
+        global_only = info_selector.model_copy(update={"ancestor_control_types": ("pane", "group")})
+        assert access._select(root, global_only) == [info, other_info]
+        assert access._select(row, global_only) == []
+        walked = list(access._walk(row))
+        assert [(a, t) for _, a, t in walked] == [
+            ((), ()), (("info-id",), ("group",)), (("info-id",), ("group",)),
+            (("info-id", "summary-id"), ("group", "group")),
+        ]
+        for _ in range(5):
+            assert access._select(row, info_selector) == [info]
+            assert phase.indexed_children(info) == (label, summary)
+    assert all(node.calls["GetChildren"] == 1 for node in nodes)
+    assert all(node.calls["GetRuntimeId"] == 0 for node in nodes)
+
+
+def test_navigation_direct_children_share_materialized_phase_without_preview_descendants():
+    from messenger_ai.adapters.qq.navigation.windows_backend import WindowsNavigationCommandHandler
+    nodes = _structural_tree()
+    root, _, _, info, label, _, _, *_ = nodes
+    access = _transport(root)
+    handler = object.__new__(WindowsNavigationCommandHandler)
+    handler.transport = access
+    window = QQWindow(process_id=7, window_handle=9, class_name="QQ")
+    selector = QQSelector(name="nickname", control_type="Text")
+    with access.read_phase(window) as phase:
+        phase.nodes()
+        assert handler._direct_matches(info, selector) == [label]
+        assert handler._direct_matches(info, selector) == [label]
+    assert all(node.calls["GetChildren"] == 1 for node in nodes)
+
+
+def test_unknown_fresh_wrapper_with_same_runtime_id_uses_safe_fallback_without_aliasing():
+    root, _, known_row, *_ = _structural_tree()
+    access = _transport(root)
+    fresh_child = NameForbiddenNode(control="Text", class_name="fresh-only")
+    fresh_wrapper = NameForbiddenNode(runtime_id=known_row._runtime_id, children=(fresh_child,))
+    window = QQWindow(process_id=7, window_handle=9, class_name="QQ")
+    with access.read_phase(window) as phase:
+        phase.nodes()
+        assert phase.subtree_nodes(fresh_wrapper) is None
+        assert phase.indexed_children(fresh_wrapper) is None
+        assert access._select(fresh_wrapper, QQSelector(name="fresh", control_type="Text")) == [fresh_child]
+        reference = weakref.ref(fresh_child)
+        del fresh_child
+        fresh_wrapper._children.clear()
+        gc.collect()
+        assert reference() is not None  # Fallback property caches retain wrapper.
+        assert known_row.calls["GetChildren"] == 1
+        assert fresh_wrapper.calls["GetChildren"] == 1
+        assert fresh_wrapper.calls["GetRuntimeId"] == 0
+    gc.collect()
+    assert reference() is None
+
+
+def test_phase_close_releases_root_edges_nodes_and_fallback_cached_controls():
+    nodes = _structural_tree()
+    references = [weakref.ref(node) for node in nodes]
+    phase = UIAPhaseIndex(window=object(), root=nodes[0], pattern_loader=lambda *_args: None)
+    phase.nodes()
+    assert phase.indexed_children(nodes[3])
+    del nodes
+    gc.collect()
+    assert all(reference() is not None for reference in references)
+    phase.close()
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    assert phase.root is None and not phase._children and not phase._cached_controls
+    for method in (phase.nodes, lambda: phase.subtree_nodes(object()), lambda: phase.indexed_children(object())):
+        with pytest.raises(RuntimeError, match="no longer valid"):
+            method()
+
+
+def test_interrupted_materialization_never_publishes_partial_subtree_graph():
+    class BrokenNode(NameForbiddenNode):
+        def GetChildren(self):
+            raise UIAUnavailable("provider enumeration failed")
+    broken = BrokenNode()
+    root = NameForbiddenNode(control="Window", children=(broken,))
+    phase = UIAPhaseIndex(window=object(), root=root, pattern_loader=lambda *_args: None)
+    with pytest.raises(UIAUnavailable):
+        phase.nodes()
+    assert phase._nodes is None and not phase._children
+    assert phase.indexed_children(broken) is None
+    phase.close()
 
 
 def _selector():

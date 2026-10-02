@@ -1,8 +1,8 @@
 """Start one runtime and report Web reachability separately from QQ health.
 
 `web_reachable` records the spawned PID's uniquely assigned local WebUI port.
-`ready` additionally requires explicit driver health evidence, which this
-supervisor does not currently possess; it must not be inferred from HTTP 200.
+`ready` additionally requires fresh, same-run successful QQ observation
+evidence. HTTP 200 alone never establishes driver readiness.
 """
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ WORKER_WITNESS_SCHEMA = "pmai-qq-runtime-worker-status-v1"
 MAX_WITNESS_WRITE_AGE_SECONDS = 10
 MIN_OBSERVE_FRESHNESS_SECONDS = 30.0
 MAX_OBSERVE_FRESHNESS_SECONDS = 600.0
+HYBRID_WITNESS_SCHEMA = "qq_hybrid_runtime_status_v2"
+HYBRID_OBSERVE_FRESHNESS_SECONDS = 90.0
 _TRANSIENT_WINDOWS_FILE_ERRORS = frozenset({5, 32, 33})
 _PUBLISH_RETRY_DELAYS = (0.05, 0.10, 0.15)
 SUPERVISOR_EVENT_LOG = Path(r"C:\PMAI\data\logs\qq-session-runtime-supervisor.stderr.log")
@@ -89,6 +91,66 @@ def _validate_requested_snapshot(
             or generation.get("generation_id") != expected_generation_id
         ):
             raise ValueError("runtime generation does not match requested build")
+
+
+def _hybrid_settings_snapshot(path: str, *, expected_sha256: str | None,
+                              active_binding_ids: list[str], config: dict) -> tuple[Path, str, tuple[dict, ...]]:
+    """Freeze launch bytes and existing business scope; never enroll identity."""
+    settings_path = Path(path)
+    if not settings_path.is_absolute() or not settings_path.is_file() or settings_path.is_symlink():
+        raise ValueError("hybrid settings must be an absolute regular snapshot")
+    if (not active_binding_ids or len(set(active_binding_ids)) != len(active_binding_ids)
+            or any(not isinstance(key, str) or not 1 <= len(key) <= 128 for key in active_binding_ids)):
+        raise ValueError("explicit unique hybrid binding IDs are required")
+    with settings_path.open("rb") as stream:
+        payload = stream.read(262145)
+    if not payload or len(payload) > 262144:
+        raise ValueError("hybrid settings snapshot is not bounded")
+    digest = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 is not None and (
+            len(expected_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in expected_sha256)
+            or digest != expected_sha256.casefold()):
+        raise ValueError("hybrid settings do not match requested build")
+    settings = json.loads(payload.decode("utf-8"))
+    if (not isinstance(settings, dict) or settings.get("schema_version") != "qq_hybrid_runtime_v2"
+            or settings.get("enabled") is not True or not isinstance(settings.get("inputs"), list)):
+        raise ValueError("explicit hybrid settings are required")
+    bindings = config.get("bindings")
+    if bindings is None:
+        contacts = config.get("contacts")
+        if not isinstance(contacts, list) or any(not isinstance(item, dict) for item in contacts):
+            raise ValueError("hybrid business registry is unavailable")
+        bindings = [item.get("binding") for item in contacts]
+    if not isinstance(bindings, list) or any(not isinstance(item, dict) for item in bindings):
+        raise ValueError("hybrid business registry is unavailable")
+    registered = {item.get("binding_id"): item for item in bindings}
+    if (len(registered) != len(bindings) or any(key not in registered for key in active_binding_ids)
+            or any(not isinstance(registered[key].get(field), str) or not registered[key][field]
+                   for key in active_binding_ids for field in (
+                       "account_id", "contact_id", "hub_conversation_id"))):
+        raise ValueError("hybrid binding is not registered")
+    targets = {}
+    for item in settings["inputs"]:
+        if not isinstance(item, dict) or not isinstance(item.get("target"), dict):
+            raise ValueError("hybrid target scope is unavailable")
+        target = item["target"]
+        key = target.get("binding_id")
+        binding = registered.get(key)
+        if (key in targets or key not in active_binding_ids or binding is None
+                or target.get("account_id") != binding.get("account_id")
+                or target.get("conversation_id") != binding.get("hub_conversation_id")
+                or item.get("contact_id") != binding.get("contact_id")
+                or target.get("identity_mode") != "persistent"
+                or type(target.get("binding_revision")) is not int or target["binding_revision"] < 1
+                or any(not isinstance(target.get(field), str) or not target[field]
+                       for field in ("account_id", "conversation_id", "binding_id"))):
+            raise ValueError("hybrid target disagrees with existing business scope")
+        targets[key] = {field: target[field] for field in (
+            "account_id", "conversation_id", "binding_id", "binding_revision")}
+        targets[key]["contact_id"] = item["contact_id"]
+    if set(targets) != set(active_binding_ids) or len({item["conversation_id"] for item in targets.values()}) != len(targets):
+        raise ValueError("hybrid active target scope is incomplete")
+    return settings_path, digest, tuple(targets[key] for key in active_binding_ids)
 
 
 def _publish_event(*, run_id: str, event: str, count: int,
@@ -226,6 +288,84 @@ def _worker_witness(run_id: str) -> tuple[dict[str, object] | None, list[str]]:
     if age < 0 or age > MAX_WITNESS_WRITE_AGE_SECONDS:
         return None, ["WORKER_WITNESS_STALE"]
     return value, []
+
+
+def _hybrid_witness(data: Path, run_id: str, *, started_at: str,
+                    active_targets: tuple[dict, ...]) -> tuple[dict | None, list[str]]:
+    try:
+        path = data / "qq-hybrid-runtime-status.json"
+        with path.open("rb") as stream:
+            payload = stream.read(32769)
+        if len(payload) > 32768:
+            raise ValueError()
+        value = json.loads(payload)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None, ["HYBRID_WITNESS_MISSING"]
+    if not isinstance(value, dict) or value.get("schema") != HYBRID_WITNESS_SCHEMA:
+        return None, ["HYBRID_WITNESS_SCHEMA_MISMATCH"]
+    if value.get("run_id") != run_id:
+        return None, ["HYBRID_WITNESS_RUN_MISMATCH"]
+    try:
+        written = datetime.fromisoformat(value["written_at"].replace("Z", "+00:00"))
+        since = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        now = datetime.now(UTC)
+        session = value["session"]
+        active = value["active_conversations"]
+        if (written.tzinfo is None or since.tzinfo is None or written < since
+                or type(value["global_revision"]) is not int or value["global_revision"] < 1
+                or type(value["paused"]) is not bool or not isinstance(session, dict)
+                or session.get("schema") != "qq_hybrid_session_v2"
+                or session.get("state") not in {"idle", "starting", "active", "closing", "cleanup_required", "closed"}
+                or type(session.get("cleanup_required")) is not bool
+                or not isinstance(active, list) or any(not isinstance(item, str) for item in active)
+                or len(active) != len(set(active))
+                or set(active) != {target["conversation_id"] for target in active_targets}):
+            raise ValueError()
+        if session["state"] in {"starting", "active", "closing", "cleanup_required"}:
+            if (session.get("purpose") not in {"observe", "draft", "verify", "health"}
+                    or uuid.UUID(session.get("worker_epoch")).int == 0):
+                raise ValueError()
+        if not 0 <= (now-written).total_seconds() <= MAX_WITNESS_WRITE_AGE_SECONDS:
+            return None, ["HYBRID_WITNESS_STALE"]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None, ["HYBRID_WITNESS_INVALID"]
+    return value, []
+
+
+def _hybrid_driver_status(metrics, witness, witness_reasons) -> tuple[str, list[str]]:
+    """Finite child idleness is valid; only fresh actual observations give ready."""
+    if ((metrics is not None and metrics.get("global_paused") is True)
+            or (witness is not None and witness.get("paused") is True)):
+        return "paused", ["GLOBAL_PAUSED"]
+    if witness_reasons:
+        return "unknown", list(witness_reasons)
+    if metrics is None or witness is None:
+        return "unknown", ["HYBRID_READINESS_EVIDENCE_MISSING"]
+    session = witness["session"]
+    if session.get("cleanup_required") is True or session.get("state") == "cleanup_required":
+        return "degraded", ["WORKER_CLEANUP_REQUIRED"]
+    if session.get("state") == "closed":
+        return "degraded", ["SESSION_CLOSED"]
+    if (type(metrics.get("global_revision")) is not int
+            or metrics["global_revision"] != witness["global_revision"]):
+        return "unknown", ["GLOBAL_CONTROL_WITNESS_MISMATCH"]
+    if metrics.get("active_identity_current") is not True:
+        return "degraded", ["ACTIVE_BINDING_CHANGED"]
+    pauses = metrics.get("active_conversation_pause_reason_counts")
+    if (not isinstance(pauses, dict) or any(type(count) is not int or count < 0 for count in pauses.values())):
+        return "unknown", ["ACTIVE_METRICS_INVALID"]
+    if sum(count for reason, count in pauses.items() if reason != "none"):
+        return "degraded", ["CONVERSATION_PAUSED"]
+    expected = metrics.get("active_conversation_count")
+    if (type(expected) is not int or expected < 1
+            or type(metrics.get("this_run_active_unpaused_observed_count")) is not int
+            or type(metrics.get("fresh_active_unpaused_observed_count")) is not int):
+        return "unknown", ["ACTIVE_METRICS_INVALID"]
+    if metrics["this_run_active_unpaused_observed_count"] != expected:
+        return "unknown", ["CONTACT_OBSERVATION_INCOMPLETE"]
+    if metrics["fresh_active_unpaused_observed_count"] != expected:
+        return "unknown", ["SUCCESSFUL_OBSERVE_STALE"]
+    return "available", []
 
 
 def _recent_successful_observe(witness: dict[str, object]) -> tuple[bool, str]:
@@ -434,6 +574,48 @@ def _metrics(data: Path, started_at: str) -> dict[str, object] | None:
         return None
 
 
+def _hybrid_metrics(data: Path, started_at: str, targets: tuple[dict, ...]) -> dict | None:
+    metrics = _metrics(data, started_at)
+    if metrics is None:
+        return None
+    try:
+        now, since = datetime.now(UTC), datetime.fromisoformat(started_at)
+        placeholders = ",".join("?" for _ in targets)
+        with closing(sqlite3.connect((data / "runtime.sqlite3").as_uri()+"?mode=ro", uri=True)) as db:
+            db.execute("BEGIN")  # One current control/identity/observation read view.
+            control = db.execute("SELECT revision,paused,reason FROM runtime_global_control WHERE singleton=1").fetchone()
+            rows = db.execute("SELECT conversation_id,account_id,contact_id,binding_revision,conversation_type,"
+                "paused,pause_reason,last_observed_at FROM runtime_conversations WHERE conversation_id IN ("
+                + placeholders + ")", tuple(target["conversation_id"] for target in targets)).fetchall()
+        if control is None or type(control[0]) is not int or control[0] < 1 or control[1] not in (0, 1):
+            return None
+        expected = {target["conversation_id"]: target for target in targets}
+        current = len(rows) == len(targets)
+        pauses, observed, fresh = {}, 0, 0
+        for conversation_id, account, contact, revision, kind, paused, reason, completed in rows:
+            target = expected[conversation_id]
+            current = current and (account == target["account_id"] and contact == target["contact_id"]
+                and revision == target["binding_revision"] and kind == "direct" and paused in (0, 1))
+            code = reason or ("paused_without_reason" if paused else "none")
+            pauses[code] = pauses.get(code, 0)+1
+            if not paused and completed is not None:
+                instant = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+                if instant.tzinfo is None:
+                    return None
+                if since <= instant <= now:
+                    observed += 1
+                    if (now-instant).total_seconds() <= HYBRID_OBSERVE_FRESHNESS_SECONDS:
+                        fresh += 1
+        return {**metrics, "global_revision": control[0], "global_paused": bool(control[1]),
+            "global_pause_reason": control[2], "active_identity_current": current,
+            "active_conversation_count": len(targets), "active_conversation_pause_reason_counts": pauses,
+            "this_run_active_unpaused_observed_count": observed,
+            "fresh_active_unpaused_observed_count": fresh,
+            "hybrid_observe_freshness_seconds": HYBRID_OBSERVE_FRESHNESS_SECONDS}
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     def positive_revision(value: str) -> int:
         revision = int(value)
@@ -445,7 +627,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-config-sha256")
     parser.add_argument("--expected-generation-id")
     parser.add_argument("--expected-session-binding-revision", type=positive_revision)
+    parser.add_argument("--hybrid-settings")
+    parser.add_argument("--expected-hybrid-settings-sha256")
+    parser.add_argument("--active-binding", action="append", default=[])
     args = parser.parse_args([] if argv is None else argv)
+    if not args.hybrid_settings and (args.active_binding or args.expected_hybrid_settings_sha256):
+        parser.error("hybrid binding/settings digest requires --hybrid-settings")
     run_id = str(uuid.uuid4())
     started_at = datetime.now(UTC).isoformat()
     port = _reserve_loopback_port()
@@ -492,6 +679,21 @@ def main(argv: list[str] | None = None) -> int:
                        "stopped_at": datetime.now(UTC).isoformat()})
         _publish_status(report, publish_tracker)
         return 2
+    hybrid_path = hybrid_digest = None
+    hybrid_targets = ()
+    if args.hybrid_settings:
+        try:
+            hybrid_path, hybrid_digest, hybrid_targets = _hybrid_settings_snapshot(args.hybrid_settings,
+                expected_sha256=args.expected_hybrid_settings_sha256,
+                active_binding_ids=args.active_binding, config=config)
+        except (OSError, ValueError, TypeError, UnicodeDecodeError):
+            report.update({"state": "stopped", "error_code": "HYBRID_SETTINGS_INVALID",
+                           "stopped_at": datetime.now(UTC).isoformat()})
+            _publish_status(report, publish_tracker)
+            return 2
+        runtime = runtime.with_name("run_vm_runtime_v2.py")
+        report.update({"runtime_mode": "hybrid_v2", "hybrid_settings_sha256": hybrid_digest,
+                       "active_binding_ids": list(args.active_binding)})
     generation = config.get("runtime_generation")
     binding = config.get("session_binding")
     report.update({
@@ -520,6 +722,11 @@ def main(argv: list[str] | None = None) -> int:
         "--web-port",
         str(port),
     ]
+    if hybrid_path is not None:
+        command.extend(["--hybrid-settings", str(hybrid_path),
+                        "--expected-hybrid-settings-sha256", hybrid_digest])
+        for binding_id in args.active_binding:
+            command.extend(["--active-binding", binding_id])
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout_log = open(LOG_DIR / "qq-session-runtime.stdout.log", "ab", buffering=0)
     stderr_log = open(LOG_DIR / "qq-session-runtime.stderr.log", "ab", buffering=0)
@@ -536,9 +743,15 @@ def main(argv: list[str] | None = None) -> int:
     ever_web_reachable = False
     while process.poll() is None:
         observation = _http_observation(port)
-        metrics = _metrics(data, str(report["started_at"]))
-        witness, witness_reasons = _worker_witness(run_id)
-        driver_state, driver_reasons = _driver_status(metrics, witness, witness_reasons)
+        if hybrid_path is None:
+            metrics = _metrics(data, str(report["started_at"]))
+            witness, witness_reasons = _worker_witness(run_id)
+            driver_state, driver_reasons = _driver_status(metrics, witness, witness_reasons)
+        else:
+            metrics = _hybrid_metrics(data, str(report["started_at"]), hybrid_targets)
+            witness, witness_reasons = _hybrid_witness(data, run_id, started_at=str(report["started_at"]),
+                                                     active_targets=hybrid_targets)
+            driver_state, driver_reasons = _hybrid_driver_status(metrics, witness, witness_reasons)
         control = _control_result(run_id)
         if observation is not None:
             ever_web_reachable = True

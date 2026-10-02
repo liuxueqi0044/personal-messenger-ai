@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from messenger_ai.domain import SendOperation
 from messenger_ai.domain.clock import ClockPort
 from messenger_ai.hub.service import HubService, SQLiteHubStore
 from messenger_ai.llm.planner import ReplyPlanner
 from messenger_ai.llm.providers import ModelProvider
 from messenger_ai.memory.service import MemoryService
 from messenger_ai.memory.store import SQLiteMemoryStore
-from messenger_ai.pacing import PacingScheduler
+from messenger_ai.pacing import DueForRevalidation, PacingScheduler
 from messenger_ai.policy import (
     AuthorizationService,
     CapabilitySnapshot,
@@ -21,10 +24,11 @@ from messenger_ai.rules.service import AtomicRulePackStore
 
 from .contracts import V5MessengerDriver
 from .coordinator import RuntimeCoordinator
-from .due_dispatch import DueCoordinator
+from .due_dispatch import DueCoordinator, DueNavigationPreflight
 from .planning import PlanningCoordinator
 from .send_dispatcher import SendDispatcher
 from .state import RuntimeState, VerifiedSendStorePaths
+from .staged_preparation import StagedPreparationPort
 
 
 @dataclass
@@ -62,6 +66,9 @@ class RuntimeApplication:
         rows = self.state.connection.execute(
             "SELECT conversation_id FROM runtime_conversations ORDER BY conversation_id"
         ).fetchall()
+        active_ids = getattr(self.driver, "observation_conversation_ids", None)
+        if active_ids is not None:
+            rows = [row for row in rows if row["conversation_id"] in active_ids]
         observed = 0
         if rows and not globally_paused:
             conversation_id = rows[self._rr_index % len(rows)]["conversation_id"]
@@ -232,7 +239,11 @@ def assemble_runtime(*, data_dir: str | Path, planner_provider: ModelProvider,
                      clock: ClockPort | None = None,
                      recover_persistent_state: bool = True,
                      initially_paused: bool = False,
-                     initial_pause_reason: str = "initial_global_pause") -> RuntimeApplication:
+                     initial_pause_reason: str = "initial_global_pause",
+                     navigation_preflight: DueNavigationPreflight | None = None,
+                     due_operation_recovery: Callable[[DueForRevalidation, SendOperation], Awaitable[SendOperation | None]] | None = None,
+                     staged_preparation: StagedPreparationPort | None = None,
+                     staged_monotonic_ns_clock: Callable[[], int] = time.monotonic_ns) -> RuntimeApplication:
     if model_concurrency < 1:
         raise ValueError("model_concurrency must be positive")
     root = Path(data_dir).resolve()
@@ -274,9 +285,14 @@ def assemble_runtime(*, data_dir: str | Path, planner_provider: ModelProvider,
         state=state, hub=hub, pacing=pacing, authorization=authorization, driver=driver)
     due = DueCoordinator(
         state=state, hub=hub, pacing=pacing, rules=rules,
-        authorization=authorization, dispatcher=dispatcher, capability_provider=lambda: capability)
+        authorization=authorization, dispatcher=dispatcher, capability_provider=lambda: capability,
+        navigation_preflight=navigation_preflight, due_operation_recovery=due_operation_recovery,
+        staged_preparation=staged_preparation, monotonic_ns_clock=staged_monotonic_ns_clock)
     if recover_persistent_state:
         coordinator.recover()
         state.recover_planning_jobs()
-    return RuntimeApplication(root, state, hub, memory, pacing, rules, planner_provider, driver,
-                              coordinator, planning, due, model_concurrency)
+    app = RuntimeApplication(root, state, hub, memory, pacing, rules, planner_provider, driver,
+                             coordinator, planning, due, model_concurrency)
+    if staged_preparation is not None:
+        due.control_cancelled = app._pause_requested.is_set
+    return app

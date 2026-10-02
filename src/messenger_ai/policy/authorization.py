@@ -301,6 +301,10 @@ class AuthorizationService:
         self._clock = clock
         self._ttl = timedelta(seconds=ttl_seconds)
 
+    def revalidate_due_passthrough(self, eligibility: PolicyDecision, request: PolicyRequest) -> PolicyDecision:
+        """Read-only preparation check; creates or consumes no authorization."""
+        return self._engine.revalidate_due(eligibility, request)
+
     def authorize_due(
         self,
         eligibility: PolicyDecision,

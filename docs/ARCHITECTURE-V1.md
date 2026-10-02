@@ -2,6 +2,8 @@
 
 日期：2026-10-01。审查代码：`08d53ebde9fe031dbc21f6e3b715efa6effb7b71`。
 
+后续版本以 [V2 混合视觉导航架构](ARCHITECTURE-V2.md) 为设计入口。V2 接替本文的驱动、导航、身份交接和实施顺序；本文的产品范围、人设与记忆、控制、持久化及备份原则仍作为基础。以下内容保留为 V1 设计记录，不表示全部已经实施。
+
 **状态：待实施的目标架构。本文不表示代码已经重构，也不表示实机已经通过验收。** 本轮只编写架构文档；客户端、虚拟机和自动回复保持原有暂停状态。
 
 ## 1. 项目到底要交付什么
@@ -428,4 +430,4 @@ Memory/LLM/Rules 主要复用并补接口；Hub 的通用消息存储和幂等�
 - UIA 标识语义：[Microsoft GetRuntimeId](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getruntimeid)；线程生命周期：[Microsoft UIA Threading](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)。
 - 可复用基础：[Python-UIAutomation-for-Windows](https://github.com/yinkaisheng/Python-UIAutomation-for-Windows)、[FlaUI](https://github.com/FlaUI/FlaUI)。已静态审查 [QQSafeChat](https://github.com/TheD0ubleC/QQSafeChat) 的 bdf14db 提交，借鉴控件定位，不将其作为已验证多联系人替代品。
 
-本文是后续设计与实施的统一入口。新的实现必须标明通过了哪一层验收；文档写完、离线测试通过和真实运行完成是三个不同状态。
+本文是 V1 设计记录；后续驱动改造按 V2 入口实施。新的实现必须标明通过了哪一层验收；文档写完、离线测试通过和真实运行完成是三个不同状态。

@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory)][string]$WheelPath,
     [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$ReleaseId,
     [string]$StagingRoot,
-    [string]$SelectorPackPath
+    [string]$SelectorPackPath,
+    [string]$HybridProbeHelperPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,7 @@ if (Test-Path -LiteralPath $release) { throw "Release staging directory already 
 $sources = [ordered]@{
     'personal_messenger_ai-0.1.0-py3-none-any.whl' = $wheel
     'run_vm_runtime.py' = (Join-Path $projectRoot 'scripts\run_vm_runtime.py')
+    'run_vm_runtime_v2.py' = (Join-Path $projectRoot 'scripts\run_vm_runtime_v2.py')
     'release_qq_observation_quarantine.py' = (Join-Path $projectRoot 'scripts\release_qq_observation_quarantine.py')
     're_evaluate_planning_job.py' = (Join-Path $projectRoot 'scripts\re_evaluate_planning_job.py')
     'qq_session_observed_bootstrap_guest.py' = (Join-Path $PSScriptRoot 'qq_session_observed_bootstrap_guest.py')
@@ -44,6 +46,16 @@ $sources = [ordered]@{
     'Start-GuestLocalRuntime.ps1' = (Join-Path $PSScriptRoot 'Start-GuestLocalRuntime.ps1')
     'Test-GuestLocalRelease.ps1' = (Join-Path $PSScriptRoot 'Test-GuestLocalRelease.ps1')
     'GUEST_LOCAL_RELEASE_CONTRACT.md' = (Join-Path $PSScriptRoot 'GUEST_LOCAL_RELEASE_CONTRACT.md')
+}
+if (-not [string]::IsNullOrWhiteSpace($HybridProbeHelperPath)) {
+    $hybridHelper = (Resolve-Path -LiteralPath $HybridProbeHelperPath -ErrorAction Stop).Path
+    if ((Split-Path $hybridHelper -Leaf) -ne 'QQ.UiaProbe.exe') { throw 'Hybrid helper must be QQ.UiaProbe.exe' }
+    $sources['QQ.UiaProbe.exe'] = $hybridHelper
+    # The self-contained single-file WPF publish leaves these native runtime
+    # dependencies beside the executable. Freeze the complete tested payload.
+    foreach ($dependency in @('D3DCompiler_47_cor3.dll','PenImc_cor3.dll','PresentationNative_cor3.dll','vcruntime140_cor3.dll','wpfgfx_cor3.dll')) {
+        $sources[$dependency] = Join-Path (Split-Path $hybridHelper -Parent) $dependency
+    }
 }
 foreach ($source in $sources.Values) {
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required release source is missing: $source" }
