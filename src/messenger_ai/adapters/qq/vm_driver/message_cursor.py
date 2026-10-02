@@ -113,6 +113,17 @@ class MessageCursorStore:
             else None
         )
 
+    @staticmethod
+    def semantic_snapshot_token(bubbles: list[dict[str, object]]) -> str:
+        """Compare a fresh raw UI sequence with the existing durable snapshot.
+
+        This computes a value only. It does not ingest, adopt, reanchor, change
+        sequence numbers or turn a freshly read token into an expected token.
+        """
+        return _snapshot_sha256(
+            json.dumps([_identity(item) for item in bubbles]), CURRENT_IDENTITY_SCHEMA
+        )
+
     def _append_reanchor_audit(self, *, conversation_id: str, operator_id: str,
                                reason_code: str, expected: str,
                                observed: str, replacement: str, next_seq: int,

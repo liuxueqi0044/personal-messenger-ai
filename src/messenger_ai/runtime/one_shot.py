@@ -324,6 +324,15 @@ async def _await_before_deadline(factory, *, deadline: float):
         raise _OneShotDeadlineExpired(started=True) from exc
 
 
+async def _dispatch_exact_with_control_fence(app, **kwargs):
+    """Use the application pause fence; the fallback supports isolated test doubles."""
+
+    dispatch = getattr(app, "dispatch_exact_with_control_fence", None)
+    if callable(dispatch):
+        return await dispatch(**kwargs)
+    return await app.due.dispatch_exact(**kwargs)
+
+
 def _cancel_plan(app, pacing_plan_id: UUID) -> bool:
     """Require durable confirmation that the exact plan changed to cancelled."""
 
@@ -664,7 +673,8 @@ async def run_one_shot_reply(
         ledger.update(attempt_id=attempt_id, state="dispatch_pending")
         try:
             consumed, operation = await _await_before_deadline(
-                lambda: app.due.dispatch_exact(
+                lambda: _dispatch_exact_with_control_fence(
+                    app,
                     pacing_plan_id=pacing_plan_id,
                     conversation_id=binding.hub_conversation_id,
                     segment_index=0,

@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import argparse
+from messenger_ai.runtime.config_publication import assert_data_publication_complete, assert_publication_complete
 import asyncio
 import ctypes
 import getpass
 import hashlib
+import hmac
 import json
+import math
 import os
 import re
+import sqlite3
 import time
 import traceback
 from datetime import UTC, datetime
@@ -34,6 +38,8 @@ from messenger_ai.memory import Contact, IdentityBinding
 from messenger_ai.observability import WindowsDPAPISecretStore
 from messenger_ai.policy import CapabilitySnapshot
 from messenger_ai.runtime.assembly import assemble_runtime
+from messenger_ai.runtime.state import RuntimeState, VerifiedSendStorePaths
+from messenger_ai.runtime.session_revision import session_revision_number, validate_session_revision
 from messenger_ai.runtime.webui_projection import RuntimeWebUIProjection
 from messenger_ai.webui import LiveHubFacade, create_app
 
@@ -94,10 +100,20 @@ class QQRuntimeInstanceOwner:
         self._kernel32.CloseHandle(handle)
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def load_config(
+    path: str | Path, *, expected_sha256: str | None = None
+) -> dict[str, Any]:
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = Path(path).read_bytes()
+        if expected_sha256 is not None:
+            expected = expected_sha256.casefold()
+            if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+                raise ValueError("expected runtime config digest is invalid")
+            actual = hashlib.sha256(payload).hexdigest()
+            if not hmac.compare_digest(actual, expected):
+                raise ValueError("runtime config digest mismatch")
+        value = json.loads(payload.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read runtime config: {exc}") from exc
     if not isinstance(value, dict) or value.get("schema") != "pmai-v5-runtime-1":
         raise ValueError("unsupported or missing runtime config schema")
@@ -105,6 +121,18 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 SESSION_IDENTITY_MIGRATION_SCHEMA = "pmai-qq-session-identity-migration-v1"
+ISOLATED_GENERATION_SCHEMA = "pmai-isolated-runtime-generation-v1"
+TRUSTED_RUNTIME_ROOT = Path(r"C:\PMAI\data\runtime")
+_ISOLATED_RUNTIME_DATABASES = (
+    "authorization.sqlite3",
+    "hub.sqlite3",
+    "memory.sqlite3",
+    "pacing.sqlite3",
+    "qq-vm-bridge.cursor.sqlite3",
+    "qq-vm-bridge.sqlite3",
+    "rules.sqlite3",
+    "runtime.sqlite3",
+)
 _SESSION_IDENTITY_MIGRATION_KEYS = {
     "schema",
     "binding_id",
@@ -118,6 +146,227 @@ _SESSION_IDENTITY_MIGRATION_KEYS = {
 
 def _signature_evidence_hash(signature: str) -> str:
     return hashlib.sha256(signature.encode("utf-8")).hexdigest()
+
+
+def _has_reparse_component(path: Path) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    try:
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+    except OSError as exc:
+        raise ValueError("isolated runtime generation path is unavailable") from exc
+    return path.is_symlink() or bool(attributes & 0x400)
+
+
+def _existing_path_chain(path: Path) -> tuple[Path, ...]:
+    chain = tuple(reversed((path, *path.parents)))
+    return tuple(component for component in chain if component.exists() or component.is_symlink())
+
+
+def _validate_flat_generation_storage(data_dir: Path) -> None:
+    """Reject aliases for every file that the isolated runtime can mutate."""
+
+    for component in _existing_path_chain(TRUSTED_RUNTIME_ROOT):
+        if _has_reparse_component(component):
+            raise ValueError("isolated runtime trusted path cannot use a reparse point")
+    for name in _ISOLATED_RUNTIME_DATABASES:
+        database = data_dir / name
+        for candidate in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm"), Path(str(database) + "-journal")):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            if _has_reparse_component(candidate):
+                raise ValueError("isolated runtime state cannot use a reparse point")
+            try:
+                stat = os.stat(candidate, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("isolated runtime state is unavailable") from exc
+            if not candidate.is_file() or int(getattr(stat, "st_nlink", 1)) != 1:
+                raise ValueError("isolated runtime state must be a private regular file")
+
+
+def _validated_generation_data_dir(config: dict[str, Any], generation_id: str) -> Path:
+    raw = config.get("data_dir")
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("isolated runtime generation data directory is invalid")
+    data_dir = Path(raw)
+    expected = (
+        TRUSTED_RUNTIME_ROOT
+        / "recovery-generations"
+        / generation_id
+        / "qq-default-account"
+    )
+    if (
+        not data_dir.is_absolute()
+        or ".." in data_dir.parts
+        or os.path.normcase(os.path.abspath(str(data_dir)))
+        != os.path.normcase(os.path.abspath(str(expected)))
+    ):
+        raise ValueError("isolated runtime generation data directory is invalid")
+    for component in (
+        TRUSTED_RUNTIME_ROOT,
+        TRUSTED_RUNTIME_ROOT / "recovery-generations",
+        TRUSTED_RUNTIME_ROOT / "recovery-generations" / generation_id,
+        expected,
+        expected / "generation-manifest.json",
+        expected / "runtime-config.json",
+    ):
+        if _has_reparse_component(component):
+            raise ValueError("isolated runtime generation path cannot use a reparse point")
+    if data_dir.resolve(strict=False) != expected.resolve(strict=False):
+        raise ValueError("isolated runtime generation path alias is invalid")
+    _validate_flat_generation_storage(data_dir)
+    return data_dir
+
+
+def _validated_runtime_generation(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    raw = config.get("runtime_generation")
+    start_paused = config.get("start_globally_paused", False)
+    if not isinstance(start_paused, bool):
+        raise ValueError("start_globally_paused must be a boolean")
+    if raw is None:
+        if start_paused:
+            raise ValueError("start_globally_paused requires an isolated runtime generation")
+        return None
+    expected_keys = {
+        "schema", "generation_id", "mode", "enforce_global_pause",
+        "manifest_sha256",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError("runtime generation fields are invalid")
+    try:
+        generation_id = str(UUID(str(raw.get("generation_id", ""))))
+    except ValueError as exc:
+        raise ValueError("runtime generation id is invalid") from exc
+    if (
+        raw.get("schema") != ISOLATED_GENERATION_SCHEMA
+        or raw.get("generation_id") != generation_id
+        or raw.get("mode") != "isolated_identity_recovery"
+        or raw.get("enforce_global_pause") is not True
+        or re.fullmatch(r"[0-9a-f]{64}", str(raw.get("manifest_sha256", "")))
+        is None
+        or start_paused is not True
+    ):
+        raise ValueError("isolated runtime generation is invalid")
+    data_dir = _validated_generation_data_dir(config, generation_id)
+    manifest_path = data_dir / "generation-manifest.json"
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("isolated runtime generation manifest is unavailable") from exc
+    if hashlib.sha256(manifest_bytes).hexdigest() != raw["manifest_sha256"]:
+        raise ValueError("isolated runtime generation manifest digest mismatch")
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {
+            "schema", "generation_id", "mode", "account_id", "contacts"
+        }
+        or manifest.get("schema")
+        != "pmai-isolated-runtime-generation-manifest-v1"
+        or manifest.get("generation_id") != generation_id
+        or manifest.get("mode") != "isolated_identity_recovery"
+        or manifest.get("account_id") != "qq-default-account"
+        or not isinstance(manifest.get("contacts"), list)
+        or not manifest["contacts"]
+    ):
+        raise ValueError("isolated runtime generation manifest is invalid")
+    return dict(raw), manifest
+
+
+def _validate_generation_contacts(
+    generation: tuple[dict[str, Any], dict[str, Any]] | None,
+    config: dict[str, Any],
+    bindings: tuple[QQIdentityBinding, ...],
+    evidence: tuple[QQSessionObservedDirectIdentity, ...],
+) -> None:
+    if generation is None:
+        return
+    manifest = generation[1]
+    entries = manifest["contacts"]
+    expected_keys = {
+        "binding_id", "account_id", "contact_id", "conversation_id",
+        "platform_conversation_id", "bootstrap_run_id", "evidence_sha256",
+        "participant_evidence_sha256", "initial_adoption_sha256",
+    }
+    by_binding: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != expected_keys:
+            raise ValueError("isolated runtime generation contact manifest is invalid")
+        try:
+            bootstrap_run_id = str(UUID(str(entry.get("bootstrap_run_id", ""))))
+        except ValueError as exc:
+            raise ValueError(
+                "isolated runtime generation contact manifest is invalid"
+            ) from exc
+        binding_id = entry.get("binding_id")
+        if (
+            not isinstance(binding_id, str)
+            or not binding_id
+            or binding_id in by_binding
+            or entry.get("bootstrap_run_id") != bootstrap_run_id
+            or re.fullmatch(r"[0-9a-f]{64}", str(entry.get("evidence_sha256", "")))
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(entry.get("participant_evidence_sha256", "")),
+            )
+            is None
+            or (
+                entry.get("initial_adoption_sha256") is not None
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(entry.get("initial_adoption_sha256"))
+                ) is None
+            )
+        ):
+            raise ValueError("isolated runtime generation contact manifest is invalid")
+        by_binding[binding_id] = entry
+    binding_by_id = {item.binding_id: item for item in bindings}
+    if set(by_binding) != set(binding_by_id) or set(by_binding) != {
+        item.binding_id for item in evidence
+    }:
+        raise ValueError("isolated runtime generation contacts do not match evidence")
+    bootstrap = set(config.get("bootstrap_last_inbound_once", []))
+    provenance = config.get("bootstrap_last_inbound_provenance", {})
+    for proof in evidence:
+        entry = by_binding[proof.binding_id]
+        binding = binding_by_id[proof.binding_id]
+        evidence_hash = hashlib.sha256(
+            json.dumps(
+                proof.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            entry["evidence_sha256"] != evidence_hash
+            or entry["participant_evidence_sha256"]
+            != _signature_evidence_hash(proof.participant_signature)
+            or entry["account_id"] != binding.account_id
+            or entry["contact_id"] != binding.contact_id
+            or entry["conversation_id"] != binding.hub_conversation_id
+            or entry["platform_conversation_id"]
+            != binding.platform_conversation_id
+        ):
+            raise ValueError("isolated runtime generation evidence digest mismatch")
+        conversation_id = binding.hub_conversation_id
+        adoption_hash = entry["initial_adoption_sha256"]
+        adoption = provenance.get(conversation_id)
+        if adoption_hash is None:
+            if conversation_id in bootstrap or adoption is not None:
+                raise ValueError("isolated runtime generation adoption scope mismatch")
+            continue
+        if conversation_id not in bootstrap or not isinstance(adoption, dict):
+            raise ValueError("isolated runtime generation adoption scope mismatch")
+        actual_hash = hashlib.sha256(
+            json.dumps(adoption, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if (
+            adoption_hash != actual_hash
+            or adoption.get("bootstrap_run_id") != entry["bootstrap_run_id"]
+        ):
+            raise ValueError("isolated runtime generation adoption digest mismatch")
 
 
 def _validated_session_identity_migrations(
@@ -180,6 +429,8 @@ def _validated_session_identity_migrations(
 
 
 def validate_config(config: dict[str, Any], *, api_key: str | None) -> tuple[QQSelectorPack, tuple[QQIdentityBinding, ...], tuple[QQSessionObservedDirectIdentity, ...]]:
+    session_revision = validate_session_revision(config, trusted_runtime_root=TRUSTED_RUNTIME_ROOT)
+    generation = _validated_runtime_generation(config)
     contacts = config.get("contacts")
     if not config.get("data_dir"):
         raise ValueError("data_dir is required")
@@ -242,6 +493,7 @@ def validate_config(config: dict[str, Any], *, api_key: str | None) -> tuple[QQS
                 raise ValueError("session observed runtime locator does not match binding")
     elif mode is not None:
         raise ValueError("unsupported identity_mode")
+    _validated_worker_timing(config)
     _validated_visual_selection(config, bindings)
     migrations = _validated_session_identity_migrations(config, bindings, evidence)
     bootstrap = config.get("bootstrap_last_inbound_once", [])
@@ -322,6 +574,18 @@ def validate_config(config: dict[str, Any], *, api_key: str | None) -> tuple[QQS
             or ordinal != count - 1
         ):
             raise ValueError("bootstrap adoption provenance does not match session binding")
+    if session_revision is None:
+        _validate_generation_contacts(generation, config, bindings, evidence)
+    else:
+        # The original manifest remains the immutable generation/adoption root.
+        # The shared revision validator separately restricts the current snapshot
+        # to same-identity locator changes and validates every hash-chain link.
+        base = session_revision.base_config
+        _validate_generation_contacts(
+            generation, base,
+            tuple(QQIdentityBinding.model_validate(item) for item in base["bindings"]),
+            tuple(QQSessionObservedDirectIdentity.model_validate(item) for item in base["session_observed_evidence"]),
+        )
     return pack, bindings, evidence
 
 
@@ -345,19 +609,63 @@ def _validated_visual_selection(
         raise ValueError(
             "the vision model is reserved for contact selection, not reply planning"
         )
-    worker_timeout = float(config.get("worker_timeout_seconds", 15))
-    if visual.timeout_seconds > worker_timeout - 4:
+    worker_timeout, prepare_reserve = _validated_worker_timing(config)
+    if visual.timeout_seconds + prepare_reserve + 4 > worker_timeout:
         raise ValueError(
-            "visual_selection timeout must leave four seconds for worker retirement"
+            "visual_selection timeout must leave the prepare write reserve and "
+            "four seconds for worker retirement"
         )
     return visual
+
+
+def _validated_worker_timing(config: dict[str, Any]) -> tuple[float, float]:
+    raw_timeout = config.get("worker_timeout_seconds", 15)
+    raw_reserve = config.get("prepare_write_reserve_seconds", 5)
+    if (
+        isinstance(raw_timeout, bool)
+        or not isinstance(raw_timeout, (int, float))
+        or isinstance(raw_reserve, bool)
+        or not isinstance(raw_reserve, (int, float))
+    ):
+        raise ValueError("worker timing values must be numbers")
+    try:
+        worker_timeout = float(raw_timeout)
+        prepare_reserve = float(raw_reserve)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("worker timing values must be finite numbers") from exc
+    if (
+        not math.isfinite(worker_timeout)
+        or worker_timeout <= 0
+        or worker_timeout > 600
+    ):
+        raise ValueError("worker timeout must be greater than 0 and no more than 600")
+    if (
+        not math.isfinite(prepare_reserve)
+        or prepare_reserve < 1
+        or prepare_reserve > worker_timeout - 4
+    ):
+        raise ValueError(
+            "prepare write reserve must be at least one second and leave four seconds "
+            "for worker retirement"
+        )
+    return worker_timeout, prepare_reserve
 
 
 def validate_active_rules(config: dict[str, Any]) -> None:
     from messenger_ai.rules.service import AtomicRulePackStore
     path = Path(config["data_dir"]).expanduser() / "rules.sqlite3"
-    store = AtomicRulePackStore(str(path))
+    # --check is also used before publishing a session-only revision. Resolve
+    # rules against an in-memory snapshot, never run schema setup on the live DB.
+    store = AtomicRulePackStore()
     try:
+        try:
+            source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                source.backup(store.connection)
+            finally:
+                source.close()
+        except sqlite3.Error as exc:
+            raise ValueError("active M7 RulePack database is unavailable") from exc
         for item in config["contacts"]:
             try:
                 store.resolve(str(item["contact_id"]))
@@ -388,16 +696,45 @@ def _capability(config: dict[str, Any], pack: QQSelectorPack) -> CapabilitySnaps
 
 
 def build_runtime(config: dict[str, Any], *, api_key: str,
-                  authorization_signing_key: bytes, run_id: str | None = None,
-                  selection_refresh_retry_enabled: bool = True,
-                  recover_persistent_state: bool = True):
+                   authorization_signing_key: bytes, run_id: str | None = None,
+                   selection_refresh_retry_enabled: bool = True,
+                   recover_persistent_state: bool = True):
+    # Also fence direct callers (e.g. maintenance tools loading a generation
+    # snapshot) against the canonical guest publication, before opening DBs.
+    assert_publication_complete(WORKER_STATUS_PATH.parent / "runtime-session-1.json")
     pack, bindings, session_evidence = validate_config(config, api_key=api_key)
+    worker_timeout, prepare_write_reserve = _validated_worker_timing(config)
+    generation = _validated_runtime_generation(config)
     visual_selection = _validated_visual_selection(config, bindings)
     identity_migrations = _validated_session_identity_migrations(
         config, bindings, session_evidence
     )
     bootstrap = config.get("bootstrap_last_inbound_once", [])
     data_dir = Path(config["data_dir"]).expanduser(); data_dir.mkdir(parents=True, exist_ok=True)
+    assert_data_publication_complete(data_dir)
+    if generation is not None:
+        # The bridge constructor performs its own durable recovery.  Establish
+        # the global pause row before constructing it so *all* recovery work is
+        # fenced, not only the coordinator recovery performed by assembly.
+        pause_state = RuntimeState(
+            data_dir / "runtime.sqlite3",
+            verified_send_stores=VerifiedSendStorePaths(
+                hub=data_dir / "hub.sqlite3",
+                pacing=data_dir / "pacing.sqlite3",
+            ),
+            initially_paused=True,
+            initial_pause_reason="isolated_identity_recovery",
+        )
+        try:
+            revision, paused, _reason = pause_state.global_control()
+            if not paused and not pause_state.set_global_pause(
+                paused=True,
+                expected_revision=revision,
+                reason="isolated_identity_recovery",
+            ):
+                raise RuntimeError("isolated runtime generation pause fence changed")
+        finally:
+            pause_state.close()
     provider = DeepSeekResponsesProvider(api_key=api_key, model=config.get("model", "deepseek-v4-flash"), timeout_seconds=float(config.get("timeout_seconds", 30)))
     worker_kwargs: dict[str, Any] = {}
     if visual_selection is not None:
@@ -410,6 +747,8 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
         bindings,
         session_evidence=session_evidence,
         run_id=run_id,
+        prepare_write_reserve_seconds=prepare_write_reserve,
+        diagnostics_dir=WORKER_STATUS_PATH.parent / "logs",
         **worker_kwargs,
     )
     app_box: dict[str, Any] = {}
@@ -420,7 +759,7 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
     bridge = QQVMDriverBridge(worker=worker, bindings=bindings, text_provider=text_provider,
         sqlite_path=data_dir / "qq-vm-bridge.sqlite3", bootstrap_last_inbound=tuple(bootstrap),
         bootstrap_last_inbound_provenance=dict(config.get("bootstrap_last_inbound_provenance", {})),
-        timeout_seconds=float(config.get("worker_timeout_seconds", 15)),
+        timeout_seconds=worker_timeout,
         selection_refresh_retry_enabled=selection_refresh_retry_enabled,
         recover_persistent_state=recover_persistent_state)
     try:
@@ -450,11 +789,17 @@ def build_runtime(config: dict[str, Any], *, api_key: str,
                 "content_policy_checks_enabled", True
             ),
             recover_persistent_state=recover_persistent_state,
+            initially_paused=generation is not None,
+            initial_pause_reason="isolated_identity_recovery",
         )
     except Exception:
         _close_unassembled(provider, worker, bridge)
         raise
     try:
+        if generation is not None:
+            _revision, paused, _reason = app.state.global_control()
+            if not paused:
+                raise RuntimeError("isolated runtime generation pause fence missing")
         for item in bindings:
             try:
                 resolved = app.rules.resolve(item.contact_id)
@@ -579,13 +924,32 @@ async def _watch_runtime_control(
                     )
                 else:
                     action = request["action"]
+                    pause_fence_token = None
+                    pause_fence_handed_off = False
                     try:
                         paused = action != "resume"
+                        if paused:
+                            pause_fence_token = app.begin_global_pause_from_control()
+                            # Acknowledge the in-memory pause fence before a
+                            # potentially long UI-bearing tick drains.  This is
+                            # deliberately not a claim that durable pause has
+                            # completed; the final state is written below.
+                            await asyncio.to_thread(
+                                _write_control_result,
+                                result_path,
+                                request=request,
+                                accepted=True,
+                                state="pausing",
+                            )
+                        pause_fence_handed_off = paused
                         await app.set_global_pause_from_control(
                             paused=paused,
                             reason=f"runtime_control:{action}:{request['request_id']}",
+                            pause_fence_token=pause_fence_token,
                         )
                     except Exception:
+                        if pause_fence_token is not None and not pause_fence_handed_off:
+                            app.cancel_global_pause_from_control(pause_fence_token)
                         await asyncio.to_thread(
                             _write_control_result,
                             result_path,
@@ -753,6 +1117,10 @@ def _worker_witness_payload(app, *, run_id: str, stopping: bool = False) -> dict
         "startup_health": startup,
         "last_request": last_request,
         "last_successful_observe": observed,
+        "first_failure": _bounded_worker_record(snapshot.get("first_failure")),
+        "last_failure": _bounded_worker_record(snapshot.get("last_failure")),
+        "last_successful_request": _bounded_worker_record(snapshot.get("last_successful_request")),
+        "diagnostic_write_errors": snapshot.get("diagnostic_write_errors", 0),
         "first_terminal_failure": terminal,
         "worker_generation": worker_generation,
         "historical_terminal_failures": historical_terminal_failures,
@@ -918,14 +1286,15 @@ async def _serve(app, *, host: str, port: int, run_id: str | None = None,
         setattr(app, "_closed", True)
 
 
-def _shutdown(app: Any) -> None:
+def _shutdown(app: Any, *, runner: asyncio.Runner | None = None) -> None:
+    """Close on the execution loop when supplied; preserve standalone callers."""
     if getattr(app, "_closed", False):
         return
     close_app = getattr(app, "aclose", None)
     if callable(close_app):
         result = close_app()
         if asyncio.iscoroutine(result):
-            asyncio.run(result)
+            (runner.run if runner is not None else asyncio.run)(result)
         setattr(app, "_closed", True)
         return
     bridge = getattr(app, "driver", None)
@@ -941,7 +1310,7 @@ def _shutdown(app: Any) -> None:
     if callable(close_provider):
         result = close_provider()
         if asyncio.iscoroutine(result):
-            asyncio.run(result)
+            (runner.run if runner is not None else asyncio.run)(result)
     cursor = getattr(bridge, "_cursor", None)
     if cursor is not None and callable(getattr(cursor, "close", None)):
         cursor.close()
@@ -975,15 +1344,52 @@ def _close_unassembled(provider: Any, worker: Any, bridge: Any) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Personal Messenger AI V5 guest runtime")
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config")
+    parser.add_argument("--publication-config", help="canonical configuration publication fence")
     parser.add_argument("--check", action="store_true", help="validate without worker, API client, or WebUI")
+    parser.add_argument(
+        "--assert-runtime-stopped",
+        action="store_true",
+        help="acquire and release the runtime owner without reading config or secrets",
+    )
     parser.add_argument("--web-host", default="127.0.0.1")
     parser.add_argument("--web-port", type=int, default=8765)
     parser.add_argument("--run-id", help="supervisor-generated UUID for run-scoped control")
+    parser.add_argument(
+        "--expected-config-sha256",
+        help="require the single config read to match this supervisor/build digest",
+    )
+    parser.add_argument("--expected-session-binding-revision", type=int,
+                        help="require the immutable QQ session metadata revision (legacy=1)")
     args = parser.parse_args(argv)
     owner: QQRuntimeInstanceOwner | None = None
     try:
-        config = load_config(args.config)
+        if args.assert_runtime_stopped:
+            if args.config or args.check or args.run_id or args.expected_config_sha256 or args.expected_session_binding_revision is not None:
+                raise ValueError("runtime stopped assertion cannot be combined with runtime options")
+            owner = QQRuntimeInstanceOwner()
+            owner.acquire()
+            print("runtime stopped ownership confirmed")
+            return 0
+        if not args.config:
+            raise ValueError("--config is required")
+        if not args.check:
+            owner = QQRuntimeInstanceOwner()
+            owner.acquire()
+            assert_publication_complete(Path(args.config))
+            if args.publication_config:
+                assert_publication_complete(Path(args.publication_config))
+        config = load_config(
+            args.config,
+            expected_sha256=args.expected_config_sha256,
+        )
+        revision = session_revision_number(config)
+        if args.expected_session_binding_revision is not None and (
+            args.expected_session_binding_revision < 1
+            or revision != args.expected_session_binding_revision
+        ):
+            raise ValueError("runtime session binding revision mismatch")
+        validate_session_revision(config, trusted_runtime_root=TRUSTED_RUNTIME_ROOT)
         vault = config.get("secret_vault")
         if not vault:
             raise ValueError("secret_vault is required; configure DPAPI secrets before startup")
@@ -997,18 +1403,18 @@ def main(argv: list[str] | None = None) -> int:
         if not args.run_id:
             raise ValueError("--run-id is required for runtime startup")
         run_id = str(UUID(args.run_id))
-        owner = QQRuntimeInstanceOwner()
-        owner.acquire()
         app = build_runtime(
             config,
             api_key=key,
             authorization_signing_key=secrets.get_or_create_hmac_key("runtime.authorization.signing"),
             run_id=run_id,
         )
-        try:
-            asyncio.run(_serve(app, host=args.web_host, port=args.web_port, run_id=run_id)); return 0
-        finally:
-            _shutdown(app)
+        with asyncio.Runner() as runner:
+            try:
+                runner.run(_serve(app, host=args.web_host, port=args.web_port, run_id=run_id))
+                return 0
+            finally:
+                _shutdown(app, runner=runner)
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"blocked: {exc}"); return 2
     finally:

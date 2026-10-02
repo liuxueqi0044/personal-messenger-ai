@@ -164,7 +164,7 @@ def test_main_calls_discovery_sidecar_discovery_and_updates_atomically(
 
 
 def test_discovery_drift_does_not_write_application(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, capsys
 ) -> None:
     from scripts import qq_q3_wgc_avatar_assess as cli
 
@@ -181,6 +181,15 @@ def test_discovery_drift_does_not_write_application(
     raw = json.dumps(application)
     path.write_text(raw, encoding="utf-8")
     calls = 0
+
+    class Store:
+        def __init__(self, _vault):
+            pass
+
+        def get_or_create_hmac_key(self, _name):
+            return b"k" * 32
+
+    monkeypatch.setattr(cli, "WindowsDPAPISecretStore", Store)
     monkeypatch.setattr(
         cli,
         "get_live_scope",
@@ -217,6 +226,7 @@ def test_discovery_drift_does_not_write_application(
     )
     assert calls == 2
     assert path.read_text(encoding="utf-8") == raw
+    assert json.loads(capsys.readouterr().out)["error_code"] == "DISCOVERY_CHANGED"
 
 
 def test_default_sidecar_points_to_project_release_skeleton() -> None:

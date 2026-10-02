@@ -1635,11 +1635,7 @@ def test_two_stage_hub_cancel_audit_overwrite_is_refused_at_the_first_step(
     assert _verify_failed_settlement(fixture.root)
 
 
-@pytest.mark.parametrize("apply", [False, True])
-def test_missing_certificate_with_terminal_runtime_is_refused_before_cancel(
-    tmp_path: Path, apply: bool
-) -> None:
-    fixture = _build_evidence(tmp_path)
+def _set_runtime_terminal(fixture: EvidenceFixture) -> None:
     _execute(
         fixture.root / "runtime.sqlite3",
         "UPDATE runtime_segment_executions SET status='failed'",
@@ -1649,13 +1645,93 @@ def test_missing_certificate_with_terminal_runtime_is_refused_before_cancel(
         "UPDATE runtime_plan_artifacts SET status='rejected'",
     )
 
+
+def test_terminal_runtime_without_certificate_dry_run_is_read_only(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_evidence(tmp_path)
+    _set_runtime_terminal(fixture)
+
+    result = settle_terminal_send(fixture.root, fixture.target)
+
+    assert result.applied is False
+    assert result.idempotent is False
+    assert _runtime_statuses(fixture.root) == ("failed", "rejected")
+    assert _audit_table_exists(fixture.root) is False
+    assert _hub_outbox_statuses(fixture.root) == _PENDING_HUB_OUTBOXES
+    assert "terminal_send_outbox_cancel_audit_v2" not in _sqlite_master_names(
+        fixture.root / "hub.sqlite3"
+    )
+
+
+def test_terminal_runtime_without_certificate_apply_cancels_and_certifies(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_evidence(tmp_path)
+    _set_runtime_terminal(fixture)
+
+    result = settle_terminal_send(fixture.root, fixture.target, apply=True)
+
+    assert result.applied is True
+    assert result.idempotent is False
+    assert _runtime_statuses(fixture.root) == ("failed", "rejected")
+    assert _hub_outbox_statuses(fixture.root) == {
+        SEND_OUTBOX_ID: "cancelled",
+        STABLE_OUTBOX_ID: "cancelled",
+        DRAFT_OUTBOX_ID: "cancelled",
+    }
+    with sqlite3.connect(fixture.root / "runtime.sqlite3") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM runtime_send_settlement_audit_v2"
+        ).fetchone()[0] == 1
+    with sqlite3.connect(fixture.root / "hub.sqlite3") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM terminal_send_outbox_cancel_audit_v2"
+        ).fetchone()[0] == 3
+    assert _verify_failed_settlement(fixture.root)
+
+
+def test_terminal_runtime_without_certificate_repeated_apply_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_evidence(tmp_path)
+    _set_runtime_terminal(fixture)
+
+    first = settle_terminal_send(fixture.root, fixture.target, apply=True)
+    replay = settle_terminal_send(fixture.root, fixture.target, apply=True)
+
+    assert first.applied is True
+    assert replay.applied is False
+    assert replay.idempotent is True
+    assert replay.evidence_sha256 == first.evidence_sha256
+    assert _runtime_statuses(fixture.root) == ("failed", "rejected")
+    with sqlite3.connect(fixture.root / "runtime.sqlite3") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM runtime_send_settlement_audit_v2"
+        ).fetchone()[0] == 1
+    with sqlite3.connect(fixture.root / "hub.sqlite3") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM terminal_send_outbox_cancel_audit_v2"
+        ).fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_mixed_runtime_state_is_refused_without_modification(
+    tmp_path: Path, apply: bool
+) -> None:
+    fixture = _build_evidence(tmp_path)
+    _execute(
+        fixture.root / "runtime.sqlite3",
+        "UPDATE runtime_segment_executions SET status='failed'",
+    )
+
     with pytest.raises(
         SettlementRefused,
         match="SEND_SETTLEMENT_RUNTIME_CAS_STATE_MISMATCH",
     ):
         settle_terminal_send(fixture.root, fixture.target, apply=apply)
 
-    assert _runtime_statuses(fixture.root) == ("failed", "rejected")
+    assert _runtime_statuses(fixture.root) == ("failed", "waiting")
     assert _audit_table_exists(fixture.root) is False
     assert _hub_outbox_statuses(fixture.root) == _PENDING_HUB_OUTBOXES
     hub_objects = _sqlite_master_names(fixture.root / "hub.sqlite3")

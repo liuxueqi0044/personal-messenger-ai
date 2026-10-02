@@ -42,3 +42,11 @@ flowchart LR
 The selection-only path and its worker-retirement contract are covered by synthetic and controlled-environment tests. Three anonymized bindings have been exercised serially in the controlled environment. Public artifacts intentionally omit attempt IDs and raw evidence paths.
 
 The capability remains profile-bound. Any process restart, window drift, client-version change, stale evidence or incomplete re-observation invalidates the proof and prevents sending.
+
+## Deterministic local selection profile
+
+The local selected-row proof does not call a vision model. For QQ 9.9.33.51802 with the existing certified selector/environment, v2 samples row-relative `x=[16,234)` and `y=[4,8),[56,60)` within an exact 250×64 row. Both strips must form one uniform set of 1744 pixels. Selected, hover and unselected backgrounds remain distinct (225, 235 and 245 respectively, per RGB channel); hover is rejected. No corner, text or avatar pixels participate in the summary.
+
+The prior full-border profile remains available for regression comparison. It rejected a valid live selected row solely because rounded-corner antialiasing produced 14 colours instead of its calibrated 12. V2 changes the sampling geometry and profile ID, without increasing colour tolerances. A contaminated strip, disagreeing strips, unknown colour, different or multiple selected rows, geometry drift, insufficient control rows or unstable sample still fails closed. Window/process identity and the independent current-header proof remain required before and after content reads.
+
+Calibration evidence on 2026-10-01 covered two captures of 20 full visible rows (one selected and nineteen unselected) plus hover on two control rows, with QQ maximized at a fixed 2560×1429 guest display. This calibration is not a delivery or long-running reliability claim.

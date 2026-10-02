@@ -1665,6 +1665,39 @@ def test_observe_timeout_quarantines_once_and_successor_serves_other_contact(tmp
     assert status["last_read_only_recovery"]["status"] == "successor_active"
 
 
+def test_observe_recovery_health_uses_bounded_lifecycle_budget(tmp_path):
+    first, _ = _two_bindings()
+
+    class RecordingSuccessor(RecoverableWorker):
+        def __init__(self):
+            super().__init__(run_id="run-deadline", fail_observe=False)
+            self.request_timeouts = []
+
+        def request(self, command, timeout):
+            self.request_timeouts.append(timeout)
+            return super().request(command, timeout)
+
+    successor = RecordingSuccessor()
+    failed = RecoverableWorker(
+        run_id="run-deadline", fail_observe=True, successor=successor,
+    )
+    bridge = QQVMDriverBridge(
+        worker=failed,
+        bindings=(first,),
+        text_provider=lambda _: "x",
+        sqlite_path=tmp_path / "observe-recovery-deadline.sqlite3",
+        timeout_seconds=90,
+    )
+    asyncio.run(bridge.observe_conversation(
+        first.hub_conversation_id,
+        binding_revision=1,
+        conversation_revision=1,
+    ))
+
+    assert len(successor.request_timeouts) == 1
+    assert 0 < successor.request_timeouts[0] <= 5
+
+
 def test_observe_recovery_budget_is_one_per_run_and_never_retries_failed_request(tmp_path):
     first, second = _two_bindings()
     forbidden = RecoverableWorker(run_id="run-budget", fail_observe=False)
@@ -2677,3 +2710,81 @@ def test_probe_health_accepts_only_exact_nonzero_epoch_result(tmp_path):
     ) == (None, 0, 0, None)
     assert bridge.health() is probe
     assert len(local.requests) == 1
+
+
+def test_unproven_message_tail_does_not_advance_cursor_or_outbox(tmp_path):
+    worker, fake, _binding = _worker()
+    fake.bubbles = [QQBubble(
+        conversation_internal_id="qq-conv-1", message_key="anchor",
+        direction=BubbleDirection.INBOUND, text="synthetic anchor",
+        observed_at=datetime.now(UTC), tree_digest="synthetic-tree",
+    )]
+    bridge = QQVMDriverBridge(
+        worker=LocalWorker(worker), bindings=tuple(worker._bindings.values()),
+        text_provider=lambda _: "", sqlite_path=tmp_path / "tail.sqlite3",
+    )
+    try:
+        first = asyncio.run(bridge.observe_conversation(
+            "hub-conv-1", binding_revision=1, conversation_revision=1
+        ))
+        assert first.complete and first.messages == ()
+        before = tuple(bridge._cursor.connection.execute("SELECT * FROM cursor_state").fetchone())
+        fake.message_tail_is_latest = lambda *_: False
+        failed = asyncio.run(bridge.observe_conversation(
+            "hub-conv-1", binding_revision=1, conversation_revision=1
+        ))
+        assert not failed.complete and failed.messages == ()
+        assert failed.gap_reason == "driver_temporary:message_tail_scroll_unavailable"
+        assert tuple(bridge._cursor.connection.execute("SELECT * FROM cursor_state").fetchone()) == before
+        assert bridge._cursor.connection.execute("SELECT COUNT(*) FROM observation_outbox").fetchone()[0] == 0
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("preserve_anchor", [True, False])
+def test_latest_tail_scroll_emits_only_new_suffix_or_preserves_anchor_gap(
+    tmp_path, preserve_anchor
+):
+    worker, fake, _binding = _worker()
+    anchor = QQBubble(
+        conversation_internal_id="qq-conv-1", message_key="anchor",
+        direction=BubbleDirection.INBOUND, text="synthetic anchor",
+        observed_at=datetime.now(UTC), tree_digest="synthetic-tree",
+    )
+    new = anchor.model_copy(update={"message_key": "new", "text": "synthetic new"})
+    fake.bubbles = [anchor]
+    bridge = QQVMDriverBridge(
+        worker=LocalWorker(worker), bindings=tuple(worker._bindings.values()),
+        text_provider=lambda _: "", sqlite_path=tmp_path / "tail.sqlite3",
+    )
+    try:
+        asyncio.run(bridge.observe_conversation("hub-conv-1", binding_revision=1, conversation_revision=1))
+        before = tuple(bridge._cursor.connection.execute("SELECT * FROM cursor_state").fetchone())
+        latest = False
+        scrolls = []
+        fake.message_tail_is_latest = lambda *_: latest
+
+        def scroll(*args, before_action):
+            nonlocal latest
+            before_action()
+            scrolls.append("scroll")
+            latest = True
+            fake.bubbles = ([anchor] if preserve_anchor else []) + [new]
+
+        fake.scroll_message_tail_to_latest = scroll
+        batch = asyncio.run(bridge.observe_conversation("hub-conv-1", binding_revision=1, conversation_revision=1))
+        if preserve_anchor:
+            assert batch.complete
+            assert [message.text for message in batch.messages] == ["synthetic new"]
+            repeated = asyncio.run(bridge.observe_conversation("hub-conv-1", binding_revision=1, conversation_revision=1))
+            assert repeated.complete and repeated.messages == ()
+            assert bridge._cursor.connection.execute("SELECT COUNT(*) FROM observation_outbox").fetchone()[0] == 1
+        else:
+            assert not batch.complete and batch.gap_reason == "message_anchor_gap"
+            assert batch.messages == ()
+            assert tuple(bridge._cursor.connection.execute("SELECT * FROM cursor_state").fetchone()) == before
+            assert bridge._cursor.connection.execute("SELECT COUNT(*) FROM observation_outbox").fetchone()[0] == 0
+        assert scrolls == ["scroll"]
+        assert not {"write-composer", "read-composer", "invoke-send"} & set(fake.calls)
+    finally:
+        bridge.close()

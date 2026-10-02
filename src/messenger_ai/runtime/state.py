@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -44,6 +45,18 @@ class OneShotStopContext:
     graceful_stop_reason: str
 
 
+@dataclass(slots=True)
+class ObservationRecoveryContext:
+    """Revocable read permission; ordinary execution remains paused."""
+
+    receipt: object
+    contact_id: str
+    active: bool = True
+    phase: str = "observing"
+    resultant_revision: int | None = None
+    batch_digest: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedSendStorePaths:
     """Durable authorities required before runtime may record ``verified``."""
@@ -60,7 +73,13 @@ class RuntimeState:
         path: str | Path = ":memory:",
         *,
         verified_send_stores: VerifiedSendStorePaths | None = None,
+        initially_paused: bool = False,
+        initial_pause_reason: str = "initial_global_pause",
     ) -> None:
+        if not isinstance(initially_paused, bool):
+            raise TypeError("initially_paused must be a boolean")
+        if initially_paused and not initial_pause_reason:
+            raise ValueError("initial_pause_reason is required when initially paused")
         self._path = str(path)
         self._verified_send_stores = verified_send_stores
         self.connection = sqlite3.connect(self._path, isolation_level=None, check_same_thread=False)
@@ -68,6 +87,9 @@ class RuntimeState:
         self._lock = threading.RLock()
         self._one_shot_stop_context: ContextVar[OneShotStopContext | None] = (
             ContextVar(f"one_shot_stop_context_{id(self)}", default=None)
+        )
+        self._observation_recovery_context: ContextVar[ObservationRecoveryContext | None] = (
+            ContextVar(f"observation_recovery_context_{id(self)}", default=None)
         )
         self.connection.executescript("""
         PRAGMA foreign_keys=ON;
@@ -92,7 +114,6 @@ class RuntimeState:
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL,
           paused INTEGER NOT NULL, reason TEXT
         );
-        INSERT OR IGNORE INTO runtime_global_control VALUES(1,1,0,NULL);
         CREATE TABLE IF NOT EXISTS runtime_segment_executions(
           pacing_plan_id TEXT NOT NULL, segment_index INTEGER NOT NULL, conversation_id TEXT NOT NULL, body_hash TEXT NOT NULL,
           authorization_id TEXT, operation_id TEXT UNIQUE, status TEXT NOT NULL,
@@ -186,6 +207,13 @@ class RuntimeState:
           completed_at TEXT
         );
         """)
+        self.connection.execute(
+            "INSERT OR IGNORE INTO runtime_global_control VALUES(1,1,?,?)",
+            (
+                int(initially_paused),
+                initial_pause_reason if initially_paused else None,
+            ),
+        )
         columns = {
             row["name"]
             for row in self.connection.execute(
@@ -282,6 +310,18 @@ class RuntimeState:
         """Persist cursor facts before exposing invalidation events to other services."""
         emitted: list[str] = []
         with self.uow() as db:
+            recovery = self._observation_recovery_context.get()
+            if recovery is not None:
+                if (not self._recovery_fence_current(db, recovery)
+                        or batch.conversation_id != recovery.receipt.conversation_id
+                        or batch.account_id != recovery.receipt.account_id
+                        or batch.contact_id != recovery.contact_id
+                        or batch.binding_revision != recovery.receipt.binding_revision
+                        or batch.conversation_revision != recovery.receipt.conversation_revision):
+                    raise RuntimeError("OBSERVATION_RECOVERY_FENCE_CHANGED")
+                if not batch.complete:
+                    # An incomplete recovery cannot publish partial cursor facts.
+                    batch = batch.model_copy(update={"messages": ()})
             one_shot_context = self._one_shot_stop_context.get()
             if one_shot_context is not None and not self._one_shot_fence_is_current(
                 db,
@@ -357,6 +397,10 @@ class RuntimeState:
                         ),
                     )
                     emitted.append(event_type)
+            if recovery is not None:
+                # Never turn a spent recovery into a generally healable pause
+                # (e.g. direction_unknown) and thereby mint another UI attempt.
+                pause_reason = recovery.receipt.pause_reason
             db.execute(
                 "UPDATE runtime_conversations SET conversation_revision=?,last_observed_at=?,paused=?,pause_reason=? WHERE conversation_id=?",
                 (revision, datetime.now(UTC).isoformat(), int(pause_reason is not None), pause_reason, batch.conversation_id),
@@ -398,7 +442,71 @@ class RuntimeState:
                         one_shot_attempt_id,
                     ),
                 )
+        if recovery is not None:
+            recovery.phase = "applied" if batch.complete and "direction_unknown" not in emitted else "failed"
+            recovery.resultant_revision = revision
+            recovery.batch_digest = self._observation_batch_digest(batch)
         return tuple(emitted)
+
+    @staticmethod
+    def _observation_batch_digest(batch: ObservationBatch) -> str:
+        return hashlib.sha256(batch.model_dump_json().encode()).hexdigest()
+
+    def _recovery_fence_current(self, db, context, *, finishing: bool = False) -> bool:
+        if (not context.active or context.phase != ("applied" if finishing else "observing")
+                or self._one_shot_stop_context.get() is not None):
+            return False
+        receipt = context.receipt
+        row = db.execute("SELECT * FROM runtime_conversations WHERE conversation_id=?",
+                         (receipt.conversation_id,)).fetchone()
+        control = db.execute("SELECT revision,paused FROM runtime_global_control WHERE singleton=1").fetchone()
+        revision = context.resultant_revision if finishing else receipt.conversation_revision
+        return bool(row and control and row["account_id"] == receipt.account_id
+            and row["contact_id"] == context.contact_id and row["conversation_type"] == "direct"
+            and int(row["binding_revision"]) == receipt.binding_revision
+            and int(row["conversation_revision"]) == revision and bool(row["paused"])
+            and row["pause_reason"] == receipt.pause_reason
+            and receipt.pause_reason == "ui_automation_unavailable:identity_profile_capture_failed"
+            and int(control["revision"]) == receipt.global_revision and not control["paused"])
+
+    @contextmanager
+    def observation_recovery_scope(self, receipt, *, contact_id: str):
+        """The caller must durably consume its single recovery before entering."""
+        if self._observation_recovery_context.get() is not None:
+            raise RuntimeError("OBSERVATION_RECOVERY_ALREADY_ACTIVE")
+        context = ObservationRecoveryContext(receipt=receipt, contact_id=contact_id)
+        with self._lock:
+            if not self._recovery_fence_current(self.connection, context):
+                raise RuntimeError("OBSERVATION_RECOVERY_FENCE_CHANGED")
+        token = self._observation_recovery_context.set(context)
+        try:
+            yield context
+        finally:
+            # Contexts copied into a child task share this revocation flag.
+            context.active = False
+            if context.phase != "recovered":
+                context.phase = "failed"
+            self._observation_recovery_context.reset(token)
+
+    def finish_observation_recovery(self, context, batch: ObservationBatch) -> bool:
+        """Called only after the driver proves the exact batch's cursor ACK."""
+        if (self._observation_recovery_context.get() is not context or not batch.complete
+                or batch.gap_reason is not None
+                or context.batch_digest != self._observation_batch_digest(batch)):
+            return False
+        with self.uow() as db:
+            if not self._recovery_fence_current(db, context, finishing=True):
+                return False
+            receipt = context.receipt
+            changed = db.execute("""UPDATE runtime_conversations SET paused=0,pause_reason=NULL
+                WHERE conversation_id=? AND account_id=? AND contact_id=? AND conversation_type='direct'
+                AND binding_revision=? AND conversation_revision=? AND paused=1 AND pause_reason=?""",
+                (receipt.conversation_id, receipt.account_id, context.contact_id, receipt.binding_revision,
+                 context.resultant_revision, receipt.pause_reason)).rowcount
+            if changed != 1:
+                return False
+        context.phase = "recovered"
+        return True
 
     def pause(self, conversation_id: str, reason: str = "manual_pause") -> None:
         with self.uow() as db:
@@ -584,6 +692,11 @@ class RuntimeState:
                 bool(row["paused"])
                 and not _temporary_observation_pause(row["pause_reason"])
             )
+            recovery = self._observation_recovery_context.get()
+            if (contact_blocked and recovery is not None
+                    and recovery.receipt.conversation_id == conversation_id
+                    and self._recovery_fence_current(self.connection, recovery)):
+                contact_blocked = False
             return (
                 int(row["binding_revision"]),
                 int(row["conversation_revision"]),

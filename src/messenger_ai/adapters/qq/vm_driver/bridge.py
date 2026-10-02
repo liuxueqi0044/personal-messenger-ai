@@ -1252,6 +1252,9 @@ class QQVMDriverBridge:
             return True
         successor = None
         activated = False
+        recovery_deadline = datetime.now(UTC) + timedelta(
+            seconds=min(5.0, max(0.05, self._timeout))
+        )
         try:
             successor = spawn()
             self._pending_successor = successor
@@ -1259,12 +1262,11 @@ class QQVMDriverBridge:
             successor.start()
             self._pending_successor_started = True
             health_command = WorkerCommand(
-                kind=WorkerKind.HEALTH, deadline=command.deadline
+                kind=WorkerKind.HEALTH, deadline=recovery_deadline
             )
-            health = await asyncio.to_thread(
-                successor.request,
+            health = await self._request_before_deadline(
+                successor,
                 health_command,
-                self._timeout,
             )
         except asyncio.CancelledError:
             self._finish_recovery(
@@ -1310,7 +1312,12 @@ class QQVMDriverBridge:
         finally:
             if successor is not None and not activated:
                 try:
-                    await asyncio.shield(asyncio.to_thread(successor.stop))
+                    cleanup_timeout = min(1.0, max(0.05, self._timeout))
+                    await self._stop_and_confirm(
+                        successor,
+                        recovery_deadline,
+                        cleanup_timeout=cleanup_timeout,
+                    )
                 except BaseException as exc:
                     self._finish_recovery(
                         recovery_id,

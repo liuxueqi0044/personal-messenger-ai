@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from contextlib import nullcontext
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from messenger_ai.domain import EventEnvelope, InboundMessage, Platform
@@ -34,15 +35,23 @@ class RuntimeCoordinator:
 
     async def observe_driver(self, driver, conversation_id: str) -> tuple[str, ...]:
         binding_revision, conversation_revision = self.state.revisions(conversation_id)
-        batch = await driver.observe_conversation(
-            conversation_id, binding_revision=binding_revision,
-            conversation_revision=conversation_revision,
-        )
-        events = self.state.apply_observation(batch)
-        driver.acknowledge_observation(
-            conversation_id, tuple(message.local_message_key for message in batch.messages)
-        )
-        return events
+        factory = getattr(driver, "observation_recovery_context", None)
+        scope = factory(conversation_id, binding_revision=binding_revision,
+            conversation_revision=conversation_revision) if factory else nullcontext()
+        async with scope as recovery:
+            batch = await driver.observe_conversation(
+                conversation_id, binding_revision=binding_revision,
+                conversation_revision=conversation_revision,
+            )
+            events = self.state.apply_observation(batch)
+            if recovery is not None and not batch.complete:
+                return events
+            acknowledged = driver.acknowledge_observation(
+                conversation_id, tuple(message.local_message_key for message in batch.messages)
+            )
+            if recovery is not None:
+                recovery.finish(batch, events, acknowledged)
+            return events
 
     def dispatch_events(
         self,

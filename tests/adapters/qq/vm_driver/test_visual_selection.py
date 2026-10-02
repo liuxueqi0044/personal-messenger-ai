@@ -19,8 +19,9 @@ from messenger_ai.adapters.qq.vm_driver.transport import (
     _encode_bgra_png,
 )
 from messenger_ai.adapters.qq.vm_driver.visual_selection import (
+    QQ_VM_ROW_PALETTE_PROFILE as STRIP_PROFILE,
     QQ_VM_ROW_ENVIRONMENT_FINGERPRINT,
-    QQ_VM_ROW_PALETTE_PROFILE,
+    QQ_VM_LEGACY_ROW_PALETTE_PROFILE as QQ_VM_ROW_PALETTE_PROFILE,
     ConversationSelectionActuator,
     ConversationSelectionStatus,
     ConversationRowPaletteProfile,
@@ -84,6 +85,26 @@ class Transport:
         }
 
 
+class LoopBoundTransport(Transport):
+    def __init__(self, output: dict) -> None:
+        super().__init__(output)
+        self.loop = None
+        self.closed_loop = None
+        self.calls = 0
+
+    async def create(self, **kwargs):
+        current = asyncio.get_running_loop()
+        if self.loop is None:
+            self.loop = current
+        elif self.loop is not current:
+            raise RuntimeError("visual transport event loop changed")
+        self.calls += 1
+        return super().create(**kwargs)
+
+    async def aclose(self):
+        self.closed_loop = asyncio.get_running_loop()
+
+
 def test_visual_provider_sends_only_one_row_image_and_no_tools() -> None:
     transport = Transport(
         {
@@ -136,6 +157,35 @@ def test_visual_provider_rejects_non_vision_or_undocumented_model() -> None:
         DeepSeekVisualSelectionProvider(
             api_key="test-key", model="deepseek-flash", transport=Transport({})
         )
+
+
+def test_visual_provider_reuses_one_sync_event_loop_across_worker_calls() -> None:
+    transport = LoopBoundTransport(
+        {
+            "decision": "match",
+            "observed_label": "联系人乙",
+            "confidence": 0.99,
+            "reason": "exact_label",
+        }
+    )
+    provider = DeepSeekVisualSelectionProvider(
+        api_key="test-key", transport=transport
+    )
+    actions = Actions([frame(), frame(), frame(), frame()])
+    selection = ConversationSelectionActuator(
+        actions=actions,
+        provider=provider,
+        labels={"session-contact-2": "联系人乙"},
+        min_confidence=0.98,
+    )
+
+    try:
+        assert call(selection).status is ConversationSelectionStatus.ACTION_ATTEMPTED
+        assert call(selection).status is ConversationSelectionStatus.ACTION_ATTEMPTED
+        assert transport.calls == 2
+    finally:
+        selection.close()
+    assert transport.closed_loop is transport.loop
 
 
 def test_full_screen_image_is_rejected_before_provider_call() -> None:
@@ -200,6 +250,20 @@ class Provider:
             )
         return VisualSelectionProviderResult(
             decision=self.decision,
+            model="deepseek-v4-flash-vision-exp",
+            latency_ms=7,
+        )
+
+
+class SequencedProvider(Provider):
+    def __init__(self, decisions: list[VisualRowDecision]) -> None:
+        super().__init__()
+        self.decisions = list(decisions)
+
+    async def inspect_row(self, request):
+        self.requests.append(request)
+        return VisualSelectionProviderResult(
+            decision=self.decisions.pop(0),
             model="deepseek-v4-flash-vision-exp",
             latency_ms=7,
         )
@@ -296,7 +360,7 @@ def test_exact_stable_visual_match_attempts_one_row_click() -> None:
 )
 def test_uncertified_visual_result_never_clicks(decision) -> None:
     row = frame()
-    actions = Actions([row])
+    actions = Actions([row, row])
     outcome = call(actuator(actions, Provider(decision)))
     assert outcome.status is ConversationSelectionStatus.REJECTED
     assert outcome.error_code == "visual_target_not_certified"
@@ -307,6 +371,90 @@ def test_uncertified_visual_result_never_clicks(decision) -> None:
         decision.observed_label == "联系人乙"
     )
     assert actions.click_calls == 0
+    assert actions.capture_calls == 2
+
+
+def test_uncertified_first_reviewed_match_attempts_exactly_one_click() -> None:
+    row = frame()
+    actions = Actions([row, row, row])
+    provider = SequencedProvider(
+        [
+            VisualRowDecision(
+                decision="not_match",
+                observed_label="联系人丙",
+                confidence=1,
+                reason="different_label",
+            ),
+            exact_match(),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.ACTION_ATTEMPTED
+    assert actions.capture_calls == 3
+    assert actions.click_calls == 1
+    assert len(provider.requests) == 2
+
+
+def test_two_uncertified_decisions_are_rejected_without_clicking() -> None:
+    row = frame()
+    actions = Actions([row, row])
+    provider = SequencedProvider(
+        [
+            exact_match(confidence=0.97),
+            exact_match(label="联系人乙 2"),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.REJECTED
+    assert outcome.error_code == "visual_target_not_certified"
+    assert actions.capture_calls == 2
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 2
+
+
+def test_row_change_before_uncertified_review_stops_without_second_provider_call() -> None:
+    actions = Actions([frame(), frame(suffix=b"changed")])
+    provider = SequencedProvider(
+        [
+            VisualRowDecision(
+                decision="not_match",
+                observed_label="联系人丙",
+                confidence=1,
+                reason="different_label",
+            ),
+            exact_match(),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.REJECTED
+    assert outcome.error_code == "visual_row_changed_before_action"
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 1
+
+
+def test_row_change_after_uncertified_review_before_click_never_clicks() -> None:
+    row = frame()
+    actions = Actions([row, row, frame(suffix=b"changed")])
+    provider = SequencedProvider(
+        [
+            exact_match(confidence=0.97),
+            exact_match(),
+        ]
+    )
+
+    outcome = call(actuator(actions, provider))
+
+    assert outcome.status is ConversationSelectionStatus.REJECTED
+    assert outcome.error_code == "visual_row_changed_before_action"
+    assert actions.capture_calls == 3
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 2
 
 
 def test_changed_row_after_model_response_never_clicks() -> None:
@@ -425,6 +573,20 @@ def test_deadline_expiring_before_the_click_never_clicks() -> None:
     assert actions.click_calls == 0
 
 
+def test_deadline_expiring_during_uncertified_review_never_clicks() -> None:
+    row = frame()
+    deadline = datetime.now(UTC) + timedelta(milliseconds=400)
+    actions = DeadlineBurningActions([row, row], deadline=deadline)
+    provider = SequencedProvider([exact_match(confidence=0.97), exact_match()])
+
+    with pytest.raises(RuntimeError, match="deadline_expired"):
+        call_with_deadline(actuator(actions, provider), deadline)
+
+    assert actions.capture_calls == 2
+    assert actions.click_calls == 0
+    assert len(provider.requests) == 1
+
+
 def test_naive_deadline_is_rejected() -> None:
     actions = Actions([frame(), frame()])
     provider = Provider(exact_match())
@@ -445,6 +607,8 @@ def test_naive_deadline_is_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 ROW_WIDTH, ROW_HEIGHT, ROW_INSET = 250, 64, 10
+# Retain all v1 regression cases. The deployed v2 mask has separate raw-pixel
+# and full transport cases below, including the real antialiasing failure.
 SELECTED_RGB = (225, 225, 225)
 HOVER_RGB = (235, 235, 235)
 UNSELECTED_RGB = (245, 245, 245)
@@ -512,7 +676,7 @@ FAST_PROFILE = QQ_VM_ROW_PALETTE_PROFILE.model_copy(
 
 
 def _row(internal_id: str, top: int) -> _ConversationRowRef:
-    return _ConversationRowRef(internal_id=internal_id, item=object(), rect=_row_rect(top))
+    return _ConversationRowRef(internal_id=internal_id, rect=_row_rect(top))
 
 
 def _conversation_for(internal_id: str) -> QQConversation:
@@ -677,6 +841,27 @@ def test_two_consecutive_identical_samples_certify_the_exact_target_row() -> Non
     assert len(moves) == 2
 
 
+def test_partially_clipped_non_target_row_is_excluded_from_certification() -> None:
+    target = "runtime:target"
+    rows = [
+        _row("runtime:control-a", 100),
+        _row(target, 200),
+        _row("runtime:control-b", 300),
+        _row("runtime:clipped", 950),
+    ]
+    capture = _capture_by_row({
+        100: UNSELECTED_FRAME,
+        200: SELECTED_FRAME,
+        300: UNSELECTED_FRAME,
+    })
+    access, _moves = _fake_access(rows=rows, capture=capture)
+
+    attestation = _certify(access, target)
+
+    assert attestation.unselected_control_count == 2
+    assert attestation.row_rect == _row_rect(200)
+
+
 def test_hover_row_is_explicitly_rejected_fail_closed() -> None:
     target = "runtime:target"
     rows = [_row("runtime:control-a", 100), _row(target, 200), _row("runtime:control-b", 300)]
@@ -722,7 +907,6 @@ def test_geometry_change_is_rejected_before_any_sample() -> None:
         _row("runtime:control-a", 100),
         _ConversationRowRef(
             internal_id=target,
-            item=object(),
             rect=ScreenRect(left=56, top=200, right=296, bottom=264),
         ),
         _row("runtime:control-b", 300),
@@ -809,13 +993,13 @@ def test_neutral_hover_point_clamps_to_the_visible_guest_desktop() -> None:
 def test_neutral_hover_point_skips_candidates_near_any_conversation_row() -> None:
     rows = [
         _ConversationRowRef(
-            "runtime:target", object(), ScreenRect(left=0, top=0, right=250, bottom=64)
+            "runtime:target", ScreenRect(left=0, top=0, right=250, bottom=64)
         ),
         _ConversationRowRef(
-            "runtime:control-a", object(), ScreenRect(left=150, top=0, right=400, bottom=64)
+            "runtime:control-a", ScreenRect(left=150, top=0, right=400, bottom=64)
         ),
         _ConversationRowRef(
-            "runtime:control-b", object(), ScreenRect(left=0, top=150, right=250, bottom=214)
+            "runtime:control-b", ScreenRect(left=0, top=150, right=250, bottom=214)
         ),
     ]
     access, _moves = _fake_access(
@@ -842,7 +1026,7 @@ def test_neutral_hover_point_skips_candidates_near_any_conversation_row() -> Non
 def test_neutral_hover_point_fails_closed_when_every_candidate_is_blocked() -> None:
     rows = [
         _ConversationRowRef(
-            "runtime:target", object(), ScreenRect(left=0, top=0, right=398, bottom=198)
+            "runtime:target", ScreenRect(left=0, top=0, right=398, bottom=198)
         )
     ]
     access, _moves = _fake_access(
@@ -1046,3 +1230,150 @@ def test_attestation_never_carries_png_or_row_content() -> None:
         "selected",
         "unselected",
     }
+
+
+def _strip_frame(rgb, *, corner_variants=14, bottom_rgb=None):
+    """Spatial row fixture: two clear background strips and noisy excluded pixels."""
+    pixels = bytearray(ROW_WIDTH * ROW_HEIGHT * 4)
+    for y in range(ROW_HEIGHT):
+        for x in range(ROW_WIDTH):
+            # Changing corner antialiasing and content must not affect selection.
+            value = (x * 17 + y * 31) % corner_variants
+            color = (value, value + 1, value + 2)
+            if 16 <= x < 234 and (4 <= y < 8 or 56 <= y < 60):
+                color = bottom_rgb if y >= 56 and bottom_rgb is not None else rgb
+            offset = (y * ROW_WIDTH + x) * 4
+            pixels[offset:offset + 4] = bytes((*reversed(color), 255))
+    return bytes(pixels)
+
+
+def _strip_summary(frame):
+    return summarize_border_pixels(frame, width=250, height=64, inset=10,
+                                   sampling_mask=STRIP_PROFILE.sampling_mask)
+
+
+@pytest.mark.parametrize("variants", [12, 14, 128])
+@pytest.mark.parametrize("rgb,state", [(SELECTED_RGB, "selected"), (HOVER_RGB, "hover"),
+                                       (UNSELECTED_RGB, "unselected")])
+def test_v2_strip_mask_ignores_corner_antialiasing_and_content(variants, rgb, state):
+    sample = _strip_summary(_strip_frame(rgb, corner_variants=variants))
+    assert (sample.pixel_count, sample.dominant_count, sample.unique_count) == (1744, 1744, 1)
+    assert sample.ratio == 1
+    assert classify_row_border(sample, STRIP_PROFILE) == state
+
+
+@pytest.mark.parametrize("bottom", [HOVER_RGB, UNSELECTED_RGB, (100, 100, 100)])
+def test_v2_disagreeing_top_and_bottom_strips_fail_closed(bottom):
+    sample = _strip_summary(_strip_frame(SELECTED_RGB, bottom_rgb=bottom))
+    assert classify_row_border(sample, STRIP_PROFILE) == "unknown"
+
+
+def test_v2_single_contaminated_sample_pixel_fails_closed():
+    pixels = bytearray(_strip_frame(SELECTED_RGB))
+    offset = (4 * ROW_WIDTH + 16) * 4
+    pixels[offset:offset + 4] = bytes((224, 224, 224, 255))
+    assert classify_row_border(_strip_summary(pixels), STRIP_PROFILE) == "unknown"
+
+
+def test_v2_wrong_mask_size_and_legacy_samples_cannot_certify():
+    with pytest.raises(ValueError, match="250x64"):
+        summarize_border_pixels(bytes(249 * 64 * 4), width=249, height=64, inset=10,
+                                sampling_mask=STRIP_PROFILE.sampling_mask)
+    with pytest.raises(ValidationError, match="250x64"):
+        ConversationRowPaletteProfile.model_validate({**STRIP_PROFILE.model_dump(), "row_width":249})
+    legacy = summarize_border_pixels(SELECTED_FRAME, width=250, height=64, inset=10)
+    assert classify_row_border(legacy, STRIP_PROFILE) == "unknown"
+    assert STRIP_PROFILE.profile_id != QQ_VM_ROW_PALETTE_PROFILE.profile_id
+
+
+def test_v2_real_transport_requires_two_stable_samples_with_exact_target():
+    target = "runtime:target"
+    rows = [_row("runtime:a", 100), _row(target, 200), _row("runtime:b", 300)]
+    plans = [dict(zip((100, 200, 300), (_strip_frame(UNSELECTED_RGB),
+                                     _strip_frame(SELECTED_RGB, corner_variants=n),
+                                     _strip_frame(UNSELECTED_RGB)))) for n in (12, 14)]
+    access, moves = _fake_access(rows=rows, capture=_SequencedCapture(3, plans))
+    profile = STRIP_PROFILE.model_copy(update={"hover_settle_seconds":0, "poll_interval_seconds":0})
+    attestation = _certify(access, target, profile)
+    assert attestation.profile_id == STRIP_PROFILE.profile_id
+    assert attestation.selected.pixel_count == 1744
+    assert attestation.stable_sample_count == 2
+    assert attestation.unselected_control_count == 2
+    assert len(moves) == 2
+
+
+@pytest.mark.parametrize("colors,reason", [
+    ((UNSELECTED_RGB, HOVER_RGB, UNSELECTED_RGB), "hover"),
+    ((SELECTED_RGB, SELECTED_RGB, UNSELECTED_RGB), "more than one"),
+    ((SELECTED_RGB, UNSELECTED_RGB, UNSELECTED_RGB), "different conversation"),
+    ((UNSELECTED_RGB, (220, 220, 220), UNSELECTED_RGB), "unrecognized"),
+])
+def test_v2_transport_rejects_hover_ambiguity_and_unknown_background(colors, reason):
+    target = "runtime:target"
+    rows = [_row("runtime:a", 100), _row(target, 200), _row("runtime:b", 300)]
+    access, _ = _fake_access(rows=rows, capture=_capture_by_row(
+        {y:_strip_frame(color) for y,color in zip((100,200,300), colors)}))
+    profile = STRIP_PROFILE.model_copy(update={"hover_settle_seconds":0, "poll_interval_seconds":0})
+    with pytest.raises(UIAUnavailable, match=reason):
+        _certify(access, target, profile)
+
+
+def _transient_enumerator(*, error_code=-2147220991, always_fail=False, active_phase=None):
+    access = object.__new__(WindowsUIAQQAccessibility)
+    roots = []
+    phases = []
+    def fresh_root(_window):
+        root = object()
+        roots.append(root)
+        return root
+    def select_rows(root, _selector):
+        assert access._active_phase.root is root
+        assert access._active_phase.active
+        assert all(not phase.active for phase in phases)
+        phases.append(access._active_phase)
+        if always_fail or len(roots) == 1:
+            yield "discarded-partial-row"
+            error = RuntimeError("provider element unavailable")
+            error.hresult = error_code
+            raise error
+        yield "fresh-row"
+    access._window_uncached = fresh_root
+    access._select = select_rows
+    access._property = lambda _item, _name, _default: False
+    access._conversation_id = lambda item: "runtime:" + item
+    access._row_screen_rect = lambda _item: _row_rect(100)
+    access._active_phase = active_phase
+    return access, roots, phases
+
+
+def test_row_enumeration_discards_partial_snapshot_when_element_disappears():
+    access, roots, phases = _transient_enumerator()
+    rows = access._visible_conversation_rows(window(), selector())
+    assert len(roots) == 2 and roots[0] is not roots[1]
+    assert [row.internal_id for row in rows] == ["runtime:fresh-row"]
+    assert len(phases) == 2 and phases[0] is not phases[1]
+    assert all(not phase.active for phase in phases)
+    assert access._active_phase is None
+
+
+@pytest.mark.parametrize("settings,attempts", [
+    ({"always_fail":True}, 2),
+    ({"error_code":-2147467259}, 1),
+])
+def test_row_enumeration_retry_is_bounded_and_closes_failed_phases(settings, attempts):
+    access, roots, phases = _transient_enumerator(**settings)
+    with pytest.raises(RuntimeError, match="provider element unavailable"):
+        access._visible_conversation_rows(window(), selector())
+    assert len(roots) == attempts
+    assert len(phases) == attempts
+    assert all(not phase.active for phase in phases)
+    assert access._active_phase is None
+
+
+def test_row_enumeration_never_reuses_or_replaces_a_callers_phase():
+    original_phase = object()
+    access, roots, phases = _transient_enumerator(active_phase=original_phase)
+    with pytest.raises(RuntimeError, match="requires a fresh UIA read phase"):
+        access._visible_conversation_rows(window(), selector())
+    assert roots == [] and phases == []
+    assert access._active_phase is original_phase

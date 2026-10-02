@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -105,6 +107,24 @@ def _parse(value: str) -> datetime:
     return datetime.fromisoformat(value).astimezone(UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class ClaimedDueOutbox:
+    outbox_id: int
+    due: DueForRevalidation
+    claim_token: str
+    claimed_at: datetime
+    recoverable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DueClaimState:
+    eligible: bool
+    error_code: str | None = None
+    expires_at: datetime | None = None
+    plan_status: str | None = None
+    operation_id: str | None = None
+
+
 class PacingScheduler:
     """Transactional plan store with an idempotent, pull-based due queue."""
 
@@ -185,6 +205,11 @@ class PacingScheduler:
                 self.connection.execute(
                     "ALTER TABLE m10_due_outbox ADD COLUMN one_shot_attempt_id TEXT"
                 )
+            for name, declaration in (
+                ("not_before", "TEXT"), ("claim_token", "TEXT"), ("defer_reason", "TEXT"),
+            ):
+                if name not in outbox_columns:
+                    self.connection.execute(f"ALTER TABLE m10_due_outbox ADD COLUMN {name} {declaration}")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS m10_due_provenance "
                 "ON m10_plans(one_shot_attempt_id, status, earliest_send_at)"
@@ -581,6 +606,20 @@ class PacingScheduler:
         one_shot_attempt_id: UUID | str | None = None,
         recoverable: bool = True,
     ) -> list[tuple[int, DueForRevalidation]]:
+        return [(claim.outbox_id, claim.due) for claim in self.claim_due_outbox_with_tokens(
+            limit=limit, pacing_plan_id=pacing_plan_id, segment_index=segment_index,
+            one_shot_attempt_id=one_shot_attempt_id, recoverable=recoverable,
+        )]
+
+    def claim_due_outbox_with_tokens(
+        self,
+        *,
+        limit: int = 100,
+        pacing_plan_id: UUID | str | None = None,
+        segment_index: int | None = None,
+        one_shot_attempt_id: UUID | str | None = None,
+        recoverable: bool = True,
+    ) -> list[ClaimedDueOutbox]:
         """Claim durable due events for runtime delivery.
 
         Claims survive process failure: ``recover_due_outbox`` returns abandoned
@@ -599,8 +638,8 @@ class PacingScheduler:
             raise TypeError("recoverable must be a boolean")
         now = self.now()
         with self._uow() as conn:
-            predicates = ["status='pending'"]
-            parameters: list[object] = []
+            predicates = ["status='pending'", "(not_before IS NULL OR not_before<=?)"]
+            parameters: list[object] = [_stamp(now)]
             exact_attempt_id = (
                 str(one_shot_attempt_id) if one_shot_attempt_id is not None else None
             )
@@ -621,29 +660,154 @@ class PacingScheduler:
                 + " ORDER BY outbox_id LIMIT ?",
                 parameters,
             ).fetchall()
-            result: list[tuple[int, DueForRevalidation]] = []
+            result: list[ClaimedDueOutbox] = []
             dispatch_status = (
                 "dispatching" if recoverable else "dispatching_nonrecoverable"
             )
             for row in rows:
+                claim_token = str(uuid4())
                 changed = conn.execute(
-                    "UPDATE m10_due_outbox SET status=?,claimed_at=? "
+                    "UPDATE m10_due_outbox SET status=?,claimed_at=?,claim_token=? "
                     "WHERE outbox_id=? AND status='pending' AND " + attempt_clause,
                     (
                         dispatch_status,
                         _stamp(now),
+                        claim_token,
                         row["outbox_id"],
                         *attempt_parameters,
                     ),
                 ).rowcount
                 if changed:
-                    result.append(
-                        (
-                            row["outbox_id"],
-                            DueForRevalidation.model_validate_json(row["payload_json"]),
-                        )
-                    )
+                    result.append(ClaimedDueOutbox(
+                        outbox_id=row["outbox_id"],
+                        due=DueForRevalidation.model_validate_json(row["payload_json"]),
+                        claim_token=claim_token, claimed_at=now, recoverable=recoverable,
+                    ))
             return result
+
+    @staticmethod
+    def _claim_parameters(claim: ClaimedDueOutbox) -> tuple[object, ...]:
+        return (claim.outbox_id, str(claim.due.pacing_plan_id), claim.due.segment_index,
+                claim.claim_token, "dispatching" if claim.recoverable else "dispatching_nonrecoverable")
+
+    def due_claim_state(self, claim: ClaimedDueOutbox) -> DueClaimState:
+        """Read real plan status and immutable due membership, without renewing it."""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT o.payload_json AS due_json,o.operation_id,p.status,p.expires_at,p.payload_json "
+                "FROM m10_due_outbox o JOIN m10_plans p ON p.pacing_plan_id=o.pacing_plan_id "
+                "WHERE o.outbox_id=? AND o.pacing_plan_id=? AND o.segment_index=? "
+                "AND o.claim_token=? AND o.status=?",
+                self._claim_parameters(claim),
+            ).fetchone()
+        if row is None:
+            return DueClaimState(False, "due_claim_stale")
+        due = DueForRevalidation.model_validate_json(row["due_json"])
+        plan = PacingPlanRecord.model_validate_json(row["payload_json"])
+        if due != claim.due or plan.one_shot_attempt_id != due.one_shot_attempt_id:
+            return DueClaimState(False, "due_claim_provenance_mismatch")
+        expires = _parse(row["expires_at"])
+        state = dict(expires_at=expires, plan_status=row["status"], operation_id=row["operation_id"])
+        if (plan.conversation_id != due.conversation_id or plan.contact_id != due.contact_id
+                or plan.segment_index != due.segment_index or plan.segment_count != due.segment_count
+                or due.segment_index < 0 or due.segment_index >= len(plan.segment_draft_ids)
+                or due.segment_index >= len(plan.segments)
+                or plan.segment_draft_ids[due.segment_index] != due.draft_id
+                or plan.segments[due.segment_index] != due.body
+                or hashlib.sha256(due.body.encode()).hexdigest() != due.body_hash
+                or plan.expected_last_message_key != due.expected_last_message_key
+                or plan.text_hash != due.text_hash or plan.rule_version != due.rule_version
+                or plan.pacing_rule_version != due.pacing_rule_version
+                or (plan.segment_eligibility_ids and (
+                    due.segment_index >= len(plan.segment_eligibility_ids)
+                    or plan.segment_eligibility_ids[due.segment_index] != due.eligibility_id))
+                or (not plan.segment_eligibility_ids and plan.eligibility_id != due.eligibility_id)):
+            return DueClaimState(False, "due_plan_membership_mismatch", **state)
+        if plan.expires_at != expires:
+            return DueClaimState(False, "due_plan_expiry_mismatch", **state)
+        if row["operation_id"] is not None:
+            return DueClaimState(False, "due_operation_exists", **state)
+        if row["status"] != PacingStatus.DUE_FOR_REVALIDATION.value:
+            return DueClaimState(False, "due_plan_not_eligible", **state)
+        if expires <= self.now():
+            return DueClaimState(False, "due_plan_expired", **state)
+        return DueClaimState(True, **state)
+
+    def is_due_claim_current(self, claim: ClaimedDueOutbox) -> bool:
+        """Fence a result independently of plan expiry or existing operation state."""
+        attempt_clause, attempt_parameters = self._attempt_filter(
+            str(claim.due.one_shot_attempt_id) if claim.due.one_shot_attempt_id else None,
+        )
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT payload_json FROM m10_due_outbox WHERE outbox_id=? "
+                "AND pacing_plan_id=? AND segment_index=? AND claim_token=? AND status=? AND "
+                + attempt_clause,
+                (*self._claim_parameters(claim), *attempt_parameters),
+            ).fetchone()
+        return row is not None and DueForRevalidation.model_validate_json(row["payload_json"]) == claim.due
+
+    def defer_due_outbox(self, claim: ClaimedDueOutbox, *, not_before: datetime | None,
+                         reason: str, needs_attention: bool = False) -> bool:
+        """Return one unsent claim to waiting, or hold it for explicit attention.
+
+        The claim nonce fences stale results after recovery/reclaim. This never
+        emits another due, changes a plan/segment/expiry, or touches send facts.
+        """
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason) is None:
+            raise ValueError("defer reason must be a bounded local code")
+        now = self.now()
+        retry = max(_utc(not_before) if not_before else now, now + timedelta(seconds=10))
+        attempt_clause, attempt_parameters = self._attempt_filter(
+            str(claim.due.one_shot_attempt_id) if claim.due.one_shot_attempt_id else None,
+        )
+        with self._uow() as conn:
+            changed = conn.execute(
+                "UPDATE m10_due_outbox SET status=?,claimed_at=NULL,not_before=?,defer_reason=? "
+                "WHERE outbox_id=? AND pacing_plan_id=? AND segment_index=? AND claim_token=? "
+                "AND status=? AND operation_id IS NULL AND " + attempt_clause,
+                ("navigation_attention" if needs_attention else "pending", _stamp(retry), reason,
+                 *self._claim_parameters(claim), *attempt_parameters),
+            ).rowcount
+            if changed:
+                self._audit(conn, str(claim.due.pacing_plan_id), "due_navigation_held" if needs_attention
+                            else "due_navigation_deferred", reason, {"segment_index": claim.due.segment_index}, now)
+            return changed == 1
+
+    def release_navigation_hold(self, outbox_id: int, *, expected_claim_token: str,
+                                reason: str = "navigation_operator_released") -> bool:
+        """Explicitly release a navigation hold; expired/cancelled work stays held."""
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason) is None:
+            raise ValueError("release reason must be a bounded local code")
+        now = self.now()
+        with self._uow() as conn:
+            changed = conn.execute(
+                "UPDATE m10_due_outbox SET status='pending',not_before=?,defer_reason=? "
+                "WHERE outbox_id=? AND claim_token=? AND status='navigation_attention' "
+                "AND operation_id IS NULL AND EXISTS(SELECT 1 FROM m10_plans p "
+                "WHERE p.pacing_plan_id=m10_due_outbox.pacing_plan_id AND p.status=? AND p.expires_at>?)",
+                (_stamp(now + timedelta(seconds=10)), reason, outbox_id, expected_claim_token,
+                 PacingStatus.DUE_FOR_REVALIDATION.value, _stamp(now)),
+            ).rowcount
+            return changed == 1
+
+    def hold_due_outbox_for_recovery(self, claim: ClaimedDueOutbox, *,
+                                     operation_id: UUID | str | None,
+                                     reason: str = "navigation_existing_operation") -> bool:
+        """Keep an existing operation out of the normal navigation/prepare queue."""
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason) is None:
+            raise ValueError("recovery reason must be a bounded local code")
+        operation = str(operation_id) if operation_id is not None else None
+        attempt_clause, attempt_parameters = self._attempt_filter(
+            str(claim.due.one_shot_attempt_id) if claim.due.one_shot_attempt_id else None,
+        )
+        with self._uow() as conn:
+            return conn.execute(
+                "UPDATE m10_due_outbox SET status='operation_recovery_hold',claimed_at=NULL,defer_reason=?,operation_id=? "
+                "WHERE outbox_id=? AND pacing_plan_id=? AND segment_index=? AND claim_token=? AND status=? "
+                "AND (operation_id IS NULL OR operation_id IS ?) AND " + attempt_clause,
+                (reason, operation, *self._claim_parameters(claim), operation, *attempt_parameters),
+            ).rowcount == 1
 
     def complete_due_outbox(self, outbox_id: int) -> bool:
         with self._uow() as conn:
@@ -657,7 +821,7 @@ class PacingScheduler:
     def recover_due_outbox(self) -> int:
         with self._uow() as conn:
             return conn.execute(
-                "UPDATE m10_due_outbox SET status='pending',claimed_at=NULL WHERE status='dispatching'"
+                "UPDATE m10_due_outbox SET status='pending',claimed_at=NULL,claim_token=NULL WHERE status='dispatching'"
             ).rowcount
 
     def record_revalidation_result(
@@ -692,6 +856,7 @@ class PacingScheduler:
         segment_index: int,
         operation_id: UUID | str | None = None,
         one_shot_attempt_id: UUID | str | None = None,
+        expected_claim_token: str | None = None,
     ) -> PacingPlanRecord | None:
         """Record an exact result and deliver its claimed outbox row atomically."""
         plan_id = str(pacing_plan_id)
@@ -702,7 +867,7 @@ class PacingScheduler:
         attempt_clause, attempt_parameters = self._attempt_filter(exact_attempt_id)
         with self._uow() as conn:
             outbox = conn.execute(
-                "SELECT status,operation_id FROM m10_due_outbox "
+                "SELECT status,operation_id,claim_token FROM m10_due_outbox "
                 "WHERE outbox_id=? AND pacing_plan_id=? AND segment_index=? AND "
                 + attempt_clause,
                 (
@@ -712,6 +877,13 @@ class PacingScheduler:
                     *attempt_parameters,
                 ),
             ).fetchone()
+            # Optional navigation claims fence *all* acknowledgement effects,
+            # including the plan update/receipt, in this same transaction.
+            # Legacy callers retain their original idempotent completion path.
+            if expected_claim_token is not None and (
+                outbox is None or outbox["claim_token"] != expected_claim_token
+            ):
+                return None
             if outbox is None or outbox["status"] not in {
                 "dispatching",
                 "dispatching_nonrecoverable",

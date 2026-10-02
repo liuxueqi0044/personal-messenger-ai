@@ -18,7 +18,7 @@ import struct
 import subprocess
 import time
 import zlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from ctypes import wintypes
 from datetime import UTC, datetime
@@ -37,6 +37,7 @@ from .guest_composer import (
     get_uia_pattern,
     read_composer_text,
     write_with_text_pattern,
+    write_with_value_pattern,
 )
 from .message_decoder import decode_message_region
 from .phase_index import UIAPhaseIndex
@@ -88,7 +89,6 @@ class _ConversationRowRef(NamedTuple):
     """One enumerated conversation row bound to its runtime locator and rect."""
 
     internal_id: str
-    item: Any
     rect: ScreenRect
 
 
@@ -254,6 +254,20 @@ class WindowsUIAQQAccessibility:
             if handle > 0 and pid > 0:
                 result.append(QQWindow(process_id=pid, window_handle=handle, class_name=str(getattr(control, "ClassName", "")), title=str(getattr(control, "Name", ""))))
         return result
+
+    def cached_direct_adjacency(self, controls, *, read, max_parents, max_edges):
+        """Fetch one fresh shallow cache per frozen parent, using our walker view."""
+        from .raw_adjacency import cached_direct_adjacency
+
+        return cached_direct_adjacency(controls, auto=self._auto, read=read,
+                                      max_parents=max_parents, max_edges=max_edges)
+
+    def cached_outside_proof(self, controls, *, read, max_parents, max_edges):
+        """Return fresh ordered edges and same-cache parent RuntimeId/classes."""
+        from .raw_adjacency import cached_outside_proof
+
+        return cached_outside_proof(controls, auto=self._auto, read=read,
+                                    max_parents=max_parents, max_edges=max_edges)
 
     def tree_digest(self, window: QQWindow) -> str:
         control = self._window(window)
@@ -462,7 +476,19 @@ class WindowsUIAQQAccessibility:
             window, timeout_seconds=foreground_timeout
         )
         _check_selection_deadline(deadline)
-        rows = self._visible_conversation_rows(window, selector)
+        enumerated_rows = self._visible_conversation_rows(window, selector)
+        _check_selection_deadline(deadline)
+        bounds = self._window_screen_bounds(window)
+        def fully_inside_window(ref: _ConversationRowRef) -> bool:
+            return bool(
+                bounds[0] <= ref.rect.left < ref.rect.right <= bounds[2]
+                and bounds[1] <= ref.rect.top < ref.rect.bottom <= bounds[3]
+            )
+        rows = [
+            ref
+            for ref in enumerated_rows
+            if fully_inside_window(ref)
+        ]
         if not rows:
             raise UIAUnavailable("no visible conversation rows were enumerated")
         target_id = conversation.internal_id
@@ -470,7 +496,6 @@ class WindowsUIAQQAccessibility:
             raise UIAUnavailable(
                 "conversation target is absent or ambiguous in the visible rows"
             )
-        bounds = self._window_screen_bounds(window)
         row_rects = {ref.internal_id: ref.rect for ref in rows}
         for ref in rows:
             rect = ref.rect
@@ -518,7 +543,12 @@ class WindowsUIAQQAccessibility:
                 raise UIAUnavailable(
                     "certified QQ window changed during selection certification"
                 )
-            current = self._visible_conversation_rows(window, selector)
+            current = [
+                ref
+                for ref in self._visible_conversation_rows(window, selector)
+                if fully_inside_window(ref)
+            ]
+            _check_selection_deadline(deadline)
             if [ref.internal_id for ref in current] != [
                 ref.internal_id for ref in rows
             ]:
@@ -605,19 +635,42 @@ class WindowsUIAQQAccessibility:
     def _visible_conversation_rows(
         self, window: QQWindow, selector: QQSelector
     ) -> list[_ConversationRowRef]:
-        """Re-enumerate every visible conversation row with its runtime locator."""
+        """Return value-only rows from one fresh, short-lived UIA read phase."""
 
         if selector.name != "conversation_item":
             raise UIAUnavailable("conversation selection selector is not certified")
-        refs: list[_ConversationRowRef] = []
-        for item in self._select(self._window(window), selector):
-            if bool(self._property(item, "IsOffscreen", True)):
-                continue
-            internal_id = self._conversation_id(item)
-            if not internal_id:
-                continue
-            refs.append(_ConversationRowRef(internal_id, item, self._row_screen_rect(item)))
-        return refs
+        if getattr(self, "_active_phase", None) is not None:
+            raise RuntimeError("conversation row enumeration requires a fresh UIA read phase")
+
+        def read_snapshot() -> list[_ConversationRowRef]:
+            refs: list[_ConversationRowRef] = []
+            # Cache duplicate COM reads only within this enumeration. Close
+            # the phase before hover movement, pixel capture or the next
+            # stability sample, and never return its live controls. Keeping
+            # loop locals in this frame also releases a failed row before a
+            # retry builds its fresh root.
+            with self.read_phase(window):
+                for item in self._select(self._window(window), selector):
+                    if bool(self._property(item, "IsOffscreen", True)):
+                        continue
+                    internal_id = self._conversation_id(item)
+                    if not internal_id:
+                        continue
+                    refs.append(_ConversationRowRef(internal_id, self._row_screen_rect(item)))
+            return refs
+
+        for attempt in range(2):
+            # QQ may destroy a transient UIA element during enumeration. Never
+            # skip that element or return partial rows: discard the entire read
+            # and rebuild once from the exact HWND. No action is retried here.
+            try:
+                return read_snapshot()
+            except Exception as exc:
+                if attempt != 0 or getattr(exc, "hresult", None) != -2147220991:
+                    raise
+                # UIA_E_ELEMENTNOTAVAILABLE (0x80040201) only. Other provider
+                # failures remain visible rather than being treated as drift.
+        raise AssertionError("unreachable")
 
     def _sample_row_border(
         self,
@@ -635,6 +688,7 @@ class WindowsUIAQQAccessibility:
                 width=rect.width,
                 height=rect.height,
                 inset=profile.border_inset,
+                sampling_mask=profile.sampling_mask,
             )
         except UIAUnavailable:
             raise
@@ -1015,7 +1069,8 @@ class WindowsUIAQQAccessibility:
         control = matches[0]
         pattern = self._pattern(control, "GetValuePattern", 10002)
         if pattern is not None and not bool(getattr(pattern, "IsReadOnly", False)):
-            pattern.SetValue(text)
+            write_with_value_pattern(control, text, scope_guard=lambda: self._guest_scope(window),
+                                     focus_guard=lambda target: self._composer_focused(target, window))
         else:
             if self._pattern(control, "GetTextPattern", 10014) is None:
                 raise UIAUnavailable("composer has no writable ValuePattern or readable TextPattern")
@@ -1062,6 +1117,77 @@ class WindowsUIAQQAccessibility:
             message_key=item.message_key, direction=item.direction, text=item.text,
             observed_at=datetime.now(UTC), tree_digest=digest)
             for item in decode_message_region(regions[0])]
+
+    def _message_scroll_pattern(self, window: QQWindow, selector: QQSelector) -> Any:
+        """Resolve only the configured, unique message region in the certified HWND."""
+
+        if selector.name != "bubbles":
+            raise UIAUnavailable("message_tail_region_unproven")
+        regions = self._select(self._window(window), selector)
+        if len(regions) != 1:
+            raise UIAUnavailable("message_tail_region_unproven")
+        region = regions[0]
+        if (
+            "ml-root" not in str(self._property(region, "ClassName", "")).split()
+            or self._property(region, "ProcessId", None) != window.process_id
+            or self._property(region, "IsOffscreen", True) is not False
+        ):
+            raise UIAUnavailable("message_tail_region_unproven")
+        pattern = self._pattern(region, "GetScrollPattern", 10004)
+        if pattern is None:
+            raise UIAUnavailable("message_tail_unproven")
+        return pattern
+
+    def message_tail_is_latest(self, window: QQWindow, selector: QQSelector) -> bool:
+        """Require valid ScrollPattern evidence; unknown is never a latest-tail proof."""
+
+        try:
+            pattern = self._message_scroll_pattern(window, selector)
+            scrollable = pattern.VerticallyScrollable
+            percent = pattern.VerticalScrollPercent
+            view_size = pattern.VerticalViewSize
+            if (
+                not isinstance(scrollable, bool)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in (percent, view_size)
+                )
+                or not 0 < view_size <= 100
+                or (scrollable and not 0 <= percent <= 100)
+                or (not scrollable and (percent != -1 or view_size != 100))
+            ):
+                raise UIAUnavailable("message_tail_unproven")
+            return not scrollable or percent == 100
+        except UIAUnavailable:
+            raise
+        except Exception as exc:
+            raise UIAUnavailable("message_tail_unproven") from exc
+
+    def scroll_message_tail_to_latest(
+        self, window: QQWindow, selector: QQSelector, *, before_action: Callable[[], None]
+    ) -> None:
+        """One semantic scroll, outside any cached phase; no keyboard/coordinate fallback."""
+
+        if getattr(self, "_active_phase", None) is not None:
+            raise UIAUnavailable("message_tail_scroll_during_read_phase")
+        if not self._guest_scope(window):
+            raise UIAUnavailable("message_tail_target_not_foreground")
+        # Re-read the exact region before the action, including malformed-state
+        # rejection. A concurrent arrival at the tail makes this a no-op.
+        if self.message_tail_is_latest(window, selector):
+            return
+        pattern = self._message_scroll_pattern(window, selector)
+        action = getattr(pattern, "SetScrollPercent", None)
+        if not callable(action):
+            raise UIAUnavailable("message_tail_scroll_unavailable")
+        before_action()
+        if not self._guest_scope(window):
+            raise UIAUnavailable("message_tail_target_not_foreground")
+        try:
+            action(-1.0, 100.0)  # Leave horizontal position unchanged.
+        except Exception as exc:
+            raise UIAUnavailable("message_tail_scroll_failed") from exc
 
     def _window(self, window: QQWindow) -> Any:
         phase = getattr(self, "_active_phase", None)
@@ -1145,20 +1271,17 @@ class WindowsUIAQQAccessibility:
                 if self._matches(item, selector, automation_ancestors, type_ancestors)]
 
     def _descendants(self, root: Any) -> Iterable[Any]:
-        phase = getattr(self, "_active_phase", None)
-        if phase is not None and phase.root is root:
-            for node in phase.nodes():
-                yield node.control
-            return
         for item, _automation_ancestors, _type_ancestors in self._walk(root):
             yield item
 
     def _walk(self, root: Any) -> Iterable[tuple[Any, tuple[str, ...], tuple[str, ...]]]:
         phase = getattr(self, "_active_phase", None)
-        if phase is not None and phase.root is root:
-            for node in phase.nodes():
-                yield node.control, node.automation_ancestors, node.type_ancestors
-            return
+        if phase is not None:
+            nodes = phase.subtree_nodes(root)
+            if nodes is not None:
+                for node in nodes:
+                    yield node.control, node.automation_ancestors, node.type_ancestors
+                return
         queue = [(item, (), ()) for item in root.GetChildren()]
         while queue:
             item, automation_ancestors, type_ancestors = queue.pop(0)

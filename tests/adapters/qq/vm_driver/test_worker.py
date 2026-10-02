@@ -63,6 +63,51 @@ def _worker():
     return QQVMWorker(accessibility=fake, selector_pack=pack, bindings=(binding,)), fake, binding.binding_id
 
 
+@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), 0.5])
+def test_worker_rejects_invalid_prepare_write_reserve(value) -> None:
+    adapter, fake = _adapter()
+    binding = next(iter(adapter.bindings.values()))
+
+    with pytest.raises(ValueError, match="prepare write reserve"):
+        QQVMWorker(
+            accessibility=fake,
+            selector_pack=adapter.selector_pack,
+            bindings=(binding,),
+            prepare_write_reserve_seconds=value,
+        )
+
+    with pytest.raises(ValueError, match="prepare write reserve"):
+        QQVMWorkerProcess(
+            adapter.selector_pack,
+            (binding,),
+            prepare_write_reserve_seconds=value,
+        )
+
+
+def test_worker_process_successor_preserves_prepare_write_reserve() -> None:
+    original = QQVMWorkerProcess
+    captured = {}
+
+    class Successor(original):
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    facade = Successor.__new__(Successor)
+    facade._selector_pack = object()
+    facade._bindings = (object(),)
+    facade._session_evidence = (object(),)
+    facade._run_id = "run-id"
+    facade._visual_selection = object()
+    facade._visual_api_key = "visual-key"
+    facade._prepare_write_reserve_seconds = 23.0
+
+    successor = original.spawn_successor(facade)
+
+    assert isinstance(successor, Successor)
+    assert captured["kwargs"]["prepare_write_reserve_seconds"] == 23.0
+
+
 class _SelectionActuator:
     def __init__(self, outcome):
         self.outcome = outcome
@@ -680,6 +725,222 @@ def test_preexisting_draft_is_never_overwritten() -> None:
     assert result.status is WorkerStatus.FAILED_SAFE
     assert result.error_code == "composer_not_empty"
     assert fake.composer == "人工草稿"
+
+
+@pytest.mark.parametrize("existing_draft", ["", "operator draft"])
+def test_prepare_without_read_phase_keeps_composer_check_for_ordinary_proof(
+    existing_draft: str,
+) -> None:
+    adapter, fake = _adapter()
+    binding = next(iter(adapter.bindings.values())).model_copy(update={
+        "conversation_type": "direct",
+        "participant_signature": "qq-profile-hmac:" + "c" * 64,
+    })
+    worker = QQVMWorker(
+        accessibility=fake,
+        selector_pack=adapter.selector_pack,
+        bindings=(binding,),
+        identity_certifier=Certifier(binding.participant_signature),
+        candidate_locator=Locator(),
+    )
+    assert not callable(getattr(fake, "read_phase", None))
+    assert binding.authorization_scope == "legacy_explicit_contacts"
+    fake.composer = existing_draft
+    command = WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="fallback:0", text="prepared reply",
+    )
+
+    result = worker.execute(command)
+
+    content_calls = [call for call in fake.calls if call in {
+        "bubbles", "read-composer", "write-composer", "invoke-send",
+    }]
+    if existing_draft:
+        assert result.status is WorkerStatus.FAILED_SAFE
+        assert result.error_code == "composer_not_empty"
+        assert content_calls == ["bubbles", "read-composer"]
+        assert fake.composer == existing_draft
+        assert worker._prepared == {}
+        assert worker._reservation is None
+    else:
+        assert result.status is WorkerStatus.OK
+        assert content_calls == ["bubbles", "read-composer", "write-composer", "read-composer"]
+        assert fake.composer == command.text
+        assert worker._reservation == command.operation_id
+
+
+def test_prepare_session_proof_with_narrow_scope_keeps_all_full_revalidations(
+    monkeypatch,
+) -> None:
+    worker, fake, binding, proof = _already_current_fixture(monkeypatch)
+    binding = binding.model_copy(update={"authorization_scope": "legacy_explicit_contacts"})
+    worker._bindings[binding.binding_id] = binding
+    assert isinstance(proof, QQSessionObservedDirectIdentity)
+    assert callable(fake.read_phase)
+    fake.confirm_conversation_selected = lambda *_args: None
+    events = []
+    full_revalidations = []
+    revalidate = worker._revalidate_expected_target
+    certify = worker._certify_visual_header_current
+    list_bubbles = fake.list_bubbles
+    read_composer = fake.read_composer
+    write_composer = fake.write_composer
+    attest = fake.certify_conversation_selected_visual
+    certify_header = worker._identity_certifier.try_certify_already_current
+
+    def spy_revalidate(**kwargs):
+        events.append("revalidate")
+        return revalidate(**kwargs)
+
+    def spy_certify(**kwargs):
+        # A narrow-scope resolution cannot issue a certified PREPARE snapshot.
+        # Every call here must still execute the complete identity/visual check.
+        full_revalidations.append(kwargs)
+        return certify(**kwargs)
+
+    def spy_attest(*args, **kwargs):
+        events.append("attest")
+        return attest(*args, **kwargs)
+
+    def spy_header(*args):
+        events.append("header")
+        return certify_header(*args)
+
+    def spy_bubbles(*args):
+        events.append("bubbles")
+        return list_bubbles(*args)
+
+    def spy_read(*args):
+        events.append("read-composer")
+        return read_composer(*args)
+
+    def spy_write(*args):
+        events.append("write-composer")
+        return write_composer(*args)
+
+    monkeypatch.setattr(worker, "_revalidate_expected_target", spy_revalidate)
+    monkeypatch.setattr(worker, "_certify_visual_header_current", spy_certify)
+    monkeypatch.setattr(fake, "list_bubbles", spy_bubbles)
+    monkeypatch.setattr(fake, "read_composer", spy_read)
+    monkeypatch.setattr(fake, "write_composer", spy_write)
+    monkeypatch.setattr(fake, "certify_conversation_selected_visual", spy_attest)
+    monkeypatch.setattr(worker._identity_certifier, "try_certify_already_current", spy_header)
+    command = WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="fallback:0", text="prepared reply",
+    )
+
+    result = worker.execute(command)
+
+    assert result.status is WorkerStatus.OK
+    full_check = ["revalidate", "attest", "header", "attest"]
+    assert events == (
+        ["bubbles"] + full_check + ["read-composer"] + full_check
+        + ["write-composer", "revalidate", "attest", "header", "read-composer", "attest"]
+    )
+    assert len(full_revalidations) == 3
+    assert all(call["current_reader"] is None for call in full_revalidations[:2])
+    assert callable(full_revalidations[2]["current_reader"])
+    assert all(call["binding"] is binding for call in full_revalidations)
+    assert fake.composer == command.text
+    assert worker._reservation == command.operation_id
+    assert "invoke-send" not in fake.calls
+
+
+def test_prepare_narrow_fallback_does_not_retry_first_revalidation_geometry_drift(
+    monkeypatch,
+) -> None:
+    worker, fake, binding, _proof = _already_current_fixture(monkeypatch)
+    binding = binding.model_copy(update={"authorization_scope": "legacy_explicit_contacts"})
+    worker._bindings[binding.binding_id] = binding
+    fake.confirm_conversation_selected = lambda *_args: None
+    attest = fake.certify_conversation_selected_visual
+    header = worker._identity_certifier.try_certify_already_current
+    resolve = worker._resolve
+    calls = {"attest": 0, "header": 0, "resolve": 0}
+
+    def drifting_attestation(*args, **kwargs):
+        calls["attest"] += 1
+        value = attest(*args, **kwargs)
+        if calls["attest"] > 1:
+            value = value.model_copy(update={"row_rect": value.row_rect.model_copy(update={
+                "left": value.row_rect.left + 1, "right": value.row_rect.right + 1,
+            })})
+        return value
+
+    def count_header(*args):
+        calls["header"] += 1
+        return header(*args)
+
+    def count_resolve(*args, **kwargs):
+        calls["resolve"] += 1
+        return resolve(*args, **kwargs)
+
+    monkeypatch.setattr(fake, "certify_conversation_selected_visual", drifting_attestation)
+    monkeypatch.setattr(worker._identity_certifier, "try_certify_already_current", count_header)
+    monkeypatch.setattr(worker, "_resolve", count_resolve)
+
+    result = worker.execute(WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="fallback:0", text="must not be written",
+    ))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert calls == {"attest": 2, "header": 1, "resolve": 1}
+    assert fake.calls.count("select") == 1
+    assert fake.calls.count("bubbles") == 1
+    assert not {"read-composer", "write-composer", "invoke-send"} & set(fake.calls)
+    assert fake.composer == ""
+    assert worker._prepared == {}
+    assert worker._reservation is None
+    assert worker._trusted_operation_lease is None
+
+
+@pytest.mark.parametrize("composer_cleared", [False, True])
+def test_prepare_with_existing_reservation_does_not_retry_geometry_drift(
+    monkeypatch, composer_cleared: bool,
+) -> None:
+    worker, fake, binding, _proof = _already_current_fixture(monkeypatch)
+    command = WorkerCommand(
+        kind=WorkerKind.PREPARE, binding_id=binding.binding_id,
+        operation_id=uuid4(), segment_ref="reserved:0", text="owned draft",
+    )
+    assert worker.execute(command).status is WorkerStatus.OK
+    prepared = worker._prepared[command.operation_id]
+    lease = worker._trusted_operation_lease
+    if composer_cleared:
+        fake.composer = ""
+    before_composer = fake.composer
+    fake.calls.clear()
+    attest = fake.certify_conversation_selected_visual
+    attestations = []
+
+    def drifting_attestation(*args, **kwargs):
+        value = attest(*args, **kwargs)
+        if attestations:
+            value = value.model_copy(update={"row_rect": value.row_rect.model_copy(update={
+                "left": value.row_rect.left + 1, "right": value.row_rect.right + 1,
+            })})
+        attestations.append(value)
+        return value
+
+    monkeypatch.setattr(fake, "certify_conversation_selected_visual", drifting_attestation)
+
+    result = worker.execute(command.model_copy(update={"request_id": uuid4()}))
+
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "selection_visual_attestation_drift"
+    assert len(attestations) == 2
+    assert fake.calls.count("bubbles") == 1
+    assert fake.calls.count("read-composer") == 1
+    assert fake.calls.count("select") == 1
+    assert not {"write-composer", "invoke-send"} & set(fake.calls)
+    assert fake.composer == before_composer
+    assert worker._prepared[command.operation_id] is prepared
+    assert worker._reservation == command.operation_id
+    assert worker._trusted_operation_lease == lease
 
 
 def test_verify_requires_a_new_unique_outbound_bubble() -> None:
@@ -1586,7 +1847,8 @@ def test_handoff_never_enters_the_worker_request_diagnostics() -> None:
     diagnostics = QQVMWorkerProcess._request_metadata(_with_handoff(command, handoff))
     serialized = json.dumps(diagnostics, sort_keys=True)
 
-    assert set(diagnostics) == {"request_id", "kind", "binding_id"}
+    assert set(diagnostics) == {"request_id", "kind", "binding_id", "operation_id",
+                                "binding_revision", "conversation_revision"}
     assert str(handoff.handoff_id) not in serialized
     assert str(handoff.predecessor_request_id) not in serialized
     assert str(handoff.predecessor_worker_epoch) not in serialized
@@ -2018,3 +2280,86 @@ def test_process_terminates_and_fails_uncertain_on_mismatched_child_response(
     assert terminal["error_code"] == "worker_response_mismatch"
     assert terminal["request_id"] == str(command.request_id)
     assert "must-not-appear" not in json.dumps(snapshot, sort_keys=True)
+
+
+def test_observe_reads_only_after_one_latest_tail_scroll_and_fresh_resolution():
+    worker, fake, binding = _worker()
+    latest = False
+    trace = []
+    fake.message_tail_is_latest = lambda *_: latest
+    original_resolve = worker._resolve
+    original_bubbles = fake.list_bubbles
+
+    def resolve(*args, **kwargs):
+        trace.append("resolve")
+        return original_resolve(*args, **kwargs)
+
+    def bubbles(*args):
+        assert latest
+        trace.append("bubbles")
+        return original_bubbles(*args)
+
+    def scroll(*args, before_action):
+        nonlocal latest
+        before_action()
+        trace.append("scroll")
+        latest = True
+
+    worker._resolve = resolve
+    fake.list_bubbles = bubbles
+    fake.scroll_message_tail_to_latest = scroll
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.OK
+    assert trace == ["resolve", "scroll", "resolve", "bubbles"]
+
+
+@pytest.mark.parametrize("mode,code", [
+    ("missing", "message_tail_unproven"),
+    ("unknown", "message_tail_unproven"),
+    ("no_action", "message_tail_scroll_unavailable"),
+])
+def test_observe_unproven_tail_is_failed_safe_without_bubbles(mode, code):
+    worker, fake, binding = _worker()
+    fake.message_tail_is_latest = None if mode == "missing" else lambda *_: (None if mode == "unknown" else False)
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE and result.error_code == code
+    assert "bubbles" not in fake.calls and "bubbles" not in result.evidence
+
+
+def test_observe_tail_settle_is_bounded_without_repeating_scroll(monkeypatch):
+    worker, fake, binding = _worker()
+    fake.message_tail_is_latest = lambda *_: False
+    calls = []
+    fake.scroll_message_tail_to_latest = lambda *args, **kwargs: calls.append("scroll")
+    ticks = iter([0.0, 3.0])
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(ticks))
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "message_tail_not_latest"
+    assert calls == ["scroll"] and "bubbles" not in fake.calls
+
+
+def test_observe_tail_drift_after_read_never_publishes_snapshot():
+    worker, fake, binding = _worker()
+    states = iter([True, False])
+    fake.message_tail_is_latest = lambda *_: next(states)
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert result.error_code == "message_tail_changed"
+    assert "bubbles" not in result.evidence
+
+
+def test_observe_scroll_keeps_identity_validation_fail_closed():
+    worker, fake, binding = _worker()
+    fake.message_tail_is_latest = lambda *_: False
+
+    def scroll(*args, before_action):
+        before_action()
+        fake.conversations[0] = fake.conversations[0].model_copy(
+            update={"participant_signature": "different-counterparty"}
+        )
+
+    fake.scroll_message_tail_to_latest = scroll
+    result = worker.execute(WorkerCommand(kind=WorkerKind.OBSERVE, binding_id=binding))
+    assert result.status is WorkerStatus.FAILED_SAFE
+    assert "bubbles" not in result.evidence and "bubbles" not in fake.calls

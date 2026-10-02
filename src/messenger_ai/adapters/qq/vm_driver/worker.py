@@ -3,20 +3,26 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import multiprocessing as mp
+import multiprocessing.spawn as mp_spawn
 import re
 import secrets
+import sys
 import threading
 import time
 import traceback
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
 from messenger_ai.adapters.qq.models import (
+    QQBubble,
     QQCertifiedDirectIdentity,
     QQConversation,
     QQIdentityBinding,
@@ -43,6 +49,7 @@ from .contracts import (
     verify_selection_handoff_auth,
 )
 from .sequence_alignment import SnapshotAlignmentError, unique_suffix_start
+from .diagnostics import WorkerDiagnosticSink, bounded_selection_attestation, emit_console
 from .session_identity import QQSessionCandidateLocator, QQSessionIdentityCertifier
 from .transport import UIAUnavailable, WindowsUIAQQAccessibility
 from .visual_selection import (
@@ -57,6 +64,80 @@ from .visual_selection import (
 )
 
 CurrentDirectIdentity = QQCertifiedDirectIdentity | QQSessionObservedDirectIdentity
+_SPAWN_EXECUTABLE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _PrepareReadSnapshot:
+    """Value data returned only after the complete visual/header/read fence."""
+
+    before_bubbles: tuple[QQBubble, ...]
+    composer_text: str
+
+
+_SELECTION_SCOPE_FIELDS = (
+    "schema_version", "profile_id", "client_version", "selector_pack_version",
+    "environment_fingerprint", "process_id", "window_handle",
+    "target_runtime_id_digest",
+)
+
+
+class _SelectionAttestationDrift(RuntimeError):
+    """A fixed public error with content-free field/geometry diagnostics."""
+
+    def __init__(self, *, changed_fields: list[str],
+                 after: SelectionVisualAttestation,
+                 before: SelectionVisualAttestation | None = None,
+                 attempt: int = 1, retrying: bool = False) -> None:
+        super().__init__("selection visual attestation drift")
+        self.diagnostic = {
+            "comparison": "before_after" if before is not None else "expected_scope",
+            "changed_fields": changed_fields,
+            "after_rect": [after.row_rect.left, after.row_rect.top,
+                           after.row_rect.right, after.row_rect.bottom],
+            "attempt": attempt,
+            "retrying": retrying,
+        }
+        if before is not None:
+            self.diagnostic["before_rect"] = [
+                before.row_rect.left, before.row_rect.top,
+                before.row_rect.right, before.row_rect.bottom,
+            ]
+
+
+def _start_without_console(process) -> None:
+    """A detached python.exe spawns a new console by default on Windows."""
+    if sys.platform != "win32":
+        process.start()
+        return
+    executable = Path(sys.executable).with_name("pythonw.exe")
+    if not executable.is_file():
+        raise RuntimeError("windowless Python executable unavailable")
+    # multiprocessing has a global executable setting; restore it even when
+    # spawn fails, and serialize our own worker starts around that setting.
+    with _SPAWN_EXECUTABLE_LOCK:
+        previous = mp_spawn.get_executable()
+        try:
+            mp.set_executable(str(executable))
+            process.start()
+        finally:
+            mp.set_executable(previous)
+
+
+def _validated_prepare_write_reserve(value: object) -> float:
+    """Return a finite reserve large enough to be an effective write fence."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("prepare write reserve must be a number")
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("prepare write reserve must be a finite number") from exc
+    if not math.isfinite(parsed) or parsed < 1.0 or parsed > 600:
+        raise ValueError(
+            "prepare write reserve must be at least 1 and no more than 600 seconds"
+        )
+    return parsed
 
 
 _SAFE_EXCEPTION_MESSAGES = {
@@ -160,9 +241,12 @@ def _safe_failure(exc: BaseException, *, fallback: str) -> tuple[str, dict[str, 
     com_hresult: int | None = None
     project_frames: list[dict[str, object]] = []
     visual_selection_evidence: dict[str, object] = {}
+    selection_attestation: dict[str, object] = {}
     current: BaseException | None = exc
     while current is not None and len(chain) < 5:
         chain.append(type(current).__name__)
+        if isinstance(current, _SelectionAttestationDrift) and not selection_attestation:
+            selection_attestation = bounded_selection_attestation(current.diagnostic)
         candidate = getattr(current, "hresult", None)
         if not isinstance(candidate, int) and getattr(current, "args", ()):
             candidate = current.args[0]
@@ -189,6 +273,8 @@ def _safe_failure(exc: BaseException, *, fallback: str) -> tuple[str, dict[str, 
     if project_frames:
         evidence["project_frames"] = project_frames[-8:]
     evidence.update(visual_selection_evidence)
+    if selection_attestation:
+        evidence["selection_attestation"] = selection_attestation
     return error_code or fallback, evidence
 
 
@@ -202,9 +288,11 @@ class QQVMWorker:
                  selection_actuator: ConversationSelectionActuator | None = None,
                  selection_visual_profile: ConversationRowPaletteProfile | None = None,
                  selection_handoff_signing_key: bytes | None = None,
+                 prepare_write_reserve_seconds: float = 5.0,
                  expected_window: tuple[int, int] | None = None,
                  window_validator: Callable[[QQWindow], None] | None = None,
-                 run_id: str | None = None) -> None:
+                 run_id: str | None = None,
+                 diagnostics_dir: Path | None = None) -> None:
         self._accessibility = accessibility
         self._selectors = selector_pack
         self._bindings = {item.binding_id: item for item in bindings}
@@ -224,6 +312,9 @@ class QQVMWorker:
         )
         if len(self._selection_handoff_signing_key) < 32:
             raise ValueError("selection handoff signing key is too short")
+        self._prepare_write_reserve_seconds = _validated_prepare_write_reserve(
+            prepare_write_reserve_seconds
+        )
         self._expected_window = expected_window
         self._window_validator = window_validator
         self._reservation_binding_id: str | None = None
@@ -231,6 +322,7 @@ class QQVMWorker:
         self._consumed_selection_handoffs: set[UUID] = set()
         self._trusted_operation_lease: tuple[UUID, str, int, int] | None = None
         self._run_id = run_id
+        self._diagnostics = WorkerDiagnosticSink(diagnostics_dir, "child") if diagnostics_dir else None
         if expected_window is not None and window_validator is None:
             raise ValueError("a scoped session window requires current-session validation")
         if any(item.authorization_scope == "all_direct_including_temporary" for item in bindings):
@@ -417,15 +509,60 @@ class QQVMWorker:
 
     def _observe(self, command: WorkerCommand) -> WorkerResult:
         binding = self._bindings[command.binding_id or ""]
-        def read_bubbles(window, _conversation, _proof):
-            with self._stage(command, "bubbles"):
-                return self._accessibility.list_bubbles(
-                    window, self._selectors.selector("bubbles")
-                )
+        selector = self._selectors.selector("bubbles")
+        tail_is_latest = getattr(self._accessibility, "message_tail_is_latest", None)
 
-        window, conversation, _proof, bubbles = self._resolve(
+        def read_bubbles(window, _conversation, _proof):
+            with self._stage(command, "message_tail"):
+                if not callable(tail_is_latest):
+                    raise UIAUnavailable("message_tail_unproven")
+                latest = tail_is_latest(window, selector)
+                if latest is not True:
+                    if latest is not False:
+                        raise UIAUnavailable("message_tail_unproven")
+                    return None
+            with self._stage(command, "bubbles"):
+                return self._accessibility.list_bubbles(window, selector)
+
+        window, conversation, proof, bubbles = self._resolve(
             command, binding, current_reader=read_bubbles
         )
+        if bubbles is None:
+            scroll = getattr(self._accessibility, "scroll_message_tail_to_latest", None)
+            if not callable(scroll):
+                raise UIAUnavailable("message_tail_scroll_unavailable")
+            expected = self._stable_target(binding=binding, window=window, proof=proof)
+            self._ensure_command_live(command)
+            with self._stage(command, "message_tail_scroll"):
+                scroll(
+                    window, selector,
+                    before_action=lambda: self._ensure_command_live(command),
+                )
+            # Never repeat the mutation. Each settling read independently
+            # certifies the same target using the existing identity checks.
+            # A selection handoff was already consumed by the first resolve;
+            # use full ordinary certification rather than replay its authority.
+            refreshed = command.model_copy(update={"selection_handoff": None})
+            limit = time.monotonic() + 2.0
+            while True:
+                self._ensure_command_live(command)
+                window, conversation, proof, bubbles = self._resolve(
+                    refreshed, binding, current_reader=read_bubbles
+                )
+                if self._stable_target(binding=binding, window=window, proof=proof) != expected:
+                    raise RuntimeError("binding proof drift after selection")
+                self._ensure_command_live(command)
+                if bubbles is not None:
+                    break
+                remaining = limit - time.monotonic()
+                if remaining <= 0:
+                    raise UIAUnavailable("message_tail_not_latest")
+                time.sleep(min(0.05, remaining))
+        # This is outside the certified read phase: discard any memoized UIA
+        # properties before deciding that the just-read snapshot is current.
+        if tail_is_latest(window, selector) is not True:
+            raise UIAUnavailable("message_tail_changed")
+        self._ensure_command_live(command)
         # The durable, conversation-scoped cursor is assigned by the main process.
         rows = [item.model_dump(mode="json") for item in bubbles]
         complete = all(item.direction.value != "unknown" for item in bubbles)
@@ -442,30 +579,60 @@ class QQVMWorker:
                     window, self._selectors.selector("bubbles")
                 )
 
-        window, conversation, proof, before = self._resolve(
-            command, binding, current_reader=read_bubbles
+        def read_composer(window, _conversation, _proof):
+            with self._stage(command, "composer_read"):
+                return self._accessibility.read_composer(
+                    window, self._selectors.selector("composer")
+                )
+
+        def read_prepare_snapshot(window, conversation, proof):
+            return _PrepareReadSnapshot(
+                before_bubbles=tuple(read_bubbles(window, conversation, proof)),
+                composer_text=read_composer(window, conversation, proof),
+            )
+
+        window, conversation, proof, current = self._resolve(
+            command,
+            binding,
+            current_reader=read_bubbles,
+            certified_current_reader=read_prepare_snapshot,
+            allow_geometry_retry=True,
         )
         expected_target = self._stable_target(
             binding=binding, window=window, proof=proof
         )
-        if isinstance(proof, QQSessionObservedDirectIdentity):
-            self._revalidate_expected_target(
-                command=command,
-                binding=binding,
-                window=window,
-                conversation=conversation,
-                expected=expected_target,
-            )
-        if self._accessibility.read_composer(window, self._selectors.selector("composer")):
+        if isinstance(current, _PrepareReadSnapshot):
+            # Both content reads share one header phase, bracketed by complete
+            # visual attestations. No UIA controls survive that phase. The
+            # transport must still enforce its fresh write-entry guards;
+            # this snapshot is not an atomic guarantee against external input.
+            before = current.before_bubbles
+            composer_text = current.composer_text
+        else:
+            # Legacy/fallback identity reads do not establish the full fence.
+            # Keep their existing independent checks around the composer read.
+            before = current
+            if isinstance(proof, QQSessionObservedDirectIdentity):
+                self._revalidate_expected_target(
+                    command=command,
+                    binding=binding,
+                    window=window,
+                    conversation=conversation,
+                    expected=expected_target,
+                )
+            composer_text = read_composer(window, conversation, proof)
+            if composer_text:
+                return self._result(command, WorkerStatus.FAILED_SAFE, "composer_not_empty")
+            if isinstance(proof, QQSessionObservedDirectIdentity):
+                self._revalidate_expected_target(
+                    command=command,
+                    binding=binding,
+                    window=window,
+                    conversation=conversation,
+                    expected=expected_target,
+                )
+        if composer_text:
             return self._result(command, WorkerStatus.FAILED_SAFE, "composer_not_empty")
-        if isinstance(proof, QQSessionObservedDirectIdentity):
-            self._revalidate_expected_target(
-                command=command,
-                binding=binding,
-                window=window,
-                conversation=conversation,
-                expected=expected_target,
-            )
         text_hash = __import__("hashlib").sha256(command.text.encode()).hexdigest()
         portable = PreparedVerificationEvidence(
             owner_binding_id=binding.binding_id,
@@ -492,6 +659,22 @@ class QQVMWorker:
             "segment_ref": command.segment_ref,
             "prepared_evidence": portable.model_dump(mode="json"),
         }
+        if (
+            command.deadline is not None
+            and (command.deadline - datetime.now(UTC)).total_seconds()
+            <= self._prepare_write_reserve_seconds
+        ):
+            # Selection, identity proof and bubble reads are read-only.  Do not
+            # cross the composer-write boundary unless enough of the parent
+            # watchdog remains for write, post-write identity proof and exact
+            # readback.  This keeps a slow QQ/UIA snapshot fail-safe instead of
+            # turning a preventable pre-write delay into an uncertain draft.
+            return self._result(
+                command,
+                WorkerStatus.FAILED_SAFE,
+                "prepare_write_budget_exhausted",
+                evidence={"composer_written": False},
+            )
         # Establish cleanup ownership before crossing the composer-write
         # boundary. Any partial write or post-write identity failure remains
         # reserved to this exact operation until a proven ABORT succeeds.
@@ -507,15 +690,18 @@ class QQVMWorker:
         self._ensure_command_live(command)
         self._accessibility.write_composer(window, command.text, self._selectors.selector("composer"))
         if isinstance(proof, QQSessionObservedDirectIdentity):
-            self._revalidate_expected_target(
+            _, actual = self._revalidate_expected_target(
                 command=command,
                 binding=binding,
                 window=window,
                 conversation=conversation,
                 expected=expected_target,
+                current_reader=read_composer,
             )
+        else:
+            self._ensure_command_live(command)
+            actual = read_composer(window, conversation, proof)
         self._ensure_command_live(command)
-        actual = self._accessibility.read_composer(window, self._selectors.selector("composer"))
         if actual != command.text:
             return self._result(
                 command,
@@ -746,6 +932,7 @@ class QQVMWorker:
         command: WorkerCommand,
         window: QQWindow,
         conversation: QQConversation,
+        attempt: int = 1,
     ) -> SelectionVisualAttestation:
         self._ensure_command_live(command)
         profile = self._selection_visual_profile
@@ -779,19 +966,23 @@ class QQVMWorker:
             if str(exc) == "deadline_expired":
                 raise
             raise RuntimeError("selection visual attestation failed") from exc
-        if (
-            attestation.profile_id != profile.profile_id
-            or attestation.client_version != self._selectors.client_version
-            or attestation.selector_pack_version
-            != self._selectors.fixture_suite_version
-            or attestation.environment_fingerprint
-            != self._selectors.environment_fingerprint
-            or attestation.process_id != window.process_id
-            or attestation.window_handle != window.window_handle
-            or attestation.target_runtime_id_digest
-            != runtime_id_digest(conversation.internal_id)
-        ):
-            raise RuntimeError("selection visual attestation drift")
+        expected = {
+            "profile_id": profile.profile_id,
+            "client_version": self._selectors.client_version,
+            "selector_pack_version": self._selectors.fixture_suite_version,
+            "environment_fingerprint": self._selectors.environment_fingerprint,
+            "process_id": window.process_id,
+            "window_handle": window.window_handle,
+            "target_runtime_id_digest": runtime_id_digest(conversation.internal_id),
+        }
+        changed_fields = [name for name, value in expected.items()
+                          if getattr(attestation, name) != value]
+        if changed_fields:
+            error = _SelectionAttestationDrift(
+                changed_fields=changed_fields, after=attestation, attempt=attempt,
+            )
+            self._report_selection_attestation_drift(command, error)
+            raise error
         self._ensure_command_live(command)
         return attestation
 
@@ -807,40 +998,85 @@ class QQVMWorker:
             [QQWindow, QQConversation, CurrentDirectIdentity | None], object
         ]
         | None,
+        allow_geometry_retry: bool = False,
     ) -> tuple[CurrentDirectIdentity, object | None]:
         try_already_current = getattr(
             self._identity_certifier, "try_certify_already_current", None
         )
         if not callable(try_already_current):
             raise RuntimeError("current identity certifier unavailable")
-        before = self._attest_exact_selected_row(
-            command=command, window=window, conversation=conversation
-        )
-        with read_phase(window):
-            proof = try_already_current(window, conversation)
-            if proof is None:
-                raise RuntimeError("selection visual header is unproven")
-            if proof.participant_signature != binding.participant_signature:
-                raise RuntimeError("profile identity mismatch")
-            current = (
-                current_reader(window, conversation, proof)
-                if current_reader is not None
-                else None
+        attempt = 1
+        while True:
+            self._ensure_command_live(command)
+            with self._stage(command, "selection_before_read"):
+                before = self._attest_exact_selected_row(
+                    command=command, window=window, conversation=conversation, attempt=attempt,
+                )
+            with self._stage(command, "identity_and_content_read"), read_phase(window):
+                proof = try_already_current(window, conversation)
+                if proof is None:
+                    raise RuntimeError("selection visual header is unproven")
+                if proof.participant_signature != binding.participant_signature:
+                    raise RuntimeError("profile identity mismatch")
+                current = (
+                    current_reader(window, conversation, proof)
+                    if current_reader is not None
+                    else None
+                )
+            with self._stage(command, "selection_after_read"):
+                after = self._attest_exact_selected_row(
+                    command=command, window=window, conversation=conversation, attempt=attempt,
+                )
+            changed_fields = [
+                name for name in (*_SELECTION_SCOPE_FIELDS, "row_rect")
+                if getattr(before, name) != getattr(after, name)
+            ]
+            if not changed_fields:
+                self._ensure_command_live(command)
+                return proof, current
+            retrying = bool(
+                allow_geometry_retry
+                and attempt == 1
+                and changed_fields == ["row_rect"]
+                and command.kind is WorkerKind.PREPARE
+                and isinstance(current, _PrepareReadSnapshot)
+                and current.composer_text == ""
+                and self._reservation is None
+                and self._trusted_operation_lease is None
+                and command.operation_id not in self._prepared
             )
-        after = self._attest_exact_selected_row(
-            command=command, window=window, conversation=conversation
-        )
-        if (
-            before.profile_id != after.profile_id
-            or before.process_id != after.process_id
-            or before.window_handle != after.window_handle
-            or before.target_runtime_id_digest
-            != after.target_runtime_id_digest
-            or before.row_rect != after.row_rect
-        ):
-            raise RuntimeError("selection visual attestation drift")
-        self._ensure_command_live(command)
-        return proof, current
+            error = _SelectionAttestationDrift(
+                changed_fields=changed_fields, before=before, after=after,
+                attempt=attempt, retrying=retrying,
+            )
+            self._report_selection_attestation_drift(command, error)
+            if not retrying:
+                raise error
+            # Both attestations passed independently; only their geometry
+            # differed. Discard all read values and start one fresh complete
+            # fence under the original deadline. Never re-resolve, consume a
+            # handoff again, reselect, or retain UIA controls across attempts.
+            del proof, current
+            attempt += 1
+
+    def _report_selection_attestation_drift(
+        self, command: WorkerCommand, error: _SelectionAttestationDrift,
+    ) -> None:
+        if self._run_id is None and self._diagnostics is None:
+            return
+        self._emit_stage({
+            "schema": "pmai-qq-worker-stage-event-v1",
+            "run_id": self._run_id,
+            "worker_epoch": str(self._epoch),
+            "request_id": str(command.request_id),
+            "kind": command.kind.value,
+            "binding_id": command.binding_id,
+            "operation_id": str(command.operation_id) if command.operation_id else None,
+            "stage": "selection_equivalence",
+            "event": "selection_attestation_drift",
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "selection_attestation": error.diagnostic,
+        })
 
     def _revalidate_expected_target(
         self,
@@ -850,26 +1086,36 @@ class QQVMWorker:
         window: QQWindow,
         conversation: QQConversation,
         expected: dict[str, object],
-    ) -> CurrentDirectIdentity:
+        current_reader: Callable[
+            [QQWindow, QQConversation, CurrentDirectIdentity | None], object
+        ]
+        | None = None,
+    ) -> tuple[CurrentDirectIdentity, object | None]:
         read_phase = getattr(self._accessibility, "read_phase", None)
         if not callable(read_phase):
             raise RuntimeError("selection visual profile is unavailable")
-        proof, _current = self._certify_visual_header_current(
+        proof, current = self._certify_visual_header_current(
             command=command,
             binding=binding,
             window=window,
             conversation=conversation,
             read_phase=read_phase,
-            current_reader=None,
+            current_reader=current_reader,
         )
         if self._stable_target(binding=binding, window=window, proof=proof) != expected:
             raise RuntimeError("binding proof drift after selection")
-        return proof
+        return proof, current
 
     def _resolve(self, command: WorkerCommand, binding: QQIdentityBinding,
                  current_reader: Callable[[QQWindow, QQConversation,
                                            CurrentDirectIdentity | None], object]
-                 | None = None):
+                 | None = None,
+                 certified_current_reader: Callable[[QQWindow, QQConversation,
+                                                     CurrentDirectIdentity | None], object]
+                 | None = None,
+                 allow_geometry_retry: bool = False):
+        # This optional reader is used only by the complete before/header/after
+        # fence. A legacy confirmation must never return its stronger snapshot.
         with self._stage(command, "target_window"):
             window = self._target_window()
         with self._stage(command, "guest_foreground"):
@@ -903,7 +1149,8 @@ class QQVMWorker:
                         window=window,
                         conversation=conversation,
                         read_phase=read_phase,
-                        current_reader=current_reader,
+                        current_reader=certified_current_reader or current_reader,
+                        allow_geometry_retry=allow_geometry_retry,
                     )
                 return window, conversation, proof, current
             if (
@@ -933,6 +1180,8 @@ class QQVMWorker:
                     command=command, binding=binding, window=window,
                     conversation=conversation, read_phase=read_phase,
                     current_reader=current_reader,
+                    certified_current_reader=certified_current_reader,
+                    allow_geometry_retry=allow_geometry_retry,
                 )
             return window, conversation, proof, current
 
@@ -1028,6 +1277,8 @@ class QQVMWorker:
         self, *, command: WorkerCommand, binding: QQIdentityBinding,
         window: QQWindow, conversation: QQConversation, read_phase,
         current_reader: Callable[[QQWindow, QQConversation, CurrentDirectIdentity | None], object] | None,
+        certified_current_reader: Callable[[QQWindow, QQConversation, CurrentDirectIdentity | None], object] | None = None,
+        allow_geometry_retry: bool = False,
     ) -> tuple[CurrentDirectIdentity | None, object | None]:
         """Certify only a settled selection, using a fresh UIA phase per retry."""
         if binding.authorization_scope == "all_direct_including_temporary":
@@ -1037,7 +1288,8 @@ class QQVMWorker:
                 window=window,
                 conversation=conversation,
                 read_phase=read_phase,
-                current_reader=current_reader,
+                current_reader=certified_current_reader or current_reader,
+                allow_geometry_retry=allow_geometry_retry,
             )
             return proof, current
         now = datetime.now(UTC)
@@ -1097,7 +1349,7 @@ class QQVMWorker:
 
     @contextmanager
     def _stage(self, command: WorkerCommand, stage: str):
-        if self._run_id is None:
+        if self._run_id is None and self._diagnostics is None:
             yield
             return
         started_at = datetime.now(UTC)
@@ -1109,15 +1361,16 @@ class QQVMWorker:
             "request_id": str(command.request_id),
             "kind": command.kind.value,
             "binding_id": command.binding_id,
+            "operation_id": str(command.operation_id) if command.operation_id else None,
             "stage": stage,
         }
-        print(json.dumps({
+        self._emit_stage({
             **base, "event": "start", "recorded_at": started_at.isoformat(),
-        }, ensure_ascii=False), flush=True)
+        })
         try:
             yield
         except Exception as exc:
-            print(json.dumps({
+            self._emit_stage({
                 **base,
                 "event": "error",
                 "recorded_at": datetime.now(UTC).isoformat(),
@@ -1125,17 +1378,22 @@ class QQVMWorker:
                     (time.perf_counter() - started_clock) * 1000
                 )),
                 "exception_type": type(exc).__name__,
-            }, ensure_ascii=False), flush=True)
+            })
             raise
         else:
-            print(json.dumps({
+            self._emit_stage({
                 **base,
                 "event": "end",
                 "recorded_at": datetime.now(UTC).isoformat(),
                 "elapsed_ms": max(0, int(
                     (time.perf_counter() - started_clock) * 1000
                 )),
-            }, ensure_ascii=False), flush=True)
+            })
+
+    def _emit_stage(self, event: dict[str, object]) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.emit(event)
+        emit_console(event)
 
     def _target_window(self) -> QQWindow:
         windows = self._accessibility.find_main_windows(self._selectors.selector("main_window"))
@@ -1214,11 +1472,18 @@ class QQVMWorkerProcess:
                  session_evidence: tuple[QQSessionObservedDirectIdentity, ...] = (),
                  run_id: str | None = None,
                  visual_selection: VisualSelectionConfig | None = None,
-                 visual_api_key: str | None = None) -> None:
+                 visual_api_key: str | None = None,
+                 prepare_write_reserve_seconds: float = 5.0,
+                 diagnostics_dir: Path | None = None) -> None:
         self._selector_pack, self._bindings = selector_pack, bindings
         self._session_evidence = session_evidence
         self._visual_selection = visual_selection
         self._visual_api_key = visual_api_key
+        self._diagnostics_dir = diagnostics_dir
+        self._diagnostics = WorkerDiagnosticSink(diagnostics_dir, "parent") if diagnostics_dir else None
+        self._prepare_write_reserve_seconds = _validated_prepare_write_reserve(
+            prepare_write_reserve_seconds
+        )
         self._selection_handoff_signing_key = secrets.token_bytes(32)
         self._parent, child = mp.get_context("spawn").Pipe()
         self._process = mp.get_context("spawn").Process(
@@ -1232,6 +1497,8 @@ class QQVMWorkerProcess:
                 visual_selection,
                 visual_api_key,
                 self._selection_handoff_signing_key,
+                self._prepare_write_reserve_seconds,
+                diagnostics_dir,
             ),
             daemon=True,
         )
@@ -1249,11 +1516,14 @@ class QQVMWorkerProcess:
             "startup_health": None,
             "last_request": None,
             "last_successful_observe": None,
+            "first_failure": None,
+            "last_failure": None,
+            "last_successful_request": None,
             "first_terminal_failure": None,
         }
 
     def start(self) -> None:
-        self._process.start()
+        _start_without_console(self._process)
         self._started = True
         with self._status_lock:
             self._refresh_process_locked()
@@ -1261,14 +1531,21 @@ class QQVMWorkerProcess:
     def spawn_successor(self) -> QQVMWorkerProcess:
         """Construct an unstarted process with the same certified UI scope."""
 
-        return type(self)(
+        successor = type(self)(
             self._selector_pack,
             self._bindings,
             session_evidence=self._session_evidence,
             run_id=self._run_id,
             visual_selection=self._visual_selection,
             visual_api_key=self._visual_api_key,
+            prepare_write_reserve_seconds=self._prepare_write_reserve_seconds,
+            diagnostics_dir=getattr(self, "_diagnostics_dir", None),
         )
+        if hasattr(self, "_status") and hasattr(successor, "_status"):
+            with self._status_lock:
+                for key in ("first_failure", "last_failure", "last_successful_request"):
+                    successor._status[key] = copy.deepcopy(self._status[key])
+        return successor
 
     def mint_selection_handoff(self, **kwargs) -> SelectionHandoff:
         """Issue a capability authenticated for this exact child process."""
@@ -1396,7 +1673,10 @@ class QQVMWorkerProcess:
                     elapsed_ms=None,
                     exception_types=(),
                 )
-            return copy.deepcopy(self._status)
+            result = copy.deepcopy(self._status)
+            sink = getattr(self, "_diagnostics", None)
+            result["diagnostic_write_errors"] = sink.errors if sink else 0
+            return result
 
     def _ensure_status_state(self) -> None:
         """Support narrow tests that construct this façade with ``__new__``."""
@@ -1415,6 +1695,9 @@ class QQVMWorkerProcess:
             "startup_health": None,
             "last_request": None,
             "last_successful_observe": None,
+            "first_failure": None,
+            "last_failure": None,
+            "last_successful_request": None,
             "first_terminal_failure": None,
         }
 
@@ -1429,6 +1712,9 @@ class QQVMWorkerProcess:
             "request_id": str(command.request_id),
             "kind": command.kind.value,
             "binding_id": command.binding_id,
+            "operation_id": str(command.operation_id) if command.operation_id else None,
+            "binding_revision": command.binding_revision,
+            "conversation_revision": command.conversation_revision,
         }
 
     @staticmethod
@@ -1461,6 +1747,9 @@ class QQVMWorkerProcess:
                 frames.append({"function": function, "file": filename, "line": line})
         if frames:
             diagnostics["project_frames"] = frames
+        attestation = bounded_selection_attestation(evidence.get("selection_attestation"))
+        if attestation:
+            diagnostics["selection_attestation"] = attestation
         return diagnostics
 
     def _record_request_started(self, command: WorkerCommand, started_at: datetime) -> None:
@@ -1474,6 +1763,7 @@ class QQVMWorkerProcess:
                 "status": "in_progress",
                 "error_code": None,
             }
+            self._emit_request_locked(self._status["last_request"], event="start")
 
     def _record_request_result(self, command: WorkerCommand, result: WorkerResult,
                                started_at: datetime, elapsed_ms: int) -> None:
@@ -1490,6 +1780,14 @@ class QQVMWorkerProcess:
                 **self._safe_result_diagnostics(result.evidence),
             }
             self._status["last_request"] = record
+            failed = result.status is not WorkerStatus.OK
+            if failed:
+                if self._status["first_failure"] is None:
+                    self._status["first_failure"] = copy.deepcopy(record)
+                self._status["last_failure"] = copy.deepcopy(record)
+            else:
+                self._status["last_successful_request"] = copy.deepcopy(record)
+            self._emit_request_locked(record, event="end", failed=failed)
             if command.kind is WorkerKind.HEALTH:
                 self._status["startup_health"] = copy.deepcopy(record)
             if command.kind is WorkerKind.OBSERVE and result.status is WorkerStatus.OK:
@@ -1521,6 +1819,11 @@ class QQVMWorkerProcess:
                 "status": "exception",
                 "error_code": error_code,
             }
+            record = self._status["last_request"]
+            if self._status["first_failure"] is None:
+                self._status["first_failure"] = copy.deepcopy(record)
+            self._status["last_failure"] = copy.deepcopy(record)
+            self._emit_request_locked(record, event="error", failed=True)
             self._freeze_terminal_locked(
                 command=command,
                 error_code=error_code,
@@ -1547,12 +1850,27 @@ class QQVMWorkerProcess:
             "exception_types": list(exception_types),
         }
         self._status["first_terminal_failure"] = record
-        print(json.dumps({
+        event = {
             "schema": "pmai-qq-worker-terminal-event-v1",
             "run_id": self._run_id,
             "recorded_at": completed_at.isoformat(),
             **record,
-        }, ensure_ascii=False), flush=True)
+        }
+        sink = getattr(self, "_diagnostics", None)
+        if sink is not None:
+            sink.emit(event, freeze_failure=True)
+        emit_console(event)
+
+    def _emit_request_locked(self, record: dict[str, object], *, event: str, failed: bool = False) -> None:
+        sink = getattr(self, "_diagnostics", None)
+        if sink is not None:
+            sink.emit({
+                "schema": "pmai-qq-worker-request-event-v1",
+                "run_id": self._run_id,
+                "worker_process_id": self._status["worker_process_id"],
+                "event": event,
+                **record,
+            }, freeze_failure=failed)
 
     def stop(self, timeout_seconds: float = 5) -> None:
         with self._request_lock:
@@ -1595,6 +1913,8 @@ def _construct_runtime_worker(
     visual_selection: VisualSelectionConfig | None = None,
     visual_api_key: str | None = None,
     selection_handoff_signing_key: bytes | None = None,
+    prepare_write_reserve_seconds: float = 5.0,
+    diagnostics_dir: Path | None = None,
 ) -> QQVMWorker:
     accessibility = WindowsUIAQQAccessibility()
     selection_visual_profile = (
@@ -1634,9 +1954,10 @@ def _construct_runtime_worker(
                       selection_actuator=selection_actuator,
                       selection_visual_profile=selection_visual_profile,
                       selection_handoff_signing_key=selection_handoff_signing_key,
+                      prepare_write_reserve_seconds=prepare_write_reserve_seconds,
                       expected_window=certifier.window_scope if certifier else None,
                       window_validator=certifier.validate_window if certifier else None,
-                      run_id=run_id)
+                      run_id=run_id, diagnostics_dir=diagnostics_dir)
 
 
 def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentityBinding, ...],
@@ -1644,7 +1965,9 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
            run_id: str | None = None,
            visual_selection: VisualSelectionConfig | None = None,
            visual_api_key: str | None = None,
-           selection_handoff_signing_key: bytes | None = None) -> None:
+           selection_handoff_signing_key: bytes | None = None,
+           prepare_write_reserve_seconds: float = 5.0,
+           diagnostics_dir: Path | None = None) -> None:
     try:
         worker = _construct_runtime_worker(
             selector_pack,
@@ -1654,6 +1977,8 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
             visual_selection,
             visual_api_key,
             selection_handoff_signing_key,
+            prepare_write_reserve_seconds,
+            diagnostics_dir,
         )
     except Exception as exc:
         # Stay alive long enough to answer the parent's mandatory HEALTH
@@ -1678,12 +2003,18 @@ def _serve(connection, selector_pack: QQSelectorPack, bindings: tuple[QQIdentity
         except (EOFError, BrokenPipeError, OSError, ValueError):
             pass
         return
-    while True:
-        command = WorkerCommand.model_validate(connection.recv())
-        result = worker.execute(command)
-        connection.send(result.model_dump(mode="json"))
-        if command.kind is WorkerKind.STOP:
-            return
+    try:
+        while True:
+            command = WorkerCommand.model_validate(connection.recv())
+            result = worker.execute(command)
+            connection.send(result.model_dump(mode="json"))
+            if command.kind is WorkerKind.STOP:
+                return
+    finally:
+        selection_actuator = getattr(worker, "_selection_actuator", None)
+        close = getattr(selection_actuator, "close", None)
+        if callable(close):
+            close()
 
 
 def _new_suffix(before: list[object], after: list[dict[str, object]]) -> list[dict[str, object]]:

@@ -31,6 +31,15 @@ class UIAPhaseIndex:
         self._nodes: tuple[UIAPhaseNode, ...] | None = None
         self._properties: dict[tuple[int, str], object] = {}
         self._patterns: dict[tuple[int, int], object | None] = {}
+        # Subtree walks may create fresh Python wrappers for the same COM
+        # element. Keep every cached wrapper alive until this phase closes:
+        # otherwise Python can reuse its id and a different element inherits
+        # stale ClassName, control type or pattern data from our cache.
+        self._cached_controls: dict[int, Any] = {}
+        # The materialized graph stores direct edges, not provider RuntimeIds.
+        # Known subtree roots can then be walked with relative ancestor paths
+        # without issuing another GetChildren call or aliasing fresh wrappers.
+        self._children: dict[int, tuple[Any, ...]] = {}
 
     def __enter__(self) -> "UIAPhaseIndex":
         self._ensure_active()
@@ -48,11 +57,15 @@ class UIAPhaseIndex:
         self._nodes = None
         self._properties.clear()
         self._patterns.clear()
+        self._cached_controls.clear()
+        self._children.clear()
+        self.root = None
 
     invalidate = close
 
     def property(self, control: Any, name: str, default: object = "") -> object:
         self._ensure_active()
+        self._cached_controls[id(control)] = control
         key = (id(control), name)
         if key not in self._properties:
             self._properties[key] = getattr(control, name, default)
@@ -61,6 +74,7 @@ class UIAPhaseIndex:
     def pattern(self, control: Any, getter_name: str,
                 pattern_id: int) -> object | None:
         self._ensure_active()
+        self._cached_controls[id(control)] = control
         key = (id(control), pattern_id)
         if key not in self._patterns:
             self._patterns[key] = self._pattern_loader(
@@ -73,6 +87,7 @@ class UIAPhaseIndex:
         """Call a stable read method once and cache its immutable result."""
 
         self._ensure_active()
+        self._cached_controls[id(control)] = control
         key = (id(control), f"{method_name}()")
         if key not in self._properties:
             method = self.property(control, method_name, None)
@@ -84,8 +99,11 @@ class UIAPhaseIndex:
         if self._nodes is not None:
             return self._nodes
         result: list[UIAPhaseNode] = []
+        children_by_id: dict[int, tuple[Any, ...]] = {}
+        self._cached_controls[id(self.root)] = self.root
+        children_by_id[id(self.root)] = tuple(self.root.GetChildren())
         queue = deque(
-            (item, (), ()) for item in self.root.GetChildren()
+            (item, (), ()) for item in children_by_id[id(self.root)]
         )
         while queue:
             item, automation_ancestors, type_ancestors = queue.popleft()
@@ -96,16 +114,57 @@ class UIAPhaseIndex:
             ))
             item_id = str(self.property(item, "AutomationId", ""))
             item_type = str(self.property(item, "ControlTypeName", ""))
+            children = tuple(item.GetChildren())
+            children_by_id[id(item)] = children
             queue.extend(
                 (
                     child,
                     automation_ancestors + ((item_id,) if item_id else ()),
                     type_ancestors + ((item_type.lower(),) if item_type else ()),
                 )
-                for child in item.GetChildren()
+                for child in children
             )
+        # Publish the graph only after a complete traversal. An interrupted
+        # provider enumeration cannot look like a complete indexed subtree.
+        self._children = children_by_id
         self._nodes = tuple(result)
         return self._nodes
+
+    def indexed_children(self, root: Any) -> tuple[Any, ...] | None:
+        """Return known direct children, or None for an unknown fresh wrapper."""
+        self._ensure_active()
+        if root is self.root:
+            self.nodes()
+        if self._nodes is None or self._cached_controls.get(id(root)) is not root:
+            return None
+        return self._children.get(id(root))
+
+    def subtree_nodes(self, root: Any) -> tuple[UIAPhaseNode, ...] | None:
+        """Walk an indexed subtree with the original root-relative semantics.
+
+        The supplied root itself is excluded. Its direct children have empty
+        ancestor tuples; deeper children include only ancestors *below* that
+        root. Unknown wrappers are never matched by Name or RuntimeId and must
+        use the caller's safe fresh-provider fallback.
+        """
+        self._ensure_active()
+        if root is self.root:
+            return self.nodes()
+        children = self.indexed_children(root)
+        if children is None:
+            return None
+        result = []
+        queue = deque((item, (), ()) for item in children)
+        while queue:
+            item, automation_ancestors, type_ancestors = queue.popleft()
+            result.append(UIAPhaseNode(item, automation_ancestors, type_ancestors))
+            item_id = str(self.property(item, "AutomationId", ""))
+            item_type = str(self.property(item, "ControlTypeName", ""))
+            queue.extend((child,
+                automation_ancestors + ((item_id,) if item_id else ()),
+                type_ancestors + ((item_type.lower(),) if item_type else ()))
+                for child in self._children[id(item)])
+        return tuple(result)
 
     def controls(self) -> Iterable[Any]:
         return (node.control for node in self.nodes())

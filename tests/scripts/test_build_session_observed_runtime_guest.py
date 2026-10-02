@@ -12,6 +12,8 @@ import pytest
 
 from messenger_ai.adapters.qq.models import QQSessionObservedDirectIdentity
 from messenger_ai.adapters.qq.vm_driver.bridge import QQVMDriverBridge
+from messenger_ai.rules.models import HumanApproval, RuleSource
+from messenger_ai.rules.service import AtomicRulePackStore
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "deployment" / "build_session_observed_runtime_guest.py"
 
@@ -70,6 +72,23 @@ def _write_bootstrap(
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def _write_rules(path: Path) -> None:
+    store = AtomicRulePackStore(str(path))
+    draft = store.ingest(RuleSource(
+        name="rules.yaml",
+        content=(
+            b"schema_version: 1\nrulepack_id: test\npersona: {}\n"
+            b"required_behaviors: []\nprohibited_behaviors: []\n"
+            b"escalation_rules: []\npacing: {}\ncontacts: {}\nexamples: {}\n"
+        ),
+    ))
+    store.activate(
+        draft.draft_id,
+        HumanApproval(approver_id="test", reason="test"),
+    )
+    store.connection.close()
+
+
 def _require_stable_signature(proof: QQSessionObservedDirectIdentity) -> None:
     if not hasattr(proof, "legacy_participant_signature"):
         pytest.skip("stable/legacy participant signature contract not installed yet")
@@ -125,7 +144,7 @@ def test_second_contact_requires_flag_and_preserves_stable_mapping(tmp_path, mon
         "client_version": "9.9.20",
         "fixture_suite_version": "session-pack-v1",
     }), encoding="utf-8")
-    rules.write_bytes(b"rules")
+    _write_rules(rules)
 
     monkeypatch.setattr(module, "DATA_ROOT", data_root)
     monkeypatch.setattr(module, "CURSOR_DB", data_root / "qq-vm-bridge.sqlite3")
@@ -141,6 +160,8 @@ def test_second_contact_requires_flag_and_preserves_stable_mapping(tmp_path, mon
     assert module.main([]) == 0
     default_config = json.loads(output.read_text(encoding="utf-8"))
     assert default_config["data_dir"] == str(data_root)
+    assert default_config["worker_timeout_seconds"] == 90
+    assert default_config["prepare_write_reserve_seconds"] == 20
     assert [item["contact_id"] for item in default_config["bindings"]] == ["session-contact-1"]
     assert registration1.is_file()
     assert not registration2.exists()
@@ -199,7 +220,7 @@ def test_explicit_additional_contact_adoption_is_scoped_and_idempotent(tmp_path,
         "client_version": "9.9.20",
         "fixture_suite_version": "session-pack-v1",
     }), encoding="utf-8")
-    rules.write_bytes(b"rules")
+    _write_rules(rules)
     monkeypatch.setattr(module, "DATA_ROOT", data_root)
     monkeypatch.setattr(module, "BOOTSTRAP_ROOT", bootstrap_root)
     monkeypatch.setattr(module, "CURSOR_DB", data_root / "qq-vm-bridge.cursor.sqlite3")
@@ -267,6 +288,253 @@ def test_explicit_additional_contact_adoption_is_scoped_and_idempotent(tmp_path,
     assert consumed["bootstrap_last_inbound_provenance"] == {}
 
 
+def test_isolated_recovery_generation_preserves_default_root(tmp_path, monkeypatch):
+    module = _load_module()
+    runtime_root = tmp_path / "runtime"
+    default_root = runtime_root / module.ACCOUNT_ID
+    default_root.mkdir(parents=True)
+    marker = default_root / "existing-state.marker"
+    marker.write_text("preserve", encoding="utf-8")
+    bootstrap_root = tmp_path / "bootstraps"
+    bootstrap_root.mkdir()
+    output = tmp_path / "runtime.json"
+    selector = tmp_path / "selector.json"
+    rules = tmp_path / "rules.sqlite3"
+    selector.write_text(json.dumps({
+        "environment_fingerprint": "a" * 64,
+        "client_version": "9.9.20",
+        "fixture_suite_version": "session-pack-v1",
+    }), encoding="utf-8")
+    _write_rules(rules)
+    monkeypatch.setattr(module, "RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(module, "BOOTSTRAP_ROOT", bootstrap_root)
+    monkeypatch.setattr(module, "OUTPUT", output)
+    monkeypatch.setattr(module, "SOURCE_RULES", rules)
+    monkeypatch.setattr(module, "SELECTOR_PACK", selector)
+    for index in (1, 2, 3):
+        _write_bootstrap(
+            bootstrap_root / f"qq-session-observed-bootstrap-{index}.json",
+            _evidence(f"session-contact-{index}", str(index)),
+            latest_text=f"baseline-{index}",
+        )
+
+    generation_id = str(uuid4())
+    build_args = [
+        "--include-contact-2",
+        "--additional-contact-index", "3",
+        "--adopt-latest-inbound-index", "3",
+        "--refresh-session-index", "1",
+        "--refresh-session-index", "2",
+        "--refresh-session-index", "3",
+        "--isolated-recovery-generation", generation_id,
+    ]
+    assert module.main(build_args) == 0
+
+    generation_root = (
+        runtime_root / "recovery-generations" / generation_id / module.ACCOUNT_ID
+    )
+    config = json.loads(output.read_text(encoding="utf-8"))
+    assert config["data_dir"] == str(generation_root)
+    generation = config["runtime_generation"]
+    assert generation == {
+        "schema": "pmai-isolated-runtime-generation-v1",
+        "generation_id": generation_id,
+        "mode": "isolated_identity_recovery",
+        "enforce_global_pause": True,
+        "manifest_sha256": generation["manifest_sha256"],
+    }
+    assert len(generation["manifest_sha256"]) == 64
+    assert config["start_globally_paused"] is True
+    assert config["bootstrap_last_inbound_once"] == [
+        "qq-session-conversation-3",
+    ]
+    assert set(config["bootstrap_last_inbound_provenance"]) == {
+        "qq-session-conversation-3",
+    }
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert (generation_root / "registered-session-scope.json").is_file()
+    assert (generation_root / "registered-session-scope-2.json").is_file()
+    assert (generation_root / "registered-session-scope-3.json").is_file()
+    manifest_path = generation_root / "generation-manifest.json"
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == generation[
+        "manifest_sha256"
+    ]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [item["binding_id"] for item in manifest["contacts"]] == [
+        "session-contact-1", "session-contact-2", "session-contact-3"
+    ]
+    by_binding = {item["binding_id"]: item for item in manifest["contacts"]}
+    assert by_binding["session-contact-1"]["initial_adoption_sha256"] is None
+    assert by_binding["session-contact-2"]["initial_adoption_sha256"] is None
+    assert len(by_binding["session-contact-3"]["initial_adoption_sha256"]) == 64
+    assert json.loads((generation_root / "runtime-config.json").read_text(
+        encoding="utf-8"
+    )) == config
+    with sqlite3.connect(generation_root / "qq-vm-bridge.cursor.sqlite3") as db:
+        db.execute(
+            "CREATE TABLE cursor_state("
+            "conversation_id TEXT PRIMARY KEY,last_sequence INTEGER,seen_keys_json TEXT)"
+        )
+        db.execute(
+            "INSERT INTO cursor_state VALUES(?,2,'[]')",
+            ("qq-session-conversation-3",),
+        )
+    assert module.main(build_args) == 0
+    retried = json.loads(output.read_text(encoding="utf-8"))
+    assert retried["bootstrap_last_inbound_once"] == [
+        "qq-session-conversation-3"
+    ]
+    assert retried == config
+    # A refresh rejected by the frozen manifest must not advance registrations.
+    preserved = {path: path.read_bytes() for path in generation_root.glob("*.json")}
+    preserved[output] = output.read_bytes()
+    original_bootstraps = {path: path.read_bytes() for path in bootstrap_root.glob("*.json")}
+    refreshed = _evidence("session-contact-1", "1").model_copy(update={
+        "process_id": 999,
+        "window_handle": 998,
+        "process_started_at_100ns": 997,
+    })
+    for index in (1, 2, 3):
+        proof = _evidence(f"session-contact-{index}", str(index)).model_copy(update={
+            "process_id": refreshed.process_id,
+            "window_handle": refreshed.window_handle,
+            "process_started_at_100ns": refreshed.process_started_at_100ns,
+        })
+        _write_bootstrap(bootstrap_root / f"qq-session-observed-bootstrap-{index}.json", proof,
+                         latest_text=f"baseline-{index}")
+    with pytest.raises(RuntimeError, match="isolated generation manifest changed"):
+        module.main(build_args)
+    assert all(path.read_bytes() == before for path, before in preserved.items())
+    for path, value in original_bootstraps.items():
+        path.write_bytes(value)
+    (generation_root / "rules.sqlite3").write_bytes(b"truncated")
+    with pytest.raises(RuntimeError, match="RulePack database integrity"):
+        module.main(build_args)
+
+
+def test_candidate_rejection_rolls_back_new_generation(tmp_path, monkeypatch):
+    module = _load_module()
+    root = tmp_path / "runtime"
+    output = tmp_path / "runtime.json"
+    selector = tmp_path / "selector.json"
+    rules = tmp_path / "rules.sqlite3"
+    selector.write_text(json.dumps({"environment_fingerprint": "a" * 64,
+                                   "client_version": "9.9.20", "fixture_suite_version": "session-pack-v1"}))
+    _write_rules(rules)
+    for key, value in {"RUNTIME_ROOT": root, "BOOTSTRAP_ROOT": tmp_path, "OUTPUT": output,
+                       "SOURCE_RULES": rules, "SELECTOR_PACK": selector}.items():
+        monkeypatch.setattr(module, key, value)
+    _write_bootstrap(tmp_path / "qq-session-observed-bootstrap-1.json", _evidence("session-contact-1", "1"),
+                     latest_text="baseline-1")
+    generation_id = str(uuid4())
+    args = ["--isolated-recovery-generation", generation_id]
+    def reject(*args):
+        raise RuntimeError("candidate rejected")
+    monkeypatch.setattr(module, "_validate_frozen_candidate", reject)
+    with pytest.raises(RuntimeError, match="candidate rejected"):
+        module.main(args)
+    generation_root = root / "recovery-generations" / generation_id / module.ACCOUNT_ID
+    assert list(generation_root.iterdir()) == []
+    assert not output.exists()
+    monkeypatch.setattr(module, "_validate_frozen_candidate", lambda *args: None)
+    assert module.main(args) == 0
+
+
+def test_isolated_recovery_generation_requires_uuid():
+    module = _load_module()
+    with pytest.raises(SystemExit):
+        module.main(["--isolated-recovery-generation", "not-a-uuid"])
+
+
+def test_isolated_recovery_requires_previous_generation_pause(tmp_path, monkeypatch):
+    module = _load_module()
+    runtime_root = tmp_path / "runtime"
+    default_root = runtime_root / module.ACCOUNT_ID
+    default_root.mkdir(parents=True)
+    with sqlite3.connect(default_root / "runtime.sqlite3") as connection:
+        connection.executescript("""
+            CREATE TABLE runtime_global_control(
+              singleton INTEGER PRIMARY KEY, revision INTEGER, paused INTEGER, reason TEXT
+            );
+            INSERT INTO runtime_global_control VALUES(1,1,0,NULL);
+        """)
+    monkeypatch.setattr(module, "RUNTIME_ROOT", runtime_root)
+
+    with pytest.raises(RuntimeError, match="must be globally paused"):
+        module.main(["--isolated-recovery-generation", str(uuid4())])
+
+
+def test_isolated_recovery_checks_published_predecessor_generation(
+    tmp_path, monkeypatch
+) -> None:
+    module = _load_module()
+    runtime_root = tmp_path / "runtime"
+    prior_id = str(uuid4())
+    prior_root = (
+        runtime_root / "recovery-generations" / prior_id / module.ACCOUNT_ID
+    )
+    prior_root.mkdir(parents=True)
+    with sqlite3.connect(prior_root / "runtime.sqlite3") as connection:
+        connection.executescript("""
+            CREATE TABLE runtime_global_control(
+              singleton INTEGER PRIMARY KEY, revision INTEGER, paused INTEGER, reason TEXT
+            );
+            INSERT INTO runtime_global_control VALUES(1,1,0,NULL);
+        """)
+    output = tmp_path / "runtime.json"
+    output.write_text(json.dumps({
+        "schema": "pmai-v5-runtime-1",
+        "data_dir": str(prior_root),
+        "runtime_generation": {"generation_id": prior_id},
+    }), encoding="utf-8")
+    monkeypatch.setattr(module, "RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(module, "OUTPUT", output)
+
+    with pytest.raises(RuntimeError, match="must be globally paused"):
+        module.main(["--isolated-recovery-generation", str(uuid4())])
+
+
+def test_isolated_generation_rejects_preexisting_hardlinked_file(
+    tmp_path, monkeypatch
+) -> None:
+    module = _load_module()
+    runtime_root = tmp_path / "runtime"
+    generation_id = str(uuid4())
+    generation_root = (
+        runtime_root / "recovery-generations" / generation_id / module.ACCOUNT_ID
+    )
+    generation_root.mkdir(parents=True)
+    source = tmp_path / "outside.sqlite3"
+    source.write_bytes(b"outside")
+    (generation_root / "runtime.sqlite3").hardlink_to(source)
+    monkeypatch.setattr(module, "RUNTIME_ROOT", runtime_root)
+
+    with pytest.raises(RuntimeError, match="must not be hard linked"):
+        module.main(["--isolated-recovery-generation", generation_id])
+
+
+def test_frozen_candidate_check_uses_exact_digest(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    runner = tmp_path / "run_vm_runtime.py"
+    runner.write_text("# frozen runner", encoding="utf-8")
+    config = tmp_path / "runtime-config.json"
+    config.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "builder.py"))
+    calls = []
+
+    class Result:
+        returncode = 0
+
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append((args, kwargs)) or Result(),
+    )
+    module._validate_frozen_candidate(config, "a" * 64)
+
+    assert calls[0][0][-2:] == ["--expected-config-sha256", "a" * 64]
+
+
 def test_refresh_replaces_only_session_evidence_and_preserves_adoption(tmp_path, monkeypatch):
     module = _load_module()
     data_root = tmp_path / "durable-account"
@@ -280,7 +548,7 @@ def test_refresh_replaces_only_session_evidence_and_preserves_adoption(tmp_path,
         "client_version": "9.9.20",
         "fixture_suite_version": "session-pack-v1",
     }), encoding="utf-8")
-    rules.write_bytes(b"rules")
+    _write_rules(rules)
     monkeypatch.setattr(module, "DATA_ROOT", data_root)
     monkeypatch.setattr(module, "BOOTSTRAP_ROOT", tmp_path)
     monkeypatch.setattr(module, "CURSOR_DB", data_root / "qq-vm-bridge.cursor.sqlite3")
@@ -328,7 +596,7 @@ def test_refresh_rejects_stable_identity_change(tmp_path, monkeypatch):
         "client_version": "9.9.20",
         "fixture_suite_version": "session-pack-v1",
     }), encoding="utf-8")
-    rules.write_bytes(b"rules")
+    _write_rules(rules)
     monkeypatch.setattr(module, "DATA_ROOT", data_root)
     monkeypatch.setattr(module, "BOOTSTRAP_ROOT", tmp_path)
     monkeypatch.setattr(module, "CURSOR_DB", data_root / "qq-vm-bridge.cursor.sqlite3")
@@ -365,7 +633,7 @@ def test_refresh_migrates_legacy_signature_and_retry_keeps_envelope(
         "client_version": "9.9.20",
         "fixture_suite_version": "session-pack-v1",
     }), encoding="utf-8")
-    rules.write_bytes(b"rules")
+    _write_rules(rules)
     monkeypatch.setattr(module, "DATA_ROOT", data_root)
     monkeypatch.setattr(module, "BOOTSTRAP_ROOT", tmp_path)
     monkeypatch.setattr(module, "CURSOR_DB", data_root / "qq-vm-bridge.cursor.sqlite3")
